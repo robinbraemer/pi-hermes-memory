@@ -160,14 +160,14 @@ const Database = loadDatabaseCtor();
 
 export class DatabaseManager {
   private db: DatabaseLike | null = null;
+  private readonly displayDbPath: string;
   private readonly dbPath: string;
-  private readonly recoveryIdentity: string;
   private readonly recoveryOptions: ResolvedDatabaseRecoveryOptions;
   private lastRecovery: DatabaseRecoveryResult | null = null;
 
   constructor(memoryDir: string, recoveryOptions: DatabaseRecoveryOptions = {}) {
-    this.dbPath = path.join(memoryDir, 'sessions.db');
-    this.recoveryIdentity = canonicalStorageIdentity(this.dbPath);
+    this.displayDbPath = path.join(memoryDir, 'sessions.db');
+    this.dbPath = canonicalStorageIdentity(this.displayDbPath);
     this.recoveryOptions = { ...DEFAULT_RECOVERY_OPTIONS, ...recoveryOptions };
   }
 
@@ -275,7 +275,7 @@ export class DatabaseManager {
         throw error;
       }
       this.lastRecovery = recovery;
-      if (!recoveredDb) throw new Error(`SQLite recovery verification did not open ${this.dbPath}`);
+      if (!recoveredDb) throw new Error(`SQLite recovery verification did not open ${this.displayDbPath}`);
       return recoveredDb;
     }
   }
@@ -370,15 +370,15 @@ export class DatabaseManager {
   }
 
   private recoverDatabaseFile(cause: unknown, verify: () => void): DatabaseRecoveryResult {
-    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(this.recoveryIdentity), '.pi-hermes-locks.sqlite'));
-    const lockKey = `recovery:${this.recoveryIdentity}`;
+    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(this.dbPath), '.pi-hermes-locks.sqlite'));
+    const lockKey = `recovery:${this.dbPath}`;
     const deadline = Date.now() + Math.max(0, this.recoveryOptions.recoveryLockWaitMs);
 
     while (true) {
       const lease = coordinator.tryAcquire(lockKey, { staleMs: this.recoveryOptions.recoveryLockStaleMs });
       if (!lease) {
         if (Date.now() >= deadline) {
-          throw new Error(`SQLite recovery already in progress for ${this.dbPath}; timed out after ${this.recoveryOptions.recoveryLockWaitMs}ms`);
+          throw new Error(`SQLite recovery already in progress for ${this.displayDbPath}; timed out after ${this.recoveryOptions.recoveryLockWaitMs}ms`);
         }
         DatabaseManager.sleepSync(Math.min(
           this.recoveryOptions.recoveryLockPollMs,
@@ -469,7 +469,7 @@ export class DatabaseManager {
   private assertRecoveryCircuitClosed(): void {
     if (this.recentRecoveryFailures().length >= Math.max(1, this.recoveryOptions.recoveryCircuitLimit)) {
       throw new Error(
-        `SQLite recovery circuit is open for ${this.dbPath}: too many failed recovery attempts within ${this.recoveryOptions.recoveryCircuitWindowMs}ms`,
+        `SQLite recovery circuit is open for ${this.displayDbPath}: too many failed recovery attempts within ${this.recoveryOptions.recoveryCircuitWindowMs}ms`,
       );
     }
   }
@@ -991,7 +991,7 @@ export class DatabaseManager {
    * Get the database file path.
    */
   getPath(): string {
-    return this.dbPath;
+    return this.displayDbPath;
   }
 
   /**

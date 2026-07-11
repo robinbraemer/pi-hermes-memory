@@ -34,6 +34,10 @@ const RECOVERY_ACTIVE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 const RETIRED_RECOVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const RETIRED_RECOVERY_MAX_COUNT = 32;
 const RETIRED_RECOVERY_MAX_BYTES = 64 * 1024 * 1024;
+const CONFLICT_ACTIVE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+const CONFLICT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const CONFLICT_MAX_COUNT = 32;
+const CONFLICT_MAX_BYTES = 64 * 1024 * 1024;
 
 class ExternalMemoryWriteConflict extends Error {}
 
@@ -42,6 +46,7 @@ export class MemoryStore {
   private userEntries: string[] = [];
   private failureEntries: string[] = [];
   private fileFingerprints: Record<string, string> = {};
+  private storagePaths: Partial<Record<"memory" | "user" | "failure", string>> = {};
   private snapshot: MemorySnapshot = { memory: "", user: "" };
   private consolidator: ((target: "memory" | "user" | "failure", signal?: AbortSignal) => Promise<ConsolidationResult>) | null = null;
   private mutationObserver: ((target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>) | null = null;
@@ -75,7 +80,15 @@ export class MemoryStore {
   }
 
   async getStorageIdentity(target: "memory" | "user" | "failure"): Promise<string> {
-    return canonicalMarkdownIdentity(this.pathFor(target));
+    return this.resolveStoragePath(target);
+  }
+
+  private async resolveStoragePath(target: "memory" | "user" | "failure"): Promise<string> {
+    const cached = this.storagePaths[target];
+    if (cached) return cached;
+    const resolved = await canonicalMarkdownIdentity(this.pathFor(target));
+    this.storagePaths[target] = resolved;
+    return resolved;
   }
 
   private entriesFor(target: "memory" | "user" | "failure"): string[] {
@@ -109,7 +122,7 @@ export class MemoryStore {
   async loadFromDisk(): Promise<void> {
     await fs.mkdir(this.memoryDir, { recursive: true });
     for (const target of ["memory", "user", "failure"] as const) {
-      const filePath = this.pathFor(target);
+      const filePath = await this.resolveStoragePath(target);
       const state = await this.readFileState(filePath);
       this.setEntries(target, [...new Set(state.entries)]);
       this.fileFingerprints[filePath] = state.fingerprint;
@@ -566,7 +579,7 @@ export class MemoryStore {
   }
 
   private async syncTargetFromDiskIfChanged(target: "memory" | "user" | "failure"): Promise<void> {
-    const filePath = this.pathFor(target);
+    const filePath = await this.resolveStoragePath(target);
     const state = await this.readFileState(filePath);
     if (this.fileFingerprints[filePath] === state.fingerprint) return;
 
@@ -578,12 +591,13 @@ export class MemoryStore {
     target: "memory" | "user" | "failure",
     mutation: () => Promise<MemoryResult>,
   ): Promise<MemoryResult> {
-    return withMarkdownMutationLock(this.pathFor(target), async () => {
+    const storagePath = await this.resolveStoragePath(target);
+    return withMarkdownMutationLock(storagePath, async () => {
       for (let attempt = 0; ; attempt++) {
         try {
           const result = await mutation();
           if (result.success && this.mutationObserver) {
-            const filePath = this.pathFor(target);
+            const filePath = storagePath;
             const state = await this.readFileState(filePath);
             this.setEntries(target, [...new Set(state.entries)]);
             this.fileFingerprints[filePath] = state.fingerprint;
@@ -600,7 +614,7 @@ export class MemoryStore {
           }
           return result;
         } catch (error) {
-          const filePath = this.pathFor(target);
+          const filePath = storagePath;
           delete this.fileFingerprints[filePath];
           const state = await this.readFileState(filePath);
           this.setEntries(target, [...new Set(state.entries)]);
@@ -624,13 +638,13 @@ export class MemoryStore {
    * drive than the memory directory (common on Windows).
    */
   private async saveToDisk(target: "memory" | "user" | "failure"): Promise<void> {
-    const filePath = this.pathFor(target);
+    const filePath = await this.resolveStoragePath(target);
     const entries = this.entriesFor(target);
     const content = entries.length ? entries.join(ENTRY_DELIMITER) : "";
     const expectedFingerprint = this.fileFingerprints[filePath] ?? "missing";
 
     // Use the memory directory for temp files so rename stays on the same device
-    const tmpDir = await fs.mkdtemp(path.join(this.memoryDir, ".tmp-"));
+    const tmpDir = await fs.mkdtemp(path.join(path.dirname(filePath), ".tmp-"));
     const tmpPath = path.join(tmpDir, "write.tmp");
 
     try {
@@ -727,6 +741,11 @@ export class MemoryStore {
     const directory = path.dirname(filePath);
     const recoveryPrefix = `.${path.basename(filePath)}.recovery-`;
     const retiredPrefix = `.${path.basename(filePath)}.retired-`;
+    const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const conflictPattern = new RegExp(
+      `^\\.${escapedName}\\.conflict-local-\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
+      "i",
+    );
     const activeCutoff = Date.now() - RECOVERY_ACTIVE_GRACE_MS;
     try {
       const names = await fs.readdir(directory);
@@ -762,6 +781,36 @@ export class MemoryStore {
         if (withinAge && withinCount && withinBytes) {
           retainedCount++;
           retainedBytes += item.state.size;
+          continue;
+        }
+        try { await fs.unlink(item.path); } catch {}
+      }
+
+      const conflictNames = (await fs.readdir(directory)).filter((name) => conflictPattern.test(name));
+      const conflicts = await Promise.all(conflictNames.map(async (name) => {
+        const conflictPath = path.join(directory, name);
+        try {
+          const state = await fs.lstat(conflictPath);
+          return state.isFile() ? { path: conflictPath, state } : null;
+        } catch {
+          return null;
+        }
+      }));
+      const graceCutoff = Date.now() - CONFLICT_ACTIVE_GRACE_MS;
+      const conflictMaxAgeCutoff = Date.now() - CONFLICT_MAX_AGE_MS;
+      const conflictCandidates = conflicts
+        .filter((item): item is NonNullable<typeof item> => item !== null)
+        .sort((left, right) => right.state.mtimeMs - left.state.mtimeMs);
+      let conflictCount = 0;
+      let conflictBytes = 0;
+      for (const item of conflictCandidates) {
+        const withinCount = conflictCount < CONFLICT_MAX_COUNT;
+        const withinBytes = conflictBytes + item.state.size <= CONFLICT_MAX_BYTES;
+        const withinGrace = item.state.mtimeMs >= graceCutoff;
+        const withinAge = item.state.mtimeMs >= conflictMaxAgeCutoff;
+        if ((withinGrace || withinAge) && withinCount && withinBytes) {
+          conflictCount++;
+          conflictBytes += item.state.size;
           continue;
         }
         try { await fs.unlink(item.path); } catch {}

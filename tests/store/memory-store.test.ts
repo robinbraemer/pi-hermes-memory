@@ -9,6 +9,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 
 
@@ -821,6 +822,37 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       raw = await readRaw(memoryPath);
       assert.equal(raw.trim(), "");
     });
+
+    it("mutates a file-symlinked Markdown target without replacing the link", { skip: process.platform === "win32" }, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-symlink-test-"));
+      const realDir = path.join(root, "real");
+      const aliasDir = path.join(root, "alias");
+      await fs.mkdir(realDir);
+      await fs.mkdir(aliasDir);
+      const realPath = path.join(realDir, MEMORY_FILE);
+      const aliasPath = path.join(aliasDir, MEMORY_FILE);
+      await fs.writeFile(realPath, `${TEST_MARKER} original`, "utf-8");
+      await fs.symlink(realPath, aliasPath, "file");
+
+      try {
+        const aliasStore = new MemoryStore(makeConfig({ memoryDir: aliasDir }));
+        await aliasStore.loadFromDisk();
+        await aliasStore.add("memory", `${TEST_MARKER} alias write`);
+
+        assert.equal((await fs.lstat(aliasPath)).isSymbolicLink(), true);
+        const directStore = new MemoryStore(makeConfig({ memoryDir: realDir }));
+        await directStore.loadFromDisk();
+        await directStore.add("memory", `${TEST_MARKER} direct write`);
+
+        const raw = await fs.readFile(realPath, "utf-8");
+        assert.match(raw, /original/);
+        assert.match(raw, /alias write/);
+        assert.match(raw, /direct write/);
+        assert.equal((await fs.lstat(aliasPath)).isSymbolicLink(), true);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
   });
 
   // ─── Both targets ───
@@ -1205,6 +1237,50 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(!retiredFiles.includes(path.basename(staleRetiredPath)));
       assert.ok(retiredFiles.length <= 32);
       assert.ok(retiredStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
+    });
+
+    it("bounds generated conflict artifacts without following lookalike symlinks", async () => {
+      const externalPath = path.join(MEMORY_DIR, "outside-conflict-data");
+      await writeRaw(externalPath, `${TEST_MARKER} outside data`);
+      const symlinkPath = path.join(
+        MEMORY_DIR,
+        `.${MEMORY_FILE}.conflict-local-${Date.now()}-${randomUUID()}`,
+      );
+      if (process.platform !== "win32") await fs.symlink(externalPath, symlinkPath, "file");
+
+      for (let index = 0; index < 40; index++) {
+        const conflictPath = path.join(
+          MEMORY_DIR,
+          `.${MEMORY_FILE}.conflict-local-${Date.now() - index}-${randomUUID()}`,
+        );
+        await writeRaw(conflictPath, `${TEST_MARKER} conflict ${index}`);
+        await fs.truncate(conflictPath, 2 * 1024 * 1024);
+      }
+      const stalePath = path.join(
+        MEMORY_DIR,
+        `.${MEMORY_FILE}.conflict-local-${Date.now()}-${randomUUID()}`,
+      );
+      await writeRaw(stalePath, `${TEST_MARKER} stale conflict`);
+      const stale = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+      await fs.utimes(stalePath, stale, stale);
+
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} triggers conflict pruning`);
+
+      const names = await fs.readdir(MEMORY_DIR);
+      const conflicts = names.filter((name) => /^\.MEMORY\.md\.conflict-local-\d+-[0-9a-f-]{36}$/.test(name));
+      const regularConflicts = [];
+      for (const name of conflicts) {
+        const artifactPath = path.join(MEMORY_DIR, name);
+        if ((await fs.lstat(artifactPath)).isFile()) regularConflicts.push(artifactPath);
+      }
+      const stats = await Promise.all(regularConflicts.map((artifactPath) => fs.stat(artifactPath)));
+      assert.ok(!names.includes(path.basename(stalePath)));
+      assert.ok(regularConflicts.length <= 32);
+      assert.ok(stats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
+      assert.equal(await fs.readFile(externalPath, "utf-8"), `${TEST_MARKER} outside data`);
+      if (process.platform !== "win32") assert.equal((await fs.lstat(symlinkPath)).isSymbolicLink(), true);
     });
 
     it("commits and observes a mutation when published-link cleanup fails", async () => {

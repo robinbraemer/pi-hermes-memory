@@ -377,6 +377,36 @@ describe('DatabaseManager', () => {
       }
     });
 
+    it('repairs a file-symlinked database target without replacing the link', { skip: process.platform === 'win32' }, () => {
+      dbManager.close();
+      const realDir = path.join(tmpDir, 'real');
+      const aliasDir = path.join(tmpDir, 'alias');
+      fs.mkdirSync(realDir);
+      fs.mkdirSync(aliasDir);
+      const realDbPath = path.join(realDir, 'sessions.db');
+      const aliasDbPath = path.join(aliasDir, 'sessions.db');
+      fs.writeFileSync(realDbPath, 'not a sqlite database');
+      fs.symlinkSync(realDbPath, aliasDbPath, 'file');
+
+      const aliasManager = new DatabaseManager(aliasDir);
+      const aliasDb = aliasManager.getDb();
+      aliasDb.prepare("INSERT INTO extension_metadata (key, value) VALUES ('alias-write', 'kept')").run();
+      aliasManager.close();
+
+      assert.equal(fs.lstatSync(aliasDbPath).isSymbolicLink(), true);
+      const directManager = new DatabaseManager(realDir);
+      try {
+        const directDb = directManager.getDb();
+        assertQuickCheckOk(directDb as InstanceType<typeof Database>);
+        assert.deepEqual(
+          directDb.prepare("SELECT value FROM extension_metadata WHERE key = 'alias-write'").get(),
+          { value: 'kept' },
+        );
+      } finally {
+        directManager.close();
+      }
+    });
+
     it('cleans abandoned rebuild files and caps corrupt backup sets', () => {
       dbManager.close();
       for (let index = 0; index < 5; index++) {
