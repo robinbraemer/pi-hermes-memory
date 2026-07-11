@@ -90,11 +90,14 @@ const RELEASE_ATTEMPTS = 3;
 const RELEASE_RETRY_WINDOW_MS = 30_000;
 const RELEASE_RETRY_INITIAL_DELAY_MS = 10;
 const RELEASE_RETRY_MAX_DELAY_MS = 1_000;
+const RELEASE_PERSISTENT_RETRY_MAX_DELAY_MS = 60_000;
 
 interface PendingRelease {
   attempt: () => boolean;
+  persistentAttempt: () => boolean;
   deadline: number;
   nextDelayMs: number;
+  persistentDelayMs: number;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -258,8 +261,10 @@ export class AtomicLockCoordinator {
     if (pendingReleases.has(pendingKey)) return;
     const pending: PendingRelease = {
       attempt: () => this.tryDeleteOwnedLock(key, token),
+      persistentAttempt: () => this.tryDeleteOwnedLock(key, token, 1, 0),
       deadline: Date.now() + RELEASE_RETRY_WINDOW_MS,
       nextDelayMs: RELEASE_RETRY_INITIAL_DELAY_MS,
+      persistentDelayMs: RELEASE_RETRY_MAX_DELAY_MS,
     };
     pendingReleases.set(pendingKey, pending);
     this.schedulePendingRelease(pendingKey, pending);
@@ -274,17 +279,24 @@ export class AtomicLockCoordinator {
     if (pendingReleases.has(pendingKey)) return;
     const pending: PendingRelease = {
       attempt: () => this.tryDeleteOwnedReadLock(key, token),
+      persistentAttempt: () => this.tryDeleteOwnedReadLock(key, token, 1, 0),
       deadline: Date.now() + RELEASE_RETRY_WINDOW_MS,
       nextDelayMs: RELEASE_RETRY_INITIAL_DELAY_MS,
+      persistentDelayMs: RELEASE_RETRY_MAX_DELAY_MS,
     };
     pendingReleases.set(pendingKey, pending);
     this.schedulePendingRelease(pendingKey, pending);
   }
 
-  private tryDeleteOwnedLock(key: string, token: string): boolean {
-    for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt++) {
+  private tryDeleteOwnedLock(
+    key: string,
+    token: string,
+    attempts = RELEASE_ATTEMPTS,
+    busyTimeoutMs = 5_000,
+  ): boolean {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       try {
-        this.deleteOwnedLock(key, token);
+        this.deleteOwnedLock(key, token, busyTimeoutMs);
         return true;
       } catch {
       }
@@ -292,8 +304,8 @@ export class AtomicLockCoordinator {
     return false;
   }
 
-  private deleteOwnedLock(key: string, token: string): void {
-    const db = this.open();
+  private deleteOwnedLock(key: string, token: string, busyTimeoutMs = 5_000): void {
+    const db = this.open(busyTimeoutMs);
     try {
       db.prepare('DELETE FROM locks WHERE lock_key = ? AND token = ?').run(key, token);
     } finally {
@@ -301,10 +313,15 @@ export class AtomicLockCoordinator {
     }
   }
 
-  private tryDeleteOwnedReadLock(key: string, token: string): boolean {
-    for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt++) {
+  private tryDeleteOwnedReadLock(
+    key: string,
+    token: string,
+    attempts = RELEASE_ATTEMPTS,
+    busyTimeoutMs = 5_000,
+  ): boolean {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       try {
-        const db = this.open();
+        const db = this.open(busyTimeoutMs);
         try {
           db.prepare('DELETE FROM read_locks WHERE lock_key = ? AND token = ?').run(key, token);
         } finally {
@@ -335,25 +352,39 @@ export class AtomicLockCoordinator {
   private retryPendingReleases(key: string): void {
     const prefix = `${path.resolve(this.dbPath)}\0${key}\0`;
     for (const [pendingKey, pending] of [...pendingReleases.entries()]) {
-      if (pendingKey.startsWith(prefix) && pending.attempt()) {
+      if (pendingKey.startsWith(prefix) && this.attemptPendingRelease(pending)) {
         this.clearPendingRelease(pendingKey, pending);
       }
     }
   }
 
+  private attemptPendingRelease(pending: PendingRelease): boolean {
+    return Date.now() >= pending.deadline
+      ? pending.persistentAttempt()
+      : pending.attempt();
+  }
+
   private schedulePendingRelease(pendingKey: string, pending: PendingRelease): void {
     const remainingMs = pending.deadline - Date.now();
+    const persistent = remainingMs <= 0;
     const delayMs = remainingMs > 0
       ? Math.min(pending.nextDelayMs, remainingMs)
-      : RELEASE_RETRY_MAX_DELAY_MS;
+      : pending.persistentDelayMs;
     pending.timer = setTimeout(() => {
       pending.timer = undefined;
       if (pendingReleases.get(pendingKey) !== pending) return;
-      if (pending.attempt()) {
+      if ((persistent ? pending.persistentAttempt : pending.attempt)()) {
         this.clearPendingRelease(pendingKey, pending);
         return;
       }
-      pending.nextDelayMs = Math.min(pending.nextDelayMs * 2, RELEASE_RETRY_MAX_DELAY_MS);
+      if (persistent) {
+        pending.persistentDelayMs = Math.min(
+          pending.persistentDelayMs * 2,
+          RELEASE_PERSISTENT_RETRY_MAX_DELAY_MS,
+        );
+      } else {
+        pending.nextDelayMs = Math.min(pending.nextDelayMs * 2, RELEASE_RETRY_MAX_DELAY_MS);
+      }
       this.schedulePendingRelease(pendingKey, pending);
     }, delayMs);
     pending.timer.unref?.();
@@ -370,13 +401,13 @@ export class AtomicLockCoordinator {
     return `${path.resolve(this.dbPath)}\0${key}\0${token}`;
   }
 
-  private open(): DatabaseLike {
+  private open(busyTimeoutMs = 5_000): DatabaseLike {
     fs.mkdirSync(path.dirname(this.dbPath), { recursive: true });
     const existed = fs.existsSync(this.dbPath);
     const db = new Database(this.dbPath);
     try {
       db.exec(`
-        PRAGMA busy_timeout = 5000;
+        PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeoutMs))};
         PRAGMA journal_mode = WAL;
         CREATE TABLE IF NOT EXISTS locks (
           lock_key TEXT PRIMARY KEY,

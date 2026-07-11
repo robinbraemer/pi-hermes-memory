@@ -269,6 +269,51 @@ describe('AtomicLockCoordinator', () => {
     }
   });
 
+  it('uses one nonblocking cleanup attempt after the release deadline', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    const prototype = AtomicLockCoordinator.prototype as any;
+    const originalTryDeleteOwnedReadLock = prototype.tryDeleteOwnedReadLock;
+    const originalDateNow = Date.now;
+    const persistentCalls: Array<[number | undefined, number | undefined]> = [];
+    let invocation = 0;
+    let cleanupAllowed = false;
+    prototype.tryDeleteOwnedReadLock = function (
+      key: string,
+      token: string,
+      attempts?: number,
+      busyTimeoutMs?: number,
+    ): boolean {
+      invocation++;
+      if (invocation === 1) return false;
+      persistentCalls.push([attempts, busyTimeoutMs]);
+      return cleanupAllowed
+        ? originalTryDeleteOwnedReadLock.call(this, key, token, attempts, busyTimeoutMs)
+        : false;
+    };
+    let coordinator: AtomicLockCoordinator | null = null;
+
+    try {
+      coordinator = new AtomicLockCoordinator(path.join(tmpDir, 'locks.sqlite'));
+      const reader = coordinator.tryAcquireShared('database-access', { staleMs: 60_000 });
+      assert.ok(reader);
+      const now = originalDateNow();
+      let nowCalls = 0;
+      Date.now = () => nowCalls++ === 0 ? now : now + 60_000;
+      reader.release();
+      Date.now = originalDateNow;
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+
+      assert.deepStrictEqual(persistentCalls[0], [1, 0]);
+    } finally {
+      Date.now = originalDateNow;
+      cleanupAllowed = true;
+      const exclusive = coordinator?.tryAcquireExclusive('database-access', { staleMs: 60_000 });
+      exclusive?.release();
+      prototype.tryDeleteOwnedReadLock = originalTryDeleteOwnedReadLock;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('retries a failed owner release independently so another process can acquire', async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
     const dbPath = path.join(tmpDir, 'locks.sqlite');
