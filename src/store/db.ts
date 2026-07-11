@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { SCHEMA_SQL } from './schema.js';
 import { AtomicLockCoordinator } from './atomic-lock-coordinator.js';
+import { canonicalStoragePathSync } from './canonical-storage-path.js';
 
 type StatementLike = {
   run: (...args: any[]) => any;
@@ -82,29 +83,6 @@ const DEFAULT_RECOVERY_OPTIONS: ResolvedDatabaseRecoveryOptions = {
   recoveryBackupRetention: 3,
 };
 
-function canonicalStorageIdentity(filePath: string): string {
-  const resolved = path.resolve(filePath);
-  try {
-    return fs.realpathSync.native(resolved);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-
-  const suffixes = [path.basename(resolved)];
-  let ancestor = path.dirname(resolved);
-  while (true) {
-    try {
-      return path.join(fs.realpathSync.native(ancestor), ...suffixes.reverse());
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    const parent = path.dirname(ancestor);
-    if (parent === ancestor) return resolved;
-    suffixes.push(path.basename(ancestor));
-    ancestor = parent;
-  }
-}
-
 function quoteIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
@@ -173,7 +151,7 @@ export class DatabaseManager {
 
   private get dbPath(): string {
     if (!this.canonicalDbPath) {
-      this.canonicalDbPath = canonicalStorageIdentity(this.displayDbPath);
+      this.canonicalDbPath = canonicalStoragePathSync(this.displayDbPath);
     }
     return this.canonicalDbPath;
   }

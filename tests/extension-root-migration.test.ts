@@ -51,10 +51,12 @@ describe("migrateExtensionRoot", () => {
     const legacy = path.join(tmpDir, "memory");
     const target = path.join(tmpDir, "pi-hermes-memory");
     fs.mkdirSync(legacy, { recursive: true });
-    fs.writeFileSync(path.join(legacy, "sessions.db"), "populated legacy database", "utf-8");
+    const sourceDb = new Database(path.join(legacy, "sessions.db"));
+    sourceDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('legacy')");
+    sourceDb.close();
 
     const result = await migrateExtensionRoot(legacy, target, {
-      moveFile: async () => {
+      publishDatabaseFile: async () => {
         throw new Error("injected sessions.db move failure");
       },
     });
@@ -100,26 +102,72 @@ describe("migrateExtensionRoot", () => {
     }
   });
 
-  it("rolls back a partial SQLite publish and leaves the legacy generation retryable", async () => {
+  it("migrates one SQLite snapshot while a checkpoint runs", async () => {
     const legacy = path.join(tmpDir, "memory");
     const target = path.join(tmpDir, "pi-hermes-memory");
     fs.mkdirSync(legacy, { recursive: true });
-    fs.writeFileSync(path.join(legacy, "sessions.db"), "database generation", "utf-8");
-    fs.writeFileSync(path.join(legacy, "sessions.db-wal"), "committed wal rows", "utf-8");
-    fs.writeFileSync(path.join(legacy, "sessions.db-shm"), "shared memory", "utf-8");
+    const sourceDb = new Database(path.join(legacy, "sessions.db"));
+    let checkpointTriggered = false;
+    try {
+      sourceDb.pragma("journal_mode = WAL");
+      sourceDb.pragma("wal_autocheckpoint = 0");
+      sourceDb.exec("CREATE TABLE memories (content TEXT)");
+      sourceDb.pragma("wal_checkpoint(TRUNCATE)");
+      const insert = sourceDb.prepare("INSERT INTO memories VALUES (?)");
+      const insertMany = sourceDb.transaction(() => {
+        for (let index = 0; index < 500; index++) insert.run(`committed-${index}-${"x".repeat(1024)}`);
+      });
+      insertMany();
+
+      const result = await migrateExtensionRoot(legacy, target, {
+        onDatabaseBackupProgress: () => {
+          if (checkpointTriggered) return;
+          checkpointTriggered = true;
+          sourceDb.pragma("wal_checkpoint(TRUNCATE)");
+        },
+      });
+
+      assert.equal(checkpointTriggered, true);
+      assert.deepStrictEqual(result.criticalFailures, []);
+      assert.equal(fs.existsSync(path.join(target, "sessions.db-wal")), false);
+      assert.equal(fs.existsSync(path.join(target, "sessions.db-shm")), false);
+      const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
+      try {
+        assert.equal(
+          (migrated.prepare("SELECT COUNT(*) AS count FROM memories").get() as { count: number }).count,
+          500,
+        );
+        assert.deepStrictEqual(migrated.pragma("integrity_check"), [{ integrity_check: "ok" }]);
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      sourceDb.close();
+    }
+  });
+
+  it("leaves the legacy SQLite generation retryable when snapshot publish fails", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    const sourceDb = new Database(path.join(legacy, "sessions.db"));
+    sourceDb.pragma("journal_mode = WAL");
+    sourceDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('legacy')");
+    sourceDb.close();
     let publishes = 0;
 
     const result = await migrateExtensionRoot(legacy, target, {
       publishDatabaseFile: async (source, destination) => {
         publishes++;
-        if (publishes === 2) throw new Error("injected sidecar publish failure");
+        if (publishes === 1) throw new Error("injected snapshot publish failure");
         await fs.promises.link(source, destination);
       },
     });
 
     assert.deepStrictEqual(result.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+    assert.equal(publishes, 1);
     for (const name of ["sessions.db", "sessions.db-wal", "sessions.db-shm"]) {
-      assert.equal(fs.existsSync(path.join(legacy, name)), true);
+      if (name === "sessions.db") assert.equal(fs.existsSync(path.join(legacy, name)), true);
       assert.equal(fs.existsSync(path.join(target, name)), false);
     }
   });

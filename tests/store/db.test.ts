@@ -423,6 +423,49 @@ describe('DatabaseManager', () => {
       }
     });
 
+    it('creates and repairs a dangling absolute database symlink through its target', { skip: process.platform === 'win32' }, () => {
+      dbManager.close();
+      const realDir = path.join(tmpDir, 'real');
+      const aliasDir = path.join(tmpDir, 'alias');
+      fs.mkdirSync(realDir);
+      fs.mkdirSync(aliasDir);
+      const realDbPath = path.join(realDir, 'sessions.db');
+      const aliasDbPath = path.join(aliasDir, 'sessions.db');
+      fs.symlinkSync(realDbPath, aliasDbPath, 'file');
+
+      const aliasManager = new DatabaseManager(aliasDir);
+      aliasManager.getDb().prepare(
+        "INSERT INTO extension_metadata (key, value) VALUES ('before-corruption', 'kept')",
+      ).run();
+      aliasManager.close();
+      fs.writeFileSync(realDbPath, 'not a sqlite database');
+
+      try {
+        assertQuickCheckOk(aliasManager.getDb() as InstanceType<typeof Database>);
+      } finally {
+        aliasManager.close();
+      }
+      assert.equal(fs.lstatSync(aliasDbPath).isSymbolicLink(), true);
+      const directDb = new Database(realDbPath);
+      try {
+        assertQuickCheckOk(directDb);
+      } finally {
+        directDb.close();
+      }
+    });
+
+    it('rejects database symlink loops before opening SQLite', { skip: process.platform === 'win32' }, () => {
+      dbManager.close();
+      const loopDir = path.join(tmpDir, 'loop');
+      fs.mkdirSync(loopDir);
+      fs.symlinkSync('sessions.other', path.join(loopDir, 'sessions.db'), 'file');
+      fs.symlinkSync('sessions.db', path.join(loopDir, 'sessions.other'), 'file');
+
+      const manager = new DatabaseManager(loopDir);
+      assert.throws(() => manager.getDb(), /symbolic link loop/i);
+      manager.close();
+    });
+
     it('cleans abandoned rebuild files and caps corrupt backup sets', () => {
       dbManager.close();
       for (let index = 0; index < 5; index++) {

@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
+import Database from "better-sqlite3";
 
 const DATABASE_FILES = ["sessions.db", "sessions.db-wal", "sessions.db-shm"] as const;
 
@@ -21,6 +22,7 @@ export interface ExtensionRootMigrationResult {
 export interface ExtensionRootMigrationOptions {
   moveFile?: (source: string, target: string) => Promise<void>;
   publishDatabaseFile?: (source: string, target: string) => Promise<void>;
+  onDatabaseBackupProgress?: () => void;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -57,45 +59,37 @@ async function moveFileSafe(source: string, target: string): Promise<void> {
   await fs.unlink(source);
 }
 
-async function fileFingerprint(filePath: string): Promise<string> {
-  const handle = await fs.open(filePath, "r");
-  const hash = createHash("sha256");
-  const buffer = Buffer.allocUnsafe(64 * 1024);
+async function stageDatabaseSnapshot(
+  source: string,
+  staged: string,
+  onProgress?: () => void,
+): Promise<void> {
+  const sourceDb = new Database(source, { readonly: true, fileMustExist: true });
   try {
-    for (;;) {
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      hash.update(buffer.subarray(0, bytesRead));
-    }
+    await sourceDb.backup(staged, {
+      progress: () => {
+        onProgress?.();
+        return 64;
+      },
+    });
   } finally {
-    await handle.close();
+    sourceDb.close();
   }
-  return hash.digest("hex");
+
+  const stagedDb = new Database(staged, { readonly: true, fileMustExist: true });
+  try {
+    const check = stagedDb.pragma("integrity_check", { simple: true });
+    if (check !== "ok") throw new Error(`staged SQLite snapshot failed integrity_check: ${String(check)}`);
+  } finally {
+    stagedDb.close();
+  }
 }
 
-async function stageDatabaseArtifact(source: string, staged: string, name: string): Promise<void> {
-  const sourceState = await fs.lstat(source);
-  if (sourceState.isSymbolicLink()) {
-    const before = await fs.readlink(source);
-    const authoritativeTarget = path.resolve(path.dirname(source), before);
-    await fs.symlink(authoritativeTarget, staged);
-    const [after, stagedTarget] = await Promise.all([fs.readlink(source), fs.readlink(staged)]);
-    if (before !== after || path.resolve(path.dirname(staged), stagedTarget) !== authoritativeTarget) {
-      throw new Error(`${name} changed while staging`);
-    }
-    return;
-  }
-  if (!sourceState.isFile()) throw new Error(`${name} is not a regular file or symlink`);
-
-  const before = await fileFingerprint(source);
-  await fs.copyFile(source, staged);
-  const [after, stagedFingerprint] = await Promise.all([
-    fileFingerprint(source),
-    fileFingerprint(staged),
-  ]);
-  if (before !== after || after !== stagedFingerprint) {
-    throw new Error(`${name} changed while staging`);
-  }
+async function stageDatabaseSymlink(source: string, staged: string): Promise<void> {
+  const before = await fs.readlink(source);
+  await fs.symlink(path.resolve(path.dirname(source), before), staged);
+  const after = await fs.readlink(source);
+  if (before !== after) throw new Error("sessions.db symlink changed while staging");
 }
 
 async function moveDirContents(
@@ -161,6 +155,7 @@ async function migrateDatabaseGeneration(
   targetRoot: string,
   result: ExtensionRootMigrationResult,
   publish: (source: string, target: string) => Promise<void>,
+  onBackupProgress?: () => void,
 ): Promise<void> {
   const sourceNames: string[] = [];
   const targetNames: string[] = [];
@@ -194,19 +189,23 @@ async function migrateDatabaseGeneration(
   const published: string[] = [];
   try {
     await fs.mkdir(stagingDir, { mode: 0o700 });
-    for (const name of sourceNames) {
-      const source = path.join(legacyRoot, name);
-      const staged = path.join(stagingDir, name);
-      await stageDatabaseArtifact(source, staged, name);
+    const source = path.join(legacyRoot, "sessions.db");
+    const staged = path.join(stagingDir, "sessions.db");
+    const sourceState = await fs.lstat(source);
+    if (sourceState.isSymbolicLink()) {
+      if (sourceNames.length !== 1) {
+        throw new Error("symlinked sessions.db cannot be combined with legacy SQLite sidecars");
+      }
+      await stageDatabaseSymlink(source, staged);
+    } else if (sourceState.isFile()) {
+      await stageDatabaseSnapshot(source, staged, onBackupProgress);
+    } else {
+      throw new Error("sessions.db is not a regular file or symlink");
     }
 
-    const publishOrder = sourceNames.filter((name) => name !== "sessions.db");
-    publishOrder.push("sessions.db");
-    for (const name of publishOrder) {
-      const target = path.join(targetRoot, name);
-      await publish(path.join(stagingDir, name), target);
-      published.push(target);
-    }
+    const target = path.join(targetRoot, "sessions.db");
+    await publish(staged, target);
+    published.push(target);
 
     for (const name of sourceNames) {
       try { await fs.unlink(path.join(legacyRoot, name)); } catch {}
@@ -255,6 +254,7 @@ export async function migrateExtensionRoot(
     targetRoot,
     result,
     options.publishDatabaseFile ?? options.moveFile ?? publishDatabaseFile,
+    options.onDatabaseBackupProgress,
   );
   if (result.criticalFailures.some((failure) => failure.name === "sessions.db")) return result;
   await moveDirContents(legacyRoot, targetRoot, result, options.moveFile ?? moveFileSafe);

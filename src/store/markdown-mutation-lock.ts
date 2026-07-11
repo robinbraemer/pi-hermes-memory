@@ -1,25 +1,12 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AtomicLockCoordinator, type AtomicLockLease } from "./atomic-lock-coordinator.js";
+import { canonicalStoragePath } from "./canonical-storage-path.js";
 
 const MUTATION_WAIT_MS = 5_000;
 const MUTATION_STALE_MS = 300_000;
 
 export async function canonicalMarkdownIdentity(filePath: string): Promise<string> {
-  const resolvedPath = path.resolve(filePath);
-  let candidate = resolvedPath;
-  const suffix: string[] = [];
-  while (true) {
-    try {
-      return path.join(await fs.realpath(candidate), ...suffix.reverse());
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const parent = path.dirname(candidate);
-      if (parent === candidate) return resolvedPath;
-      suffix.push(path.basename(candidate));
-      candidate = parent;
-    }
-  }
+  return canonicalStoragePath(filePath);
 }
 
 export async function acquireMarkdownMutationLock(filePath: string): Promise<AtomicLockLease> {

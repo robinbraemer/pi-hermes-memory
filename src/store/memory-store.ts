@@ -666,6 +666,7 @@ export class MemoryStore {
         }
       } else {
         const recoveryPath = this.recoveryPathFor(filePath);
+        const publishedIdentity = await this.fileIdentity(tmpPath);
         try {
           await fs.rename(filePath, recoveryPath);
         } catch (error) {
@@ -696,15 +697,16 @@ export class MemoryStore {
             } catch {
             }
             try {
-              await fs.copyFile(recoveryPath, tmpPath);
+              await this.rollbackPublishedFile(recoveryPath, filePath, publishedIdentity);
             } catch (restorePublishedError) {
               rollbackError = restorePublishedError;
             }
-          }
-          try {
-            await this.restoreDisplacedFile(recoveryPath, filePath);
-          } catch (restoreError) {
-            rollbackError ??= restoreError;
+          } else {
+            try {
+              await this.restoreDisplacedFile(recoveryPath, filePath);
+            } catch (restoreError) {
+              rollbackError = restoreError;
+            }
           }
           if (rollbackError) throw rollbackError;
           if ((error as NodeJS.ErrnoException).code === "EEXIST"
@@ -728,6 +730,48 @@ export class MemoryStore {
   private async restoreDisplacedFile(displacedPath: string, filePath: string): Promise<void> {
     try {
       await fs.link(displacedPath, filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+  }
+
+  private async fileIdentity(filePath: string): Promise<{ dev: number; ino: number }> {
+    const state = await fs.lstat(filePath);
+    return { dev: state.dev, ino: state.ino };
+  }
+
+  private sameFileIdentity(
+    left: { dev: number; ino: number },
+    right: { dev: number; ino: number },
+  ): boolean {
+    return left.dev === right.dev && left.ino === right.ino;
+  }
+
+  private async rollbackPublishedFile(
+    displacedPath: string,
+    filePath: string,
+    publishedIdentity: { dev: number; ino: number },
+  ): Promise<void> {
+    const conflictPath = path.join(
+      path.dirname(filePath),
+      `.${path.basename(filePath)}.conflict-local-${Date.now()}-${randomUUID()}`,
+    );
+    try {
+      await fs.rename(filePath, conflictPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await this.restoreDisplacedFile(displacedPath, filePath);
+      return;
+    }
+
+    const movedIdentity = await this.fileIdentity(conflictPath);
+    if (this.sameFileIdentity(movedIdentity, publishedIdentity)) {
+      await this.restoreDisplacedFile(displacedPath, filePath);
+      return;
+    }
+
+    try {
+      await fs.link(conflictPath, filePath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }

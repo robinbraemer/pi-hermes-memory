@@ -853,6 +853,48 @@ describe("MemoryStore", { concurrency: 1 }, () => {
         await fs.rm(root, { recursive: true, force: true });
       }
     });
+
+    it("creates a dangling relative Markdown symlink target and preserves the link", { skip: process.platform === "win32" }, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-dangling-symlink-test-"));
+      const realDir = path.join(root, "real");
+      const aliasDir = path.join(root, "alias");
+      await fs.mkdir(realDir);
+      await fs.mkdir(aliasDir);
+      const realPath = path.join(realDir, MEMORY_FILE);
+      const aliasPath = path.join(aliasDir, MEMORY_FILE);
+      await fs.symlink(path.relative(aliasDir, realPath), aliasPath, "file");
+
+      try {
+        const aliasStore = new MemoryStore(makeConfig({ memoryDir: aliasDir }));
+        await aliasStore.loadFromDisk();
+        const aliasResult = await aliasStore.add("memory", `${TEST_MARKER} alias write`);
+        assert.equal(aliasResult.success, true);
+
+        const directStore = new MemoryStore(makeConfig({ memoryDir: realDir }));
+        await directStore.loadFromDisk();
+        const directResult = await directStore.add("memory", `${TEST_MARKER} direct write`);
+        assert.equal(directResult.success, true);
+
+        const raw = await fs.readFile(realPath, "utf-8");
+        assert.match(raw, /alias write/);
+        assert.match(raw, /direct write/);
+        assert.equal((await fs.lstat(aliasPath)).isSymbolicLink(), true);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("rejects Markdown symlink loops before mutation", { skip: process.platform === "win32" }, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-symlink-loop-test-"));
+      await fs.symlink(USER_FILE, path.join(root, MEMORY_FILE), "file");
+      await fs.symlink(MEMORY_FILE, path.join(root, USER_FILE), "file");
+      try {
+        const store = new MemoryStore(makeConfig({ memoryDir: root }));
+        await assert.rejects(store.loadFromDisk(), /symbolic link loop/i);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
   });
 
   // ─── Both targets ───
@@ -1123,6 +1165,35 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       const raw = await readRaw(memoryPath);
       assert.match(raw, /original before preservation failure/);
       assert.match(raw, /later successful add/);
+      assert.doesNotMatch(raw, /failed local add/);
+    });
+
+    it("rolls back a published mutation without copying through the temporary link", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} original before copy failure`);
+
+      const originalRead = (store as any).readFileState.bind(store);
+      let displacedReads = 0;
+      (store as any).readFileState = async (filePath: string) => {
+        if (path.basename(filePath).startsWith(`.${MEMORY_FILE}.recovery-`)) {
+          displacedReads++;
+          if (displacedReads === 2) throw new Error("injected post-publish failure");
+        }
+        return originalRead(filePath);
+      };
+      (store as any).preserveConflictFile = async (tmpPath: string) => {
+        await fs.unlink(tmpPath);
+        await fs.mkdir(tmpPath);
+        throw new Error("injected conflict copy failure");
+      };
+
+      await assert.rejects(
+        store.add("memory", `${TEST_MARKER} failed local add`),
+        /injected post-publish failure/,
+      );
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /original before copy failure/);
       assert.doesNotMatch(raw, /failed local add/);
     });
 
