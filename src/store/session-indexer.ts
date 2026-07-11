@@ -37,24 +37,33 @@ export interface IncrementalIndexOptions {
   maxFilesToIndex?: number;
 }
 
+type IndexableSession = Omit<ParsedSession, 'parentSessionId' | 'source'>
+  & Partial<Pick<ParsedSession, 'parentSessionId' | 'source'>>;
+
 /**
  * Index a single session into the database.
  *
  * @returns IndexResult with count of messages indexed
  */
-export function indexSession(dbManager: DatabaseManager, session: ParsedSession): IndexResult {
+export function indexSession(dbManager: DatabaseManager, session: IndexableSession): IndexResult {
   return dbManager.withCorruptionRecovery(() => indexSessionOnce(dbManager, session));
 }
 
-function indexSessionOnce(dbManager: DatabaseManager, session: ParsedSession): IndexResult {
+function indexSessionOnce(dbManager: DatabaseManager, session: IndexableSession): IndexResult {
   const db = dbManager.getDb();
+  const parentSessionId = typeof session.parentSessionId === 'string' && session.parentSessionId.trim()
+    ? session.parentSessionId.trim()
+    : null;
+  const source = typeof session.source === 'string' && session.source.trim()
+    ? session.source.trim()
+    : 'interactive';
 
   const existingSession = db.prepare('SELECT id FROM sessions WHERE id = ?').get(session.id) as { id: string } | undefined;
   const before = db.prepare('SELECT COUNT(*) as count FROM messages WHERE session_id = ?').get(session.id) as { count: number };
 
   const insertSession = db.prepare(`
-    INSERT OR IGNORE INTO sessions (id, project, cwd, started_at, ended_at, message_count)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO sessions (id, project, cwd, started_at, ended_at, parent_session_id, source, message_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const insertMsg = db.prepare(`
@@ -67,6 +76,8 @@ function indexSessionOnce(dbManager: DatabaseManager, session: ParsedSession): I
     SET project = ?,
         cwd = ?,
         ended_at = COALESCE(?, ended_at),
+        parent_session_id = COALESCE(?, parent_session_id),
+        source = ?,
         message_count = (SELECT COUNT(*) FROM messages WHERE session_id = ?)
     WHERE id = ?
   `);
@@ -78,6 +89,8 @@ function indexSessionOnce(dbManager: DatabaseManager, session: ParsedSession): I
       session.cwd,
       session.startedAt,
       session.endedAt,
+      parentSessionId,
+      source,
       session.messages.length
     );
 
@@ -92,7 +105,7 @@ function indexSessionOnce(dbManager: DatabaseManager, session: ParsedSession): I
       );
     }
 
-    updateSession.run(session.project, session.cwd, session.endedAt, session.id, session.id);
+    updateSession.run(session.project, session.cwd, session.endedAt, parentSessionId, source, session.id, session.id);
   };
 
   if (db.transaction) {
@@ -203,6 +216,8 @@ export function parseSessionManagerSnapshot(sessionManager: SessionManagerSnapsh
     cwd: header.cwd,
     startedAt: header.timestamp,
     endedAt: null,
+    parentSessionId: null,
+    source: 'interactive',
     messages,
   };
 }

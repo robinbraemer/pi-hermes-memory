@@ -598,12 +598,21 @@ export class DatabaseManager {
 
   private copySessions(source: DatabaseLike, target: DatabaseLike): number {
     const insert = target.prepare(`
-      INSERT OR IGNORE INTO sessions (id, project, cwd, started_at, ended_at, message_count)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO sessions (id, project, cwd, started_at, ended_at, parent_session_id, source, message_count)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
     let copied = 0;
 
-    for (const row of this.readTableRows(source, 'sessions', ['id', 'project', 'cwd', 'started_at', 'ended_at', 'message_count'])) {
+    for (const row of this.readTableRows(source, 'sessions', [
+      'id',
+      'project',
+      'cwd',
+      'started_at',
+      'ended_at',
+      'parent_session_id',
+      'source',
+      'message_count',
+    ])) {
       if (typeof row.id !== 'string' || typeof row.cwd !== 'string' || typeof row.started_at !== 'string') continue;
       const project = typeof row.project === 'string' && row.project ? row.project : (path.basename(row.cwd) || 'unknown');
       insert.run(
@@ -612,6 +621,8 @@ export class DatabaseManager {
         row.cwd,
         row.started_at,
         this.nullableString(row.ended_at),
+        this.nullableString(row.parent_session_id),
+        typeof row.source === 'string' && row.source.trim() ? row.source.trim() : 'interactive',
         this.integerOr(row.message_count, 0),
       );
       copied++;
@@ -832,6 +843,10 @@ export class DatabaseManager {
       || msg.includes('memories(category)')
       || msg.includes('no such column: project')
       || msg.includes('sessions(project)')
+      || msg.includes('no such column: parent_session_id')
+      || msg.includes('sessions(parent_session_id)')
+      || msg.includes('no such column: source')
+      || msg.includes('sessions(source)')
       || msg.includes('memories(project)');
   }
 
@@ -870,6 +885,12 @@ export class DatabaseManager {
     const names = this.getColumnNames(db, 'sessions');
     if (!names.has('project')) {
       db.exec('ALTER TABLE sessions ADD COLUMN project TEXT');
+    }
+    if (!names.has('parent_session_id')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id)');
+    }
+    if (!names.has('source')) {
+      db.exec("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'interactive'");
     }
 
     this.backfillSessionsProject(db);

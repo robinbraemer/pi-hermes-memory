@@ -233,6 +233,38 @@ describe('DatabaseManager', () => {
       migratedManager.close();
     });
 
+    it('should add lineage metadata columns to legacy sessions without losing rows', () => {
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const legacyDb = new Database(dbPath);
+      legacyDb.exec(`
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY,
+          project TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          message_count INTEGER DEFAULT 0
+        );
+      `);
+      legacyDb.prepare(`
+        INSERT INTO sessions (id, project, cwd, started_at)
+        VALUES (?, ?, ?, ?)
+      `).run('synthetic-legacy', 'synthetic-project', '/synthetic/project', '2026-01-01T00:00:00Z');
+      legacyDb.close();
+
+      const migratedManager = new DatabaseManager(tmpDir);
+      const migratedDb = migratedManager.getDb();
+      const names = (migratedDb.prepare('PRAGMA table_info(sessions)').all() as { name: string }[])
+        .map((column) => column.name);
+      assert.ok(names.includes('parent_session_id'));
+      assert.ok(names.includes('source'));
+      const row = migratedDb.prepare(
+        'SELECT parent_session_id, source FROM sessions WHERE id = ?',
+      ).get('synthetic-legacy') as { parent_session_id: string | null; source: string };
+      assert.deepStrictEqual(row, { parent_session_id: null, source: 'interactive' });
+      migratedManager.close();
+    });
+
     it('should migrate legacy memories table without project column', () => {
       const dbPath = path.join(tmpDir, 'sessions.db');
       const legacyDb = new Database(dbPath);
@@ -652,9 +684,9 @@ describe('DatabaseManager', () => {
     it('repairs recoverable corruption on open and preserves readable rows', () => {
       const db = dbManager.getDb();
       db.prepare(`
-        INSERT INTO sessions (id, project, cwd, started_at)
-        VALUES (?, ?, ?, ?)
-      `).run('recover-session', 'recover-project', '/work/recover', '2026-05-03T00:00:00Z');
+        INSERT INTO sessions (id, project, cwd, started_at, parent_session_id, source)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run('recover-session', 'recover-project', '/synthetic/recover', '2026-05-03T00:00:00Z', 'recover-session', 'cron');
 
       const insertMessage = db.prepare(`
         INSERT INTO messages (id, session_id, role, content, timestamp)
@@ -686,6 +718,10 @@ describe('DatabaseManager', () => {
       assert.deepStrictEqual(dbManager.getStats(), { sessions: 1, messages: 50, memories: 1 });
       const memory = repairedDb.prepare('SELECT content FROM memories WHERE content = ?').get('recoverable memory') as { content: string } | undefined;
       assert.ok(memory);
+      const recoveredSession = repairedDb.prepare(
+        'SELECT parent_session_id, source FROM sessions WHERE id = ?',
+      ).get('recover-session') as { parent_session_id: string | null; source: string };
+      assert.deepStrictEqual(recoveredSession, { parent_session_id: 'recover-session', source: 'cron' });
       assertQuickCheckOk(repairedDb as InstanceType<typeof Database>);
       assert.ok(fs.readdirSync(tmpDir).some((name) => name.startsWith('sessions.db.corrupt-')), 'corrupt DB should be quarantined');
     });

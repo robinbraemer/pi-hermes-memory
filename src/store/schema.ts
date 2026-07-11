@@ -24,6 +24,8 @@ export const SCHEMA_SQL = `
     cwd TEXT NOT NULL,
     started_at TEXT NOT NULL,
     ended_at TEXT,
+    parent_session_id TEXT REFERENCES sessions(id),
+    source TEXT NOT NULL DEFAULT 'interactive',
     message_count INTEGER DEFAULT 0
   );
 
@@ -112,5 +114,7 @@ export const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
   CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
   CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
+  CREATE INDEX IF NOT EXISTS idx_sessions_parent_session_id ON sessions(parent_session_id);
+  CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
   CREATE INDEX IF NOT EXISTS idx_session_files_session_id ON session_files(session_id);
 `;
