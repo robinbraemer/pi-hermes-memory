@@ -57,6 +57,7 @@ export interface ExtensionRootMigrationOptions {
   retireDatabaseFile?: (source: string, target: string) => Promise<void>;
   backupDatabase?: (source: string, staged: string, onProgress?: () => void) => Promise<void>;
   onDatabaseBackupProgress?: () => void;
+  platform?: NodeJS.Platform;
 }
 
 const MIGRATION_LOCK_WAIT_MS = 5000;
@@ -600,6 +601,7 @@ async function migrateDatabaseGeneration(
   retire: (source: string, target: string) => Promise<void>,
   backup: (source: string, staged: string, onProgress?: () => void) => Promise<void>,
   onBackupProgress?: () => void,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<void> {
   let lease: AtomicLockLease | null = null;
   try {
@@ -788,6 +790,7 @@ async function migrateDatabaseGeneration(
   let corruptGeneration = false;
   let generationNames = sourceNames;
   let sourceReservation: FileIdentity | null = null;
+  const closeWriteLockBeforeMove = platform === "win32";
   try {
     await writeMigrationMarker(pendingMarker, {
       version: 1,
@@ -822,6 +825,12 @@ async function migrateDatabaseGeneration(
       throw new Error("sessions.db is not a regular file or symlink");
     }
 
+    if (writeLock && closeWriteLockBeforeMove) {
+      writeLock.exec("COMMIT");
+      writeLock.close();
+      writeLock = null;
+    }
+
     generationNames = await databaseFilesAt(legacyRoot);
     if (!generationNames.includes("sessions.db")) {
       throw new Error("legacy SQLite generation changed before retirement");
@@ -849,6 +858,11 @@ async function migrateDatabaseGeneration(
     if (!corruptGeneration && sourceState.isFile()) {
       const retiredSource = path.join(retirementDir, "sessions.db");
       try {
+        if (!writeLock) {
+          writeLock = new Database(retiredSource, { fileMustExist: true, timeout: 0 });
+          writeLock.pragma("busy_timeout = 0");
+          writeLock.exec("BEGIN IMMEDIATE");
+        }
         await backup(retiredSource, staged, onBackupProgress);
       } catch (error) {
         if (!isDatabaseCorruption(error)) throw error;
@@ -895,6 +909,12 @@ async function migrateDatabaseGeneration(
     const publicationSuccessors = await databaseSuccessorsAt(legacyRoot, sourceReservation);
     if (publicationSuccessors.length > 0) {
       throw new Error(`legacy SQLite generation changed during publication: ${publicationSuccessors.join(", ")}`);
+    }
+
+    if (writeLock && closeWriteLockBeforeMove) {
+      writeLock.exec("COMMIT");
+      writeLock.close();
+      writeLock = null;
     }
 
     result.moved += generationNames.length;
@@ -1024,6 +1044,7 @@ export async function migrateExtensionRoot(
     options.retireDatabaseFile ?? moveFileSafe,
     options.backupDatabase ?? stageDatabaseSnapshot,
     options.onDatabaseBackupProgress,
+    options.platform ?? process.platform,
   );
   if (result.criticalFailures.some((failure) => failure.name === "sessions.db")) return result;
   if (existsSync(legacyRoot)) {

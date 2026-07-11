@@ -788,7 +788,7 @@ export class MemoryStore {
           if (published) {
             await this.unlinkOwnedPublishedFile(filePath, publishedIdentity, this.fingerprint(content));
           }
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          if (["EEXIST", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) {
             throw new ExternalMemoryWriteConflict();
           }
           throw error;
@@ -829,15 +829,18 @@ export class MemoryStore {
           );
         } catch (error) {
           let rollbackError: unknown;
+          const targetDisappeared = (error as NodeJS.ErrnoException).code === "ENOENT";
           if (published) {
-            try {
-              await this.preserveConflictFile(tmpPath, filePath, "local");
-            } catch {
-            }
-            try {
-              await this.rollbackPublishedFile(recoveryPath, filePath, publishedIdentity);
-            } catch (restorePublishedError) {
-              rollbackError = restorePublishedError;
+            if (!targetDisappeared) {
+              try {
+                await this.preserveConflictFile(tmpPath, filePath, "local");
+              } catch {
+              }
+              try {
+                await this.rollbackPublishedFile(recoveryPath, filePath, publishedIdentity);
+              } catch (restorePublishedError) {
+                rollbackError = restorePublishedError;
+              }
             }
           } else {
             try {
@@ -849,6 +852,7 @@ export class MemoryStore {
           if (rollbackError) throw rollbackError;
           await fs.unlink(pendingPath);
           if ((error as NodeJS.ErrnoException).code === "EEXIST"
+            || targetDisappeared
             || error instanceof ExternalMemoryWriteConflict) {
             throw new ExternalMemoryWriteConflict();
           }

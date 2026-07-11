@@ -231,6 +231,46 @@ describe("migrateExtensionRoot", () => {
     }
   });
 
+  it("closes its SQLite handle before retiring a Windows source generation", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    const sourcePath = path.join(legacy, "sessions.db");
+    const sourceDb = new Database(sourcePath);
+    sourceDb.exec("CREATE TABLE memories (content TEXT); INSERT INTO memories VALUES ('before migration')");
+    sourceDb.close();
+    let retirementWriteCompleted = false;
+
+    const result = await migrateExtensionRoot(legacy, target, {
+      platform: "win32",
+      retireDatabaseFile: async (source, destination) => {
+        if (path.basename(source) === "sessions.db") {
+          const writer = new Database(source, { fileMustExist: true, timeout: 0 });
+          try {
+            writer.pragma("busy_timeout = 0");
+            writer.prepare("INSERT INTO memories VALUES (?)").run("during retirement");
+            retirementWriteCompleted = true;
+          } finally {
+            writer.close();
+          }
+        }
+        await fs.promises.rename(source, destination);
+      },
+    });
+
+    assert.equal(retirementWriteCompleted, true);
+    assert.deepStrictEqual(result.criticalFailures, []);
+    const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
+    try {
+      assert.deepStrictEqual(
+        migrated.prepare("SELECT content FROM memories ORDER BY rowid").all(),
+        [{ content: "before migration" }, { content: "during retirement" }],
+      );
+    } finally {
+      migrated.close();
+    }
+  });
+
   it("rolls back a failed source retirement so migration can retry", async () => {
     const legacy = path.join(tmpDir, "memory");
     const target = path.join(tmpDir, "pi-hermes-memory");

@@ -1259,6 +1259,49 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.match(raw, /local add/);
     });
 
+    it("reapplies an add without restoring a published pathname deleted externally", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing`);
+
+      const mutableStore = store as any;
+      const originalRequireStoragePath = mutableStore.requireStoragePath.bind(store);
+      let storagePathChecks = 0;
+      mutableStore.requireStoragePath = async (target: string, expectedPath: string) => {
+        await originalRequireStoragePath(target, expectedPath);
+        if (target === "memory" && ++storagePathChecks === 3) {
+          await fs.unlink(expectedPath);
+        }
+      };
+
+      const result = await store.add("memory", `${TEST_MARKER} local add`);
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.doesNotMatch(raw, /existing/);
+      assert.match(raw, /local add/);
+    });
+
+    it("reapplies an initial add when its published pathname is deleted externally", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+
+      const mutableStore = store as any;
+      const originalRequireStoragePath = mutableStore.requireStoragePath.bind(store);
+      let storagePathChecks = 0;
+      mutableStore.requireStoragePath = async (target: string, expectedPath: string) => {
+        await originalRequireStoragePath(target, expectedPath);
+        if (target === "memory" && ++storagePathChecks === 3) {
+          await fs.unlink(expectedPath);
+        }
+      };
+
+      const result = await store.add("memory", `${TEST_MARKER} initial local add`);
+
+      assert.equal(result.success, true);
+      assert.match(await readRaw(memoryPath), /initial local add/);
+    });
+
     it("recovers a write through an open descriptor after displacement", async () => {
       const store = new MemoryStore(makeConfig());
       await store.loadFromDisk();
