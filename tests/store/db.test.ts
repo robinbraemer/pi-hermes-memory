@@ -98,6 +98,22 @@ describe('DatabaseManager', () => {
       assert.ok(fs.existsSync(path.join(nestedDir, 'sessions.db')));
       manager.close();
     });
+
+    it('defers database creation while an initialization guard is active', () => {
+      const guardedDir = path.join(tmpDir, 'guarded');
+      const manager = new DatabaseManager(guardedDir);
+      manager.setOpenGuard(() => {
+        throw new Error('legacy database migration pending');
+      });
+
+      assert.throws(() => manager.getDb(), /legacy database migration pending/);
+      assert.equal(fs.existsSync(path.join(guardedDir, 'sessions.db')), false);
+
+      manager.setOpenGuard(null);
+      assert.ok(manager.getDb());
+      assert.equal(fs.existsSync(path.join(guardedDir, 'sessions.db')), true);
+      manager.close();
+    });
   });
 
   describe('schema', () => {

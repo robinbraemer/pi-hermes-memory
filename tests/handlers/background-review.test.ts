@@ -127,7 +127,7 @@ function fireTurnEnd(branch: any[] = makeBranch(10), ctxOverrides: Record<string
 }
 
 // Allow async handlers to settle
-async function settle(ms = 10) {
+async function settle(ms = 50) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
@@ -303,7 +303,7 @@ describe("setupBackgroundReview", () => {
     for (let i = 0; i < 10; i++) {
       fireTurnEnd();
     }
-    await settle(5);
+    await settle(50);
 
     assert.strictEqual(execCalls.length, 1, "exec should be called once for first trigger");
 
@@ -311,7 +311,7 @@ describe("setupBackgroundReview", () => {
     for (let i = 0; i < 15; i++) {
       fireTurnEnd();
     }
-    await settle(5);
+    await settle(50);
 
     assert.strictEqual(execCalls.length, 1, "exec should still only be called once — reviewInProgress guard");
 

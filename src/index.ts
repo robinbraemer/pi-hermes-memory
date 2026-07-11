@@ -23,6 +23,7 @@
  */
 
 import * as path from "node:path";
+import * as fs from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { MemoryStore } from "./store/memory-store.js";
 import { SkillStore } from "./store/skill-store.js";
@@ -108,6 +109,16 @@ export default function (pi: ExtensionAPI) {
     migrationSentinelPath: path.join(globalDir, ".skills-migrated-to-extension-storage"),
   });
   const dbManager = new DatabaseManager(globalDir);
+  let databaseMigrationPending = shouldMigrateExtensionRoot
+    && fs.existsSync(path.join(legacyGlobalDir, "sessions.db"))
+    && !fs.existsSync(path.join(globalDir, "sessions.db"));
+  if (databaseMigrationPending) {
+    dbManager.setOpenGuard(() => {
+      if (databaseMigrationPending) {
+        throw new Error("Legacy sessions.db migration is pending");
+      }
+    });
+  }
   const sessionsDir = path.join(agentRoot, "sessions");
 
   const refreshSkillProjectContext = (cwd?: string) => {
@@ -140,11 +151,17 @@ export default function (pi: ExtensionAPI) {
           globalDir,
           config.projectsMemoryDir,
           agentRoot,
+          {
+            onMigrationSucceeded: () => {
+              databaseMigrationPending = false;
+              dbManager.setOpenGuard(null);
+            },
+          },
         );
+        persistenceInitialized = true;
       } catch {
         // Best-effort only: migration or SQLite backfill must not block startup.
       }
-      persistenceInitialized = true;
     }
 
     refreshSkillProjectContext(ctx.cwd);
@@ -153,7 +170,7 @@ export default function (pi: ExtensionAPI) {
     await store.loadFromDisk();
     if (projectStore) await projectStore.loadFromDisk();
 
-    scheduleSessionBackfill(dbManager, sessionsDir, {
+    if (persistenceInitialized) scheduleSessionBackfill(dbManager, sessionsDir, {
       notify: (message, level) => {
         const ui = (ctx as { ui?: { notify?: (message: string, level?: string) => void } }).ui;
         if (ui?.notify) {

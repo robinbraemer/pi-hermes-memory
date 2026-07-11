@@ -161,14 +161,25 @@ const Database = loadDatabaseCtor();
 export class DatabaseManager {
   private db: DatabaseLike | null = null;
   private readonly displayDbPath: string;
-  private readonly dbPath: string;
+  private canonicalDbPath: string | null = null;
   private readonly recoveryOptions: ResolvedDatabaseRecoveryOptions;
   private lastRecovery: DatabaseRecoveryResult | null = null;
+  private openGuard: (() => void) | null = null;
 
   constructor(memoryDir: string, recoveryOptions: DatabaseRecoveryOptions = {}) {
     this.displayDbPath = path.join(memoryDir, 'sessions.db');
-    this.dbPath = canonicalStorageIdentity(this.displayDbPath);
     this.recoveryOptions = { ...DEFAULT_RECOVERY_OPTIONS, ...recoveryOptions };
+  }
+
+  private get dbPath(): string {
+    if (!this.canonicalDbPath) {
+      this.canonicalDbPath = canonicalStorageIdentity(this.displayDbPath);
+    }
+    return this.canonicalDbPath;
+  }
+
+  setOpenGuard(guard: (() => void) | null): void {
+    this.openGuard = guard;
   }
 
   /**
@@ -201,6 +212,7 @@ export class DatabaseManager {
    */
   getDb(): DatabaseLike {
     if (!this.db) {
+      this.openGuard?.();
       this.db = this.open();
     }
     return this.db;

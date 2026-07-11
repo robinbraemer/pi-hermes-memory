@@ -689,10 +689,24 @@ export class MemoryStore {
             throw new ExternalMemoryWriteConflict();
           }
         } catch (error) {
+          let rollbackError: unknown;
           if (published) {
-            await this.preserveConflictFile(filePath, filePath, "local");
+            try {
+              await this.preserveConflictFile(filePath, filePath, "local");
+            } catch {
+            }
+            try {
+              await fs.unlink(filePath);
+            } catch (unlinkError) {
+              if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") rollbackError = unlinkError;
+            }
           }
-          await this.restoreDisplacedFile(recoveryPath, filePath);
+          try {
+            await this.restoreDisplacedFile(recoveryPath, filePath);
+          } catch (restoreError) {
+            rollbackError ??= restoreError;
+          }
+          if (rollbackError) throw rollbackError;
           if ((error as NodeJS.ErrnoException).code === "EEXIST"
             || error instanceof ExternalMemoryWriteConflict) {
             throw new ExternalMemoryWriteConflict();

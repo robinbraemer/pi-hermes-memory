@@ -966,12 +966,13 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       await store.add("memory", `${TEST_MARKER} existing`);
 
       const originalRead = (store as any).readFileState.bind(store);
+      const canonicalMemoryPath = await fs.realpath(memoryPath);
       let injected = false;
       let memoryReads = 0;
       (store as any).readFileState = async (filePath: string) => {
         const state = await originalRead(filePath);
-        if (filePath === memoryPath) memoryReads++;
-        if (!injected && filePath === memoryPath && memoryReads === 2) {
+        if (filePath === canonicalMemoryPath) memoryReads++;
+        if (!injected && filePath === canonicalMemoryPath && memoryReads === 2) {
           injected = true;
           const current = await readRaw(memoryPath);
           await writeRaw(memoryPath, `${current}${ENTRY_DELIMITER}${TEST_MARKER} late editor`);
@@ -1087,6 +1088,42 @@ describe("MemoryStore", { concurrency: 1 }, () => {
         assert.ok(recovered.some((content) => content.includes(`original before failure ${failureRead}`)));
         assert.match(await readRaw(memoryPath), new RegExp(`original before failure ${failureRead}`));
       }
+    });
+
+    it("restores the authoritative file when conflict preservation fails", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} original before preservation failure`);
+
+      const originalRead = (store as any).readFileState.bind(store);
+      let displacedReads = 0;
+      (store as any).readFileState = async (filePath: string) => {
+        if (path.basename(filePath).startsWith(`.${MEMORY_FILE}.recovery-`)) {
+          displacedReads++;
+          if (displacedReads === 2) {
+            throw new Error("injected post-publish verification failure");
+          }
+        }
+        return originalRead(filePath);
+      };
+      (store as any).preserveConflictFile = async () => {
+        throw new Error("injected conflict preservation failure");
+      };
+
+      await assert.rejects(
+        store.add("memory", `${TEST_MARKER} failed local add`),
+        /injected post-publish verification failure/,
+      );
+      assert.match(await readRaw(memoryPath), /original before preservation failure/);
+      assert.doesNotMatch(await readRaw(memoryPath), /failed local add/);
+
+      (store as any).readFileState = originalRead;
+      const result = await store.add("memory", `${TEST_MARKER} later successful add`);
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /original before preservation failure/);
+      assert.match(raw, /later successful add/);
+      assert.doesNotMatch(raw, /failed local add/);
     });
 
     it("does not commit a failed add during a later mutation", async () => {

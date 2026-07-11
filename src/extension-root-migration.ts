@@ -7,6 +7,16 @@ export interface ExtensionRootMigrationResult {
   merged: number;
   skipped: number;
   warnings: string[];
+  criticalFailures: Array<{
+    name: string;
+    source: string;
+    target: string;
+    message: string;
+  }>;
+}
+
+export interface ExtensionRootMigrationOptions {
+  moveFile?: (source: string, target: string) => Promise<void>;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -33,7 +43,13 @@ async function moveFileSafe(source: string, target: string): Promise<void> {
   await fs.unlink(source);
 }
 
-async function moveDirContents(sourceDir: string, targetDir: string, result: ExtensionRootMigrationResult): Promise<void> {
+async function moveDirContents(
+  sourceDir: string,
+  targetDir: string,
+  result: ExtensionRootMigrationResult,
+  moveFile: (source: string, target: string) => Promise<void>,
+  relativeDir = "",
+): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true });
 
   const entries = await fs.readdir(sourceDir, { withFileTypes: true });
@@ -43,16 +59,31 @@ async function moveDirContents(sourceDir: string, targetDir: string, result: Ext
 
     if (!await pathExists(targetPath)) {
       try {
-        await moveFileSafe(sourcePath, targetPath);
+        await moveFile(sourcePath, targetPath);
         result.moved++;
       } catch (error) {
-        result.warnings.push(`${sourcePath}: ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        result.warnings.push(`${sourcePath}: ${message}`);
+        if (!relativeDir && entry.name === "sessions.db") {
+          result.criticalFailures.push({
+            name: entry.name,
+            source: sourcePath,
+            target: targetPath,
+            message,
+          });
+        }
       }
       continue;
     }
 
     if (entry.isDirectory()) {
-      await moveDirContents(sourcePath, targetPath, result);
+      await moveDirContents(
+        sourcePath,
+        targetPath,
+        result,
+        moveFile,
+        path.join(relativeDir, entry.name),
+      );
       result.merged++;
       try {
         const remaining = await fs.readdir(sourcePath);
@@ -74,19 +105,21 @@ async function moveDirContents(sourceDir: string, targetDir: string, result: Ext
 export async function migrateExtensionRoot(
   legacyRoot: string,
   targetRoot: string,
+  options: ExtensionRootMigrationOptions = {},
 ): Promise<ExtensionRootMigrationResult> {
   const result: ExtensionRootMigrationResult = {
     moved: 0,
     merged: 0,
     skipped: 0,
     warnings: [],
+    criticalFailures: [],
   };
 
   if (path.resolve(legacyRoot) === path.resolve(targetRoot)) return result;
   if (!existsSync(legacyRoot)) return result;
 
   await fs.mkdir(targetRoot, { recursive: true });
-  await moveDirContents(legacyRoot, targetRoot, result);
+  await moveDirContents(legacyRoot, targetRoot, result, options.moveFile ?? moveFileSafe);
 
   try {
     const remaining = await fs.readdir(legacyRoot);

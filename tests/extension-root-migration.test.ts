@@ -45,4 +45,24 @@ describe("migrateExtensionRoot", () => {
     assert.strictEqual(fs.readFileSync(path.join(target, "MEMORY.md"), "utf-8"), "new memory");
     assert.ok(result.skipped >= 1);
   });
+
+  it("reports a failed sessions database move as critical", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    fs.writeFileSync(path.join(legacy, "sessions.db"), "populated legacy database", "utf-8");
+
+    const result = await migrateExtensionRoot(legacy, target, {
+      moveFile: async () => {
+        throw new Error("injected sessions.db move failure");
+      },
+    });
+
+    assert.deepStrictEqual(
+      result.criticalFailures.map((failure) => failure.name),
+      ["sessions.db"],
+    );
+    assert.equal(fs.existsSync(path.join(target, "sessions.db")), false);
+    assert.equal(fs.existsSync(path.join(legacy, "sessions.db")), true);
+  });
 });
