@@ -39,9 +39,8 @@ function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir
   if (fs.existsSync(projectsRoot)) {
     for (const name of fs.readdirSync(projectsRoot)) {
       if (!isSafeProjectName(name, projectsRoot)) continue;
-      const dir = path.join(projectsRoot, name);
-      const memoryFile = path.join(dir, MEMORY_FILE);
-      if (fs.existsSync(dir) && fs.lstatSync(dir).isDirectory() && fs.existsSync(memoryFile)) {
+      const memoryFile = resolveAuthoritativeMemoryFile(projectsRoot, name);
+      if (memoryFile) {
         projects.set(name, memoryFile);
       }
     }
@@ -57,9 +56,8 @@ function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir
       if ((globalDirName && name === globalDirName) || name === projectsMemoryDir || name === 'skills' || name.startsWith('.')) continue;
       if (projects.has(name)) continue;
       if (!isSafeProjectName(name, resolvedAgentRoot)) continue;
-      const dir = path.join(agentRoot, name);
-      const memoryFile = path.join(dir, MEMORY_FILE);
-      if (fs.existsSync(dir) && fs.lstatSync(dir).isDirectory() && fs.existsSync(memoryFile)) {
+      const memoryFile = resolveAuthoritativeMemoryFile(resolvedAgentRoot, name);
+      if (memoryFile) {
         projects.set(name, memoryFile);
       }
     }
@@ -68,6 +66,53 @@ function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir
   return [...projects.entries()]
     .map(([name, memoryFile]) => ({ name, memoryFile }))
     .filter(({ memoryFile }) => fs.existsSync(memoryFile));
+}
+
+function realpathIfPresent(filePath: string): string {
+  try {
+    return fs.realpathSync(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return path.resolve(filePath);
+    throw error;
+  }
+}
+
+function resolveAuthoritativeMemoryFile(root: string, projectName: string): string | null {
+  const canonicalRoot = realpathIfPresent(root);
+  if (!isSafeProjectName(projectName, path.resolve(root))) return null;
+
+  const projectDir = path.join(root, projectName);
+  let projectStat: fs.Stats;
+  try {
+    projectStat = fs.lstatSync(projectDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return path.join(canonicalRoot, projectName, MEMORY_FILE);
+    }
+    throw error;
+  }
+  if (projectStat.isSymbolicLink() || !projectStat.isDirectory()) return null;
+
+  const canonicalProjectDir = fs.realpathSync(projectDir);
+  if (path.dirname(canonicalProjectDir) !== canonicalRoot) return null;
+
+  const memoryFile = path.join(projectDir, MEMORY_FILE);
+  let memoryStat: fs.Stats;
+  try {
+    memoryStat = fs.lstatSync(memoryFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return path.join(canonicalProjectDir, MEMORY_FILE);
+    }
+    throw error;
+  }
+  if (memoryStat.isSymbolicLink() || !memoryStat.isFile()) return null;
+
+  const canonicalMemoryFile = fs.realpathSync(memoryFile);
+  if (path.dirname(canonicalMemoryFile) !== canonicalProjectDir || path.basename(canonicalMemoryFile) !== MEMORY_FILE) {
+    return null;
+  }
+  return canonicalMemoryFile;
 }
 
 function isSafeProjectName(name: string, projectsRoot: string): boolean {
@@ -141,7 +186,7 @@ export async function syncMarkdownMemoriesToSqlite(
   const projectsRoot = path.resolve(agentRoot, projectsMemoryDir ?? 'projects-memory');
   for (const projectName of projectNames) {
     const memoryFile = projectFiles.get(projectName)
-      ?? (isSafeProjectName(projectName, projectsRoot) ? path.join(projectsRoot, projectName, MEMORY_FILE) : null);
+      ?? resolveAuthoritativeMemoryFile(projectsRoot, projectName);
     await reconcileFile(memoryFile, 'memory', projectName);
   }
 

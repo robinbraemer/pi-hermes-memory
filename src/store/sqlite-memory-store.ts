@@ -278,7 +278,7 @@ export function parseMarkdownMemoryEntry(
 ): ParsedMarkdownMemoryEntry {
   const metadata = parseMetadataComment(rawEntry);
   const { text, created, lastReferenced } = metadata;
-  const parsedProject = normalizeNullable(project) ?? metadata.project;
+  const parsedProject = normalizeNullable(project);
 
   if (target !== 'failure') {
     return {

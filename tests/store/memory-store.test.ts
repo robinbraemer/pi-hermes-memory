@@ -890,6 +890,89 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.equal(raw.match(/local add/g)?.length, 1);
     });
 
+    it("reapplies an add when an external write lands after the final fingerprint read", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing`);
+
+      const originalRead = (store as any).readFileState.bind(store);
+      let injected = false;
+      let memoryReads = 0;
+      (store as any).readFileState = async (filePath: string) => {
+        const state = await originalRead(filePath);
+        if (filePath === memoryPath) memoryReads++;
+        if (!injected && filePath === memoryPath && memoryReads === 2) {
+          injected = true;
+          const current = await readRaw(memoryPath);
+          await writeRaw(memoryPath, `${current}${ENTRY_DELIMITER}${TEST_MARKER} late editor`);
+        }
+        return state;
+      };
+
+      const result = await store.add("memory", `${TEST_MARKER} local add`);
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /late editor/);
+      assert.match(raw, /local add/);
+    });
+
+    it("recovers a write through an open descriptor after displacement", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing`);
+      const handle = await fs.open(memoryPath, "r+");
+
+      const originalRead = (store as any).readFileState.bind(store);
+      let injected = false;
+      (store as any).readFileState = async (filePath: string) => {
+        if (!injected && filePath !== memoryPath && path.basename(filePath) === "base.md") {
+          injected = true;
+          await handle.truncate(0);
+          await handle.writeFile(`${TEST_MARKER} descriptor editor`, "utf-8");
+          await handle.sync();
+        }
+        return originalRead(filePath);
+      };
+
+      try {
+        const result = await store.add("memory", `${TEST_MARKER} local add`);
+        assert.equal(result.success, true);
+      } finally {
+        await handle.close();
+      }
+
+      assert.equal(injected, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /descriptor editor/);
+      assert.match(raw, /local add/);
+    });
+
+    it("replays when an editor recreates the path after displacement", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing`);
+
+      const originalRead = (store as any).readFileState.bind(store);
+      let injected = false;
+      (store as any).readFileState = async (filePath: string) => {
+        const state = await originalRead(filePath);
+        if (!injected && filePath !== memoryPath && path.basename(filePath) === "base.md") {
+          injected = true;
+          await writeRaw(memoryPath, `${TEST_MARKER} recreated editor`);
+        }
+        return state;
+      };
+
+      const result = await store.add("memory", `${TEST_MARKER} local add`);
+
+      assert.equal(result.success, true);
+      assert.equal(injected, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /recreated editor/);
+      assert.match(raw, /local add/);
+    });
+
     it("serializes concurrent mutations of the same canonical target", async () => {
       const firstStore = new MemoryStore(makeConfig());
       const secondStore = new MemoryStore(makeConfig());

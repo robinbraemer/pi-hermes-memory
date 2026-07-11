@@ -11,7 +11,7 @@
  * - Content scanning before any write
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { scanContent } from "./content-scanner.js";
@@ -621,6 +621,7 @@ export class MemoryStore {
     // Use the memory directory for temp files so rename stays on the same device
     const tmpDir = await fs.mkdtemp(path.join(this.memoryDir, ".tmp-"));
     const tmpPath = path.join(tmpDir, "write.tmp");
+    const basePath = path.join(tmpDir, "base.md");
 
     try {
       await fs.writeFile(tmpPath, content, "utf-8");
@@ -628,7 +629,53 @@ export class MemoryStore {
       if (currentState.fingerprint !== expectedFingerprint) {
         throw new ExternalMemoryWriteConflict();
       }
-      await fs.rename(tmpPath, filePath);
+
+      if (expectedFingerprint === "missing") {
+        try {
+          await fs.link(tmpPath, filePath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            throw new ExternalMemoryWriteConflict();
+          }
+          throw error;
+        }
+      } else {
+        try {
+          await fs.rename(filePath, basePath);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            throw new ExternalMemoryWriteConflict();
+          }
+          throw error;
+        }
+
+        const displacedState = await this.readFileState(basePath);
+        if (displacedState.fingerprint !== expectedFingerprint) {
+          await this.restoreDisplacedFile(basePath, filePath);
+          throw new ExternalMemoryWriteConflict();
+        }
+
+        try {
+          await fs.link(tmpPath, filePath);
+        } catch (error) {
+          await this.preserveConflictFile(basePath, filePath, "base");
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            throw new ExternalMemoryWriteConflict();
+          }
+          throw error;
+        }
+
+        const verifiedDisplacedState = await this.readFileState(basePath);
+        if (verifiedDisplacedState.fingerprint !== expectedFingerprint) {
+          await this.preserveConflictFile(filePath, filePath, "local");
+          await this.restoreDisplacedFile(basePath, filePath);
+          throw new ExternalMemoryWriteConflict();
+        }
+
+        await fs.unlink(basePath);
+      }
+
+      await fs.unlink(tmpPath);
       this.fileFingerprints[filePath] = this.fingerprint(content);
     } catch (err) {
       try { await fs.unlink(tmpPath); } catch { /* ignore */ }
@@ -636,5 +683,24 @@ export class MemoryStore {
     } finally {
       try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
+  }
+
+  private async restoreDisplacedFile(displacedPath: string, filePath: string): Promise<void> {
+    try {
+      await fs.link(displacedPath, filePath);
+      await fs.unlink(displacedPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await this.preserveConflictFile(displacedPath, filePath, "base");
+    }
+  }
+
+  private async preserveConflictFile(sourcePath: string, filePath: string, kind: string): Promise<string> {
+    const conflictPath = path.join(
+      path.dirname(filePath),
+      `.${path.basename(filePath)}.conflict-${kind}-${Date.now()}-${randomUUID()}`,
+    );
+    await fs.rename(sourcePath, conflictPath);
+    return conflictPath;
   }
 }

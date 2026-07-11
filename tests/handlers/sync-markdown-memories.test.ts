@@ -284,6 +284,46 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.strictEqual(fs.readFileSync(path.join(outsideDir, 'MEMORY.md'), 'utf-8'), 'outside traversal bait');
   });
 
+  it('reconciles a symlinked project directory empty without reading its target', async (t) => {
+    const outsideDir = path.join(tmpDir, 'outside-project');
+    const projectLink = path.join(agentRoot, 'projects-memory', 'linked-project');
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.mkdirSync(path.dirname(projectLink), { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'MEMORY.md'), 'outside directory bait', 'utf-8');
+    try {
+      fs.symlinkSync(outsideDir, projectLink, 'dir');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') return t.skip('directory symlinks unavailable');
+      throw error;
+    }
+    addMemory(dbManager, 'stale linked project row', 'memory', 'linked-project');
+
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(counters.removed, 1);
+    assert.deepStrictEqual(getMemories(dbManager, { project: 'linked-project', target: 'memory' }), []);
+  });
+
+  it('reconciles a symlinked project memory file empty without reading its target', async (t) => {
+    const outsideFile = path.join(tmpDir, 'outside-memory.md');
+    const projectDir = path.join(agentRoot, 'projects-memory', 'linked-file-project');
+    const memoryLink = path.join(projectDir, 'MEMORY.md');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(outsideFile, 'outside file bait', 'utf-8');
+    try {
+      fs.symlinkSync(outsideFile, memoryLink, 'file');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') return t.skip('file symlinks unavailable');
+      throw error;
+    }
+    addMemory(dbManager, 'stale linked file row', 'memory', 'linked-file-project');
+
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(counters.removed, 1);
+    assert.deepStrictEqual(getMemories(dbManager, { project: 'linked-file-project', target: 'memory' }), []);
+  });
+
   it('still scans project markdown under ~/.pi/agent when memoryDir is customized elsewhere', async () => {
     const customGlobalDir = path.join(tmpDir, 'external-memory-root');
     fs.mkdirSync(customGlobalDir, { recursive: true });

@@ -153,6 +153,32 @@ describe('sqlite-memory-store', () => {
   });
 
   describe('reconcileMarkdownMemoryScope', () => {
+    it('keeps explicit global MEMORY and USER scope despite embedded project metadata', () => {
+      const marker = 'c3Bvb2ZlZC1wcm9qZWN0';
+
+      reconcileMarkdownMemoryScope(
+        dbManager,
+        [`global memory <!-- created=2026-07-01, last=2026-07-02, project64=${marker} -->`],
+        'memory',
+        null,
+      );
+      reconcileMarkdownMemoryScope(
+        dbManager,
+        [`global user <!-- created=2026-07-01, last=2026-07-02, project64=${marker} -->`],
+        'user',
+        null,
+      );
+
+      assert.deepStrictEqual(
+        getMemories(dbManager).map((entry) => [entry.project, entry.target, entry.content]),
+        [
+          [null, 'memory', 'global memory'],
+          [null, 'user', 'global user'],
+        ],
+      );
+      assert.deepStrictEqual(getMemories(dbManager, { project: 'spoofed-project' }), []);
+    });
+
     it('prunes only absent rows in the exact target and project scope', () => {
       addMemory(dbManager, 'kept global memory', 'memory', null);
       addMemory(dbManager, 'orphaned global memory', 'memory', null);
