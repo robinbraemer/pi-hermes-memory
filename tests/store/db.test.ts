@@ -301,20 +301,46 @@ describe('DatabaseManager', () => {
       dbManager.close();
       const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
       fs.mkdirSync(lockDir);
-      fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid }));
+      fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, token: 'live-owner' }));
+      const stale = new Date(Date.now() - 10_000);
+      fs.utimesSync(lockDir, stale, stale);
       spawn(process.execPath, [
         '-e',
         'setTimeout(() => require("node:fs").rmSync(process.argv[1], { recursive: true, force: true }), 100)',
         lockDir,
       ], { stdio: 'ignore' });
 
-      dbManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 1000, recoveryLockPollMs: 10 });
+      dbManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 1000, recoveryLockPollMs: 10, recoveryLockStaleMs: 1 });
       const started = Date.now();
       const result = dbManager.recoverFromCorruption(corruptSqliteError());
 
       assert.strictEqual(result.strategy, 'reused');
       assert.ok(Date.now() - started >= 50, 'peer should wait for the active recovery owner');
       assert.strictEqual(fs.readdirSync(tmpDir).filter((name) => name.startsWith('sessions.db.corrupt-')).length, 0);
+    });
+
+    it('does not release a recovery lock whose ownership token changed', () => {
+      dbManager.close();
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'corrupt database');
+      const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
+      dbManager = new DatabaseManager(tmpDir);
+      (dbManager as any).recoverDatabaseFileUnlocked = () => {
+        fs.rmSync(path.join(tmpDir, 'sessions.db'), { force: true });
+        const healthy = new Database(path.join(tmpDir, 'sessions.db'));
+        healthy.close();
+        fs.writeFileSync(
+          path.join(lockDir, 'owner.json'),
+          JSON.stringify({ pid: process.pid, token: 'successor-owner' }),
+        );
+        return { strategy: 'recreated-empty', backupPaths: [] };
+      };
+
+      dbManager.recoverFromCorruption(corruptSqliteError());
+
+      assert.strictEqual(fs.existsSync(lockDir), true);
+      const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8'));
+      assert.strictEqual(owner.token, 'successor-owner');
+      fs.rmSync(lockDir, { recursive: true, force: true });
     });
 
     it('takes over a stale recovery lock', () => {
@@ -385,6 +411,28 @@ describe('DatabaseManager', () => {
       assert.throws(() => dbManager.recoverFromCorruption(corruptSqliteError()), /injected recovery failure/);
       assert.throws(() => dbManager.recoverFromCorruption(corruptSqliteError()), /recovery circuit is open/i);
       assert.strictEqual(recoveryCalls, 1);
+    });
+
+    it('counts a failed post-recovery open before clearing the circuit', () => {
+      dbManager.close();
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'corrupt database');
+      dbManager = new DatabaseManager(tmpDir, {
+        recoveryCircuitLimit: 1,
+        recoveryCircuitWindowMs: 60_000,
+      });
+      const originalOpenUnchecked = (dbManager as any).openUnchecked.bind(dbManager);
+      let openCalls = 0;
+      (dbManager as any).openUnchecked = () => {
+        openCalls++;
+        if (openCalls === 2) throw new Error('injected post-recovery open failure');
+        return originalOpenUnchecked();
+      };
+
+      assert.throws(() => dbManager.getDb(), /injected post-recovery open failure/);
+      const state = JSON.parse(
+        fs.readFileSync(path.join(tmpDir, 'sessions.db.recovery-state.json'), 'utf-8'),
+      );
+      assert.strictEqual(state.failures.length, 1);
     });
 
     it('does not treat legacy recovery attempt state as failed recoveries', () => {

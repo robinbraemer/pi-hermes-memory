@@ -833,5 +833,65 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       const raw = await readRaw(memoryPath);
       assert.doesNotMatch(raw, /fresh-B|stale-A/);
     });
+
+    it("serializes concurrent mutations of the same canonical target", async () => {
+      const firstStore = new MemoryStore(makeConfig());
+      const secondStore = new MemoryStore(makeConfig());
+      await Promise.all([firstStore.loadFromDisk(), secondStore.loadFromDisk()]);
+
+      const originalSave = (firstStore as any).saveToDisk.bind(firstStore);
+      let releaseFirst!: () => void;
+      const firstCanSave = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      let firstEntered!: () => void;
+      const firstEnteredSave = new Promise<void>((resolve) => { firstEntered = resolve; });
+      (firstStore as any).saveToDisk = async (target: "memory") => {
+        firstEntered();
+        await firstCanSave;
+        await originalSave(target);
+      };
+
+      const first = firstStore.add("memory", `${TEST_MARKER} first writer`);
+      await firstEnteredSave;
+      const second = secondStore.add("memory", `${TEST_MARKER} second writer`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      releaseFirst();
+      await Promise.all([first, second]);
+
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /first writer/);
+      assert.match(raw, /second writer/);
+    });
+
+    it("allows different targets to mutate concurrently", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+
+      const originalSave = (store as any).saveToDisk.bind(store);
+      let releaseMemory!: () => void;
+      const memoryCanSave = new Promise<void>((resolve) => { releaseMemory = resolve; });
+      let memoryEntered!: () => void;
+      const memoryEnteredSave = new Promise<void>((resolve) => { memoryEntered = resolve; });
+      (store as any).saveToDisk = async (target: "memory" | "user") => {
+        if (target === "memory") {
+          memoryEntered();
+          await memoryCanSave;
+        }
+        await originalSave(target);
+      };
+
+      const memoryWrite = store.add("memory", `${TEST_MARKER} blocked memory writer`);
+      await memoryEnteredSave;
+      const userWrite = store.add("user", `${TEST_MARKER} independent user writer`);
+      const outcome = await Promise.race([
+        userWrite.then(() => "completed" as const),
+        new Promise<"blocked">((resolve) => setTimeout(() => resolve("blocked"), 250)),
+      ]);
+      releaseMemory();
+      const [, userResult] = await Promise.all([memoryWrite, userWrite]);
+
+      assert.equal(outcome, "completed");
+      assert.equal(userResult.success, true);
+      assert.match(await readRaw(userPath), /independent user writer/);
+    });
   });
 });

@@ -11,7 +11,7 @@
  * - Content scanning before any write
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { scanContent } from "./content-scanner.js";
@@ -35,6 +35,7 @@ export class MemoryStore {
   private fileFingerprints: Record<string, string> = {};
   private snapshot: MemorySnapshot = { memory: "", user: "" };
   private consolidator: ((target: "memory" | "user" | "failure", signal?: AbortSignal) => Promise<ConsolidationResult>) | null = null;
+  private mutationObserver: ((target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>) | null = null;
 
   constructor(private config: MemoryConfig) {}
 
@@ -44,6 +45,12 @@ export class MemoryStore {
    */
   setConsolidator(fn: (target: "memory" | "user" | "failure", signal?: AbortSignal) => Promise<ConsolidationResult>): void {
     this.consolidator = fn;
+  }
+
+  setMutationObserver(
+    fn: (target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>,
+  ): void {
+    this.mutationObserver = fn;
   }
 
   // ─── Path helpers ───
@@ -126,7 +133,7 @@ export class MemoryStore {
   // ─── CRUD ───
 
   async add(target: "memory" | "user" | "failure", content: string, signal?: AbortSignal): Promise<MemoryResult> {
-    return this._add(target, content, signal);
+    return this.addWithConsolidation(target, content, signal, 1, "Entry added.");
   }
 
   async addFailure(content: string, options: {
@@ -137,7 +144,9 @@ export class MemoryStore {
     project?: string;
   }): Promise<MemoryResult> {
     const failureText = this.buildFailureMemoryText(content, options);
-    return this._add("failure", failureText, undefined, 1, "Failure memory saved: " + options.category);
+    return this.addWithConsolidation(
+      "failure", failureText, undefined, 1, "Failure memory saved: " + options.category,
+    );
   }
 
   getFailureEntries(maxAgeDays = 7): string[] {
@@ -157,7 +166,6 @@ export class MemoryStore {
     target: "memory" | "user" | "failure",
     content: string,
     signal?: AbortSignal,
-    _retriesLeft = 1,
     addedMessage = "Entry added.",
   ): Promise<MemoryResult> {
     content = content.trim();
@@ -188,20 +196,6 @@ export class MemoryStore {
         return this.fifoEvictAndAdd(target, entries, encoded, content.length, limit);
       }
 
-      // Auto-consolidate once if configured — limit retries to prevent infinite loops
-      if (strategy === "auto-consolidate" && this.consolidator && _retriesLeft > 0) {
-        try {
-          const result = await this.consolidator(target, signal);
-          if (result.consolidated) {
-            // CRITICAL: reload from disk — child process modified files, our arrays are stale
-            await this.loadFromDisk();
-            // Retry the add exactly once (retriesLeft = 0 means no more consolidation)
-            return this._add(target, content, signal, _retriesLeft - 1, addedMessage);
-          }
-        } catch {
-          // Consolidation failed — fall through to error
-        }
-      }
       return this.memoryFullError(target, content.length);
     }
 
@@ -210,6 +204,38 @@ export class MemoryStore {
     await this.saveToDisk(target);
 
     return this.successResponse(target, addedMessage);
+  }
+
+  private async addWithConsolidation(
+    target: "memory" | "user" | "failure",
+    content: string,
+    signal: AbortSignal | undefined,
+    retriesLeft: number,
+    addedMessage: string,
+  ): Promise<MemoryResult> {
+    const result = await this.runTargetMutation(
+      target,
+      () => this._add(target, content, signal, addedMessage),
+    );
+    if (
+      result.success
+      || retriesLeft <= 0
+      || this.memoryOverflowStrategy() !== "auto-consolidate"
+      || !this.consolidator
+      || !result.error?.startsWith("Memory at ")
+    ) {
+      return result;
+    }
+
+    try {
+      const consolidation = await this.consolidator(target, signal);
+      if (consolidation.consolidated) {
+        await this.loadFromDisk();
+        return this.addWithConsolidation(target, content, signal, retriesLeft - 1, addedMessage);
+      }
+    } catch {
+    }
+    return result;
   }
 
   private async fifoEvictAndAdd(
@@ -255,6 +281,10 @@ export class MemoryStore {
   }
 
   async replace(target: "memory" | "user" | "failure", oldText: string, newContent: string): Promise<MemoryResult> {
+    return this.runTargetMutation(target, () => this.replaceUnlocked(target, oldText, newContent));
+  }
+
+  private async replaceUnlocked(target: "memory" | "user" | "failure", oldText: string, newContent: string): Promise<MemoryResult> {
     oldText = normalizeMemoryLookupText(oldText);
     newContent = newContent.trim();
     if (!oldText) return { success: false, error: "old_text cannot be empty." };
@@ -302,6 +332,10 @@ export class MemoryStore {
   }
 
   async remove(target: "memory" | "user" | "failure", oldText: string): Promise<MemoryResult> {
+    return this.runTargetMutation(target, () => this.removeUnlocked(target, oldText));
+  }
+
+  private async removeUnlocked(target: "memory" | "user" | "failure", oldText: string): Promise<MemoryResult> {
     oldText = normalizeMemoryLookupText(oldText);
     if (!oldText) return { success: false, error: "old_text cannot be empty." };
 
@@ -523,6 +557,109 @@ export class MemoryStore {
 
     this.setEntries(target, [...new Set(state.entries)]);
     this.fileFingerprints[filePath] = state.fingerprint;
+  }
+
+  private async runTargetMutation(
+    target: "memory" | "user" | "failure",
+    mutation: () => Promise<MemoryResult>,
+  ): Promise<MemoryResult> {
+    const identity = await this.getStorageIdentity(target);
+    const lockDir = `${identity}.mutation-lock`;
+    const token = randomUUID();
+    const deadline = Date.now() + 5000;
+
+    while (true) {
+      try {
+        await fs.mkdir(lockDir);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (await this.mutationLockIsStale(lockDir)) {
+          await this.removeMutationLockIfOwned(lockDir);
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(`Memory mutation already in progress for ${identity}`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        continue;
+      }
+
+      try {
+        try {
+          await fs.writeFile(
+            path.join(lockDir, "owner.json"),
+            JSON.stringify({ pid: process.pid, token }),
+            { encoding: "utf-8", mode: 0o600 },
+          );
+        } catch (error) {
+          await fs.rm(lockDir, { recursive: true, force: true });
+          throw error;
+        }
+
+        const result = await mutation();
+        if (result.success && this.mutationObserver) {
+          const filePath = this.pathFor(target);
+          const state = await this.readFileState(filePath);
+          this.setEntries(target, [...new Set(state.entries)]);
+          this.fileFingerprints[filePath] = state.fingerprint;
+          const warning = await this.mutationObserver(target, [...state.entries]);
+          if (warning) {
+            const warnings = [...(result.warnings ?? []), warning];
+            return {
+              ...result,
+              message: result.message ? `${result.message} Warning: ${warning}` : warning,
+              warning,
+              warnings,
+            };
+          }
+        }
+        return result;
+      } finally {
+        await this.releaseMutationLock(lockDir, token);
+      }
+    }
+  }
+
+  private async mutationLockIsStale(lockDir: string): Promise<boolean> {
+    try {
+      try {
+        const owner = JSON.parse(await fs.readFile(path.join(lockDir, "owner.json"), "utf-8")) as { pid?: unknown };
+        if (typeof owner.pid === "number" && owner.pid > 0) {
+          try {
+            process.kill(owner.pid, 0);
+            return false;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+            return false;
+          }
+        }
+      } catch {
+      }
+      return Date.now() - (await fs.stat(lockDir)).mtimeMs > 300000;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
+    }
+  }
+
+  private async removeMutationLockIfOwned(lockDir: string): Promise<void> {
+    let token: string | undefined;
+    try {
+      const owner = JSON.parse(await fs.readFile(path.join(lockDir, "owner.json"), "utf-8")) as { token?: unknown };
+      if (typeof owner.token === "string") token = owner.token;
+    } catch {
+    }
+    if (token) await this.releaseMutationLock(lockDir, token);
+    else await fs.rm(lockDir, { recursive: true, force: true });
+  }
+
+  private async releaseMutationLock(lockDir: string, token: string): Promise<void> {
+    try {
+      const owner = JSON.parse(await fs.readFile(path.join(lockDir, "owner.json"), "utf-8")) as { token?: unknown };
+      if (owner.token === token) await fs.rm(lockDir, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
 
   /**

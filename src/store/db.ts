@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { SCHEMA_SQL } from './schema.js';
 
 type StatementLike = {
@@ -209,7 +210,11 @@ export class DatabaseManager {
    */
   recoverFromCorruption(cause?: unknown): DatabaseRecoveryResult {
     this.close();
-    const recovery = this.recoverDatabaseFile(cause);
+    let verifiedDb: DatabaseLike | null = null;
+    const recovery = this.recoverDatabaseFile(cause, () => {
+      verifiedDb = this.openUnchecked();
+    });
+    if (verifiedDb) this.safeClose(verifiedDb);
     this.lastRecovery = recovery;
     return recovery;
   }
@@ -230,9 +235,13 @@ export class DatabaseManager {
         throw err;
       }
 
-      const recovery = this.recoverDatabaseFile(err);
+      let recoveredDb: DatabaseLike | null = null;
+      const recovery = this.recoverDatabaseFile(err, () => {
+        recoveredDb = this.openUnchecked();
+      });
       this.lastRecovery = recovery;
-      return this.openUnchecked();
+      if (!recoveredDb) throw new Error(`SQLite recovery verification did not open ${this.dbPath}`);
+      return recoveredDb;
     }
   }
 
@@ -325,43 +334,18 @@ export class DatabaseManager {
     }
   }
 
-  private recoverDatabaseFile(cause?: unknown): DatabaseRecoveryResult {
+  private recoverDatabaseFile(cause: unknown, verify: () => void): DatabaseRecoveryResult {
     const lockDir = `${this.dbPath}.recovery-lock`;
     const deadline = Date.now() + Math.max(0, this.recoveryOptions.recoveryLockWaitMs);
 
     while (true) {
+      const token = randomUUID();
       try {
         fs.mkdirSync(lockDir);
-        try {
-          fs.writeFileSync(
-            path.join(lockDir, 'owner.json'),
-            JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
-            { encoding: 'utf-8', mode: 0o600 },
-          );
-
-          if (this.currentDatabaseIsHealthy()) {
-            this.clearRecoveryFailures();
-            return { strategy: 'reused', backupPaths: [] };
-          }
-
-          this.assertRecoveryCircuitClosed();
-          try {
-            this.cleanupRecoveryArtifacts();
-            const result = this.recoverDatabaseFileUnlocked(cause);
-            this.cleanupRecoveryArtifacts();
-            this.clearRecoveryFailures();
-            return result;
-          } catch (error) {
-            this.recordRecoveryFailure();
-            throw error;
-          }
-        } finally {
-          fs.rmSync(lockDir, { recursive: true, force: true });
-        }
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         if (this.recoveryLockIsStaleOrGone(lockDir)) {
-          fs.rmSync(lockDir, { recursive: true, force: true });
+          this.removeRecoveryLockIfOwned(lockDir);
           continue;
         }
         if (Date.now() >= deadline) {
@@ -371,6 +355,46 @@ export class DatabaseManager {
           this.recoveryOptions.recoveryLockPollMs,
           Math.max(1, deadline - Date.now()),
         ));
+        continue;
+      }
+
+      try {
+        try {
+          fs.writeFileSync(
+            path.join(lockDir, 'owner.json'),
+            JSON.stringify({ pid: process.pid, token, startedAt: new Date().toISOString() }),
+            { encoding: 'utf-8', mode: 0o600 },
+          );
+        } catch (error) {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+          throw error;
+        }
+
+        if (this.currentDatabaseIsHealthy()) {
+          try {
+            verify();
+            this.clearRecoveryFailures();
+            return { strategy: 'reused', backupPaths: [] };
+          } catch (error) {
+            this.recordRecoveryFailure();
+            throw error;
+          }
+        }
+
+        this.assertRecoveryCircuitClosed();
+        try {
+          this.cleanupRecoveryArtifacts();
+          const result = this.recoverDatabaseFileUnlocked(cause);
+          verify();
+          this.cleanupRecoveryArtifacts();
+          this.clearRecoveryFailures();
+          return result;
+        } catch (error) {
+          this.recordRecoveryFailure();
+          throw error;
+        }
+      } finally {
+        this.releaseRecoveryLock(lockDir, token);
       }
     }
   }
@@ -413,11 +437,13 @@ export class DatabaseManager {
     try {
       try {
         const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')) as { pid?: unknown };
-        if (typeof owner.pid === 'number' && owner.pid > 0 && owner.pid !== process.pid) {
+        if (typeof owner.pid === 'number' && owner.pid > 0) {
           try {
             process.kill(owner.pid, 0);
+            return false;
           } catch (error) {
             if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+            return false;
           }
         }
       } catch {
@@ -427,6 +453,26 @@ export class DatabaseManager {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
       throw error;
+    }
+  }
+
+  private removeRecoveryLockIfOwned(lockDir: string): void {
+    let token: string | undefined;
+    try {
+      const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')) as { token?: unknown };
+      if (typeof owner.token === 'string') token = owner.token;
+    } catch {
+    }
+    if (token) this.releaseRecoveryLock(lockDir, token);
+    else fs.rmSync(lockDir, { recursive: true, force: true });
+  }
+
+  private releaseRecoveryLock(lockDir: string, token: string): void {
+    try {
+      const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')) as { token?: unknown };
+      if (owner.token === token) fs.rmSync(lockDir, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
 
