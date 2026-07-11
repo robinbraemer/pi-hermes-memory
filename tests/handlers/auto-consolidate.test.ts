@@ -8,8 +8,10 @@ import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
+import { createHash } from "node:crypto";
 import { registerConsolidateCommand, triggerConsolidation } from "../../src/handlers/auto-consolidate.js";
 import { resolveChildPiInvocation } from "../../src/handlers/pi-child-process.js";
+import { MemoryStore } from "../../src/store/memory-store.js";
 import { ENTRY_DELIMITER } from "../../src/constants.js";
 
 // ─── Mock infrastructure ───
@@ -70,6 +72,7 @@ const mockStore = {
   getMemoryEntries: () => ["old entry 1", "old entry 2"],
   getUserEntries: () => ["user fact 1"],
   getAllFailureEntries: () => ["failure lesson 1", "failure lesson 2"],
+  getStorageIdentity: async (target: string) => path.join("mock-store", target),
   loadFromDisk: async () => {},
 } as any;
 
@@ -139,8 +142,54 @@ describe("triggerConsolidation", () => {
     assert.strictEqual(execCalls.length, 1, "only one child Pi process should be spawned");
   });
 
+  it("allows the same project target to consolidate concurrently in distinct stores", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-consolidation-stores-"));
+    const stores = ["project-a", "project-b"].map((name) => new MemoryStore({
+      memoryDir: path.join(root, name),
+      memoryCharLimit: 5_000,
+      userCharLimit: 5_000,
+    } as any));
+    await Promise.all(stores.map((store) => store.loadFromDisk()));
+
+    let started = 0;
+    let markFirstStarted!: () => void;
+    let markBothStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const bothStarted = new Promise<void>((resolve) => { markBothStarted = resolve; });
+    const releases: Array<() => void> = [];
+    const pi = {
+      exec: async () => {
+        started++;
+        if (started === 1) markFirstStarted();
+        if (started === 2) markBothStarted();
+        await new Promise<void>((resolve) => { releases.push(resolve); });
+        return { code: 0, stdout: "Done", stderr: "" };
+      },
+    } as any;
+
+    try {
+      const first = triggerConsolidation(pi, stores[0], "memory", undefined, 60_000, "project");
+      await firstStarted;
+      const second = triggerConsolidation(pi, stores[1], "memory", undefined, 60_000, "project");
+      const raced = await Promise.race([
+        bothStarted.then(() => "both-started" as const),
+        settle(100).then(() => "timeout" as const),
+      ]);
+
+      releases.forEach((release) => release());
+      await Promise.allSettled([first, second]);
+
+      assert.strictEqual(raced, "both-started");
+      assert.strictEqual(started, 2);
+    } finally {
+      releases.forEach((release) => release());
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("retries lock acquisition when an existing lock disappears before inspection", async () => {
-    const lockPath = path.join(LOCK_DIR, "memory-memory.lock");
+    const storageHash = createHash("sha256").update(path.join("mock-store", "memory")).digest("hex");
+    const lockPath = path.join(LOCK_DIR, `memory-memory-${storageHash}.lock`);
     await fs.rm(lockPath, { recursive: true, force: true });
     await fs.symlink(path.join(LOCK_DIR, "already-gone"), lockPath, "dir");
 
@@ -282,6 +331,7 @@ describe("triggerConsolidation", () => {
     const emptyStore = {
       getMemoryEntries: () => [],
       getUserEntries: () => [],
+      getStorageIdentity: async (target: string) => path.join("empty-store", target),
       loadFromDisk: async () => {},
     } as any;
 
@@ -318,6 +368,7 @@ describe("registerConsolidateCommand", () => {
     const projectStore = {
       getMemoryEntries: () => ["project fact"],
       getUserEntries: () => [],
+      getStorageIdentity: async (target: string) => path.join("project-store", target),
       loadFromDisk: async () => { projectReloaded = true; },
     } as any;
 

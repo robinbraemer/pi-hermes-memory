@@ -9,6 +9,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { MemoryStore } from "../store/memory-store.js";
 import { CONSOLIDATION_PROMPT, ENTRY_DELIMITER } from "../constants.js";
@@ -35,8 +36,12 @@ function sanitizeLockPart(value: string): string {
   return value.replace(/[^a-z0-9._-]+/gi, "_").slice(0, 80) || "unknown";
 }
 
-function consolidationLockPath(target: MemoryTarget, toolTarget: ToolMemoryTarget): string {
-  return path.join(consolidationLockRoot(), `${sanitizeLockPart(toolTarget)}-${sanitizeLockPart(target)}.lock`);
+function consolidationLockPath(target: MemoryTarget, toolTarget: ToolMemoryTarget, storageIdentity: string): string {
+  const storageHash = createHash("sha256").update(storageIdentity).digest("hex");
+  return path.join(
+    consolidationLockRoot(),
+    `${sanitizeLockPart(toolTarget)}-${sanitizeLockPart(target)}-${storageHash}.lock`,
+  );
 }
 
 async function lockIsStaleOrGone(lockDir: string, timeoutMs: number): Promise<boolean> {
@@ -51,11 +56,13 @@ async function lockIsStaleOrGone(lockDir: string, timeoutMs: number): Promise<bo
 }
 
 async function tryAcquireConsolidationLock(
+  store: MemoryStore,
   target: MemoryTarget,
   toolTarget: ToolMemoryTarget,
   timeoutMs: number,
 ): Promise<ConsolidationLock | null> {
-  const lockDir = consolidationLockPath(target, toolTarget);
+  const storageIdentity = await store.getStorageIdentity(target);
+  const lockDir = consolidationLockPath(target, toolTarget, storageIdentity);
   await fs.mkdir(path.dirname(lockDir), { recursive: true });
 
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -140,7 +147,7 @@ export async function triggerConsolidation(
   let lock: ConsolidationLock | null = null;
 
   try {
-    lock = await tryAcquireConsolidationLock(target, toolTarget, timeoutMs);
+    lock = await tryAcquireConsolidationLock(store, target, toolTarget, timeoutMs);
     if (!lock) {
       return {
         consolidated: false,

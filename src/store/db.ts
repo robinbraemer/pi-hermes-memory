@@ -340,15 +340,21 @@ export class DatabaseManager {
           );
 
           if (this.currentDatabaseIsHealthy()) {
+            this.clearRecoveryFailures();
             return { strategy: 'reused', backupPaths: [] };
           }
 
           this.assertRecoveryCircuitClosed();
-          this.recordRecoveryAttempt();
-          this.cleanupRecoveryArtifacts();
-          const result = this.recoverDatabaseFileUnlocked(cause);
-          this.cleanupRecoveryArtifacts();
-          return result;
+          try {
+            this.cleanupRecoveryArtifacts();
+            const result = this.recoverDatabaseFileUnlocked(cause);
+            this.cleanupRecoveryArtifacts();
+            this.clearRecoveryFailures();
+            return result;
+          } catch (error) {
+            this.recordRecoveryFailure();
+            throw error;
+          }
         } finally {
           fs.rmSync(lockDir, { recursive: true, force: true });
         }
@@ -428,35 +434,39 @@ export class DatabaseManager {
     return `${this.dbPath}.recovery-state.json`;
   }
 
-  private recentRecoveryAttempts(): number[] {
+  private recentRecoveryFailures(): number[] {
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.recoveryCircuitPath(), 'utf-8')) as { attempts?: unknown };
-      if (!Array.isArray(parsed.attempts)) return [];
+      const parsed = JSON.parse(fs.readFileSync(this.recoveryCircuitPath(), 'utf-8')) as { failures?: unknown };
+      if (!Array.isArray(parsed.failures)) return [];
       const cutoff = Date.now() - Math.max(0, this.recoveryOptions.recoveryCircuitWindowMs);
-      return parsed.attempts.filter((value): value is number => typeof value === 'number' && value >= cutoff);
+      return parsed.failures.filter((value): value is number => typeof value === 'number' && value >= cutoff);
     } catch {
       return [];
     }
   }
 
   private assertRecoveryCircuitClosed(): void {
-    if (this.recentRecoveryAttempts().length >= Math.max(1, this.recoveryOptions.recoveryCircuitLimit)) {
+    if (this.recentRecoveryFailures().length >= Math.max(1, this.recoveryOptions.recoveryCircuitLimit)) {
       throw new Error(
-        `SQLite recovery circuit is open for ${this.dbPath}: too many recovery attempts within ${this.recoveryOptions.recoveryCircuitWindowMs}ms`,
+        `SQLite recovery circuit is open for ${this.dbPath}: too many failed recovery attempts within ${this.recoveryOptions.recoveryCircuitWindowMs}ms`,
       );
     }
   }
 
-  private recordRecoveryAttempt(): void {
+  private recordRecoveryFailure(): void {
     const statePath = this.recoveryCircuitPath();
     const tempPath = `${statePath}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    const attempts = [...this.recentRecoveryAttempts(), Date.now()];
+    const failures = [...this.recentRecoveryFailures(), Date.now()];
     try {
-      fs.writeFileSync(tempPath, JSON.stringify({ attempts }), { encoding: 'utf-8', mode: 0o600 });
+      fs.writeFileSync(tempPath, JSON.stringify({ failures }), { encoding: 'utf-8', mode: 0o600 });
       fs.renameSync(tempPath, statePath);
     } finally {
       fs.rmSync(tempPath, { force: true });
     }
+  }
+
+  private clearRecoveryFailures(): void {
+    fs.rmSync(this.recoveryCircuitPath(), { force: true });
   }
 
   private cleanupRecoveryArtifacts(): void {

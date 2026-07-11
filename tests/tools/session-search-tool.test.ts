@@ -153,6 +153,43 @@ describe("registerSessionSearchTool", () => {
     }
   });
 
+  it("bounds the zero-result response without echoing an oversized query", async () => {
+    let captured: any;
+    const mockPi = {
+      registerTool: (def: any) => { captured = def; },
+    } as any;
+    const memoryDir = makeSessionsDir();
+    const dbManager = new DatabaseManager(memoryDir);
+
+    try {
+      indexSession(dbManager, {
+        id: "zero-result-session",
+        project: "zero-result-project",
+        cwd: "/work/zero-result",
+        startedAt: "2026-07-11T00:00:00.000Z",
+        endedAt: null,
+        messages: [{
+          id: "zero-result-message",
+          role: "assistant",
+          content: "indexed haystack",
+          timestamp: "2026-07-11T00:01:00.000Z",
+        }],
+      });
+      registerSessionSearchTool(mockPi, dbManager);
+      const query = `${" ".repeat(60_000)}missing`;
+
+      const result = await captured.execute("tc-zero-result", { query });
+      const output = result.content[0].text as string;
+
+      assert.strictEqual(result.details.count, 0);
+      assert.ok(output.length <= 50 * 1024, `expected <= 50 KiB, got ${output.length}`);
+      assert.strictEqual(output.includes(query), false);
+      assert.ok(JSON.stringify(result.details).length < 1_000);
+    } finally {
+      dbManager.close();
+    }
+  });
+
   it("registers and executes the anchor markdown-only schema when configured", async () => {
     let captured: any;
     const mockPi = {

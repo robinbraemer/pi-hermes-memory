@@ -58,6 +58,23 @@ export class MemoryStore {
     return path.join(this.memoryDir, MEMORY_FILE);
   }
 
+  async getStorageIdentity(target: "memory" | "user" | "failure"): Promise<string> {
+    const filePath = path.resolve(this.pathFor(target));
+    try {
+      return await fs.realpath(filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+
+    try {
+      const canonicalDir = await fs.realpath(path.dirname(filePath));
+      return path.join(canonicalDir, path.basename(filePath));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return filePath;
+    }
+  }
+
   private entriesFor(target: "memory" | "user" | "failure"): string[] {
     if (target === "user") return this.userEntries;
     if (target === "failure") return this.failureEntries;

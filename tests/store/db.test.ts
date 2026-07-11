@@ -348,7 +348,7 @@ describe('DatabaseManager', () => {
       assert.ok(names.filter((name) => name.startsWith('sessions.db.corrupt-')).length <= 3);
     });
 
-    it('opens a circuit after repeated recovery attempts in the configured window', () => {
+    it('does not count successful recreations toward the recovery circuit', () => {
       dbManager.close();
       const dbPath = path.join(tmpDir, 'sessions.db');
       fs.writeFileSync(dbPath, 'first corrupt database');
@@ -365,7 +365,41 @@ describe('DatabaseManager', () => {
         recoveryCircuitWindowMs: 60_000,
       });
 
-      assert.throws(() => dbManager.getDb(), /recovery circuit is open/i);
+      assert.doesNotThrow(() => dbManager.getDb());
+      assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'recreated-empty');
+    });
+
+    it('opens the recovery circuit after a failed recovery', () => {
+      dbManager.close();
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'corrupt database');
+      dbManager = new DatabaseManager(tmpDir, {
+        recoveryCircuitLimit: 1,
+        recoveryCircuitWindowMs: 60_000,
+      });
+      let recoveryCalls = 0;
+      (dbManager as any).recoverDatabaseFileUnlocked = () => {
+        recoveryCalls++;
+        throw new Error('injected recovery failure');
+      };
+
+      assert.throws(() => dbManager.recoverFromCorruption(corruptSqliteError()), /injected recovery failure/);
+      assert.throws(() => dbManager.recoverFromCorruption(corruptSqliteError()), /recovery circuit is open/i);
+      assert.strictEqual(recoveryCalls, 1);
+    });
+
+    it('does not treat legacy recovery attempt state as failed recoveries', () => {
+      dbManager.close();
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'corrupt database');
+      fs.writeFileSync(
+        path.join(tmpDir, 'sessions.db.recovery-state.json'),
+        JSON.stringify({ attempts: [Date.now()] }),
+      );
+      dbManager = new DatabaseManager(tmpDir, {
+        recoveryCircuitLimit: 1,
+        recoveryCircuitWindowMs: 60_000,
+      });
+
+      assert.doesNotThrow(() => dbManager.getDb());
     });
 
     it('repairs recoverable corruption on open and preserves readable rows', () => {

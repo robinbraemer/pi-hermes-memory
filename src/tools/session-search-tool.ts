@@ -192,8 +192,15 @@ Returns bounded conversation snippets with session dates and project context. La
       const results = searchSessions(dbManager, query, { project, role, limit });
 
       if (results.length === 0) {
-        const result: SearchResult = { success: true, count: 0, message: `No results found for "${query}". Try a different search term or broader query.` };
-        return { content: [{ type: 'text' as const, text: result.message! }], details: result };
+        const output = capLegacyOutput('No results found. Try a different search term or broader query.');
+        const result: SearchResult = {
+          success: true,
+          count: 0,
+          message: output.text,
+          outputChars: output.text.length,
+          outputTruncated: output.truncated,
+        };
+        return { content: [{ type: 'text' as const, text: output.text }], details: result };
       }
 
       const blocks: string[] = [`Found ${results.length} results for "${query}":`];
