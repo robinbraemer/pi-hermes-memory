@@ -6,6 +6,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { DatabaseManager, SQLITE_WAL_AUTOCHECKPOINT_PAGES } from '../../src/store/db.js';
+import { AtomicLockCoordinator } from '../../src/store/atomic-lock-coordinator.js';
 
 describe('DatabaseManager', () => {
   let tmpDir: string;
@@ -299,15 +300,22 @@ describe('DatabaseManager', () => {
     it('waits for a recovery owner and reuses the healthy database it leaves behind', () => {
       dbManager.getDb();
       dbManager.close();
-      const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
-      fs.mkdirSync(lockDir);
-      fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, token: 'live-owner' }));
-      const stale = new Date(Date.now() - 10_000);
-      fs.utimesSync(lockDir, stale, stale);
+      const lockDbPath = path.join(tmpDir, '.pi-hermes-locks.sqlite');
+      const lockKey = `recovery:${path.join(tmpDir, 'sessions.db')}`;
+      const coordinator = new AtomicLockCoordinator(lockDbPath);
+      const lease = coordinator.tryAcquire(lockKey, { staleMs: 1 });
+      assert.ok(lease);
       spawn(process.execPath, [
         '-e',
-        'setTimeout(() => require("node:fs").rmSync(process.argv[1], { recursive: true, force: true }), 100)',
-        lockDir,
+        `setTimeout(() => {
+          const Database = require('better-sqlite3');
+          const db = new Database(process.argv[1]);
+          db.prepare('DELETE FROM locks WHERE lock_key = ? AND token = ?').run(process.argv[2], process.argv[3]);
+          db.close();
+        }, 100)`,
+        lockDbPath,
+        lockKey,
+        lease.token,
       ], { stdio: 'ignore' });
 
       dbManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 1000, recoveryLockPollMs: 10, recoveryLockStaleMs: 1 });
@@ -319,56 +327,23 @@ describe('DatabaseManager', () => {
       assert.strictEqual(fs.readdirSync(tmpDir).filter((name) => name.startsWith('sessions.db.corrupt-')).length, 0);
     });
 
-    it('does not release a recovery lock whose ownership token changed', () => {
-      dbManager.close();
-      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'corrupt database');
-      const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
-      dbManager = new DatabaseManager(tmpDir);
-      (dbManager as any).recoverDatabaseFileUnlocked = () => {
-        fs.rmSync(path.join(tmpDir, 'sessions.db'), { force: true });
-        const healthy = new Database(path.join(tmpDir, 'sessions.db'));
-        healthy.close();
-        fs.writeFileSync(
-          path.join(lockDir, 'owner.json'),
-          JSON.stringify({ pid: process.pid, token: 'successor-owner' }),
-        );
-        return { strategy: 'recreated-empty', backupPaths: [] };
-      };
-
-      dbManager.recoverFromCorruption(corruptSqliteError());
-
-      assert.strictEqual(fs.existsSync(lockDir), true);
-      const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8'));
-      assert.strictEqual(owner.token, 'successor-owner');
-      fs.rmSync(lockDir, { recursive: true, force: true });
-    });
-
-    it('does not remove a successor observed after stale recovery inspection', () => {
-      const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
-      fs.mkdirSync(lockDir);
-      fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: 999999, token: 'successor' }));
-
-      (dbManager as any).removeRecoveryLockIfOwned(lockDir, 'stale-owner');
-
-      assert.strictEqual(fs.existsSync(lockDir), true);
-      const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8'));
-      assert.strictEqual(owner.token, 'successor');
-      fs.rmSync(lockDir, { recursive: true, force: true });
-    });
-
     it('takes over a stale recovery lock', () => {
       dbManager.close();
       fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'not a sqlite database');
-      const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
-      fs.mkdirSync(lockDir);
-      const stale = new Date(Date.now() - 10_000);
-      fs.utimesSync(lockDir, stale, stale);
+      const lockDbPath = path.join(tmpDir, '.pi-hermes-locks.sqlite');
+      const coordinator = new AtomicLockCoordinator(lockDbPath);
+      coordinator.tryAcquire('schema-init', { staleMs: 50 })!.release();
+      const lockDb = new Database(lockDbPath);
+      lockDb.prepare(`
+        INSERT INTO locks (lock_key, token, pid, acquired_at)
+        VALUES (?, 'dead-owner', 999999, ?)
+      `).run(`recovery:${path.join(tmpDir, 'sessions.db')}`, Date.now() - 10_000);
+      lockDb.close();
 
       dbManager = new DatabaseManager(tmpDir, { recoveryLockStaleMs: 50 });
       const db = dbManager.getDb();
 
       assertQuickCheckOk(db as InstanceType<typeof Database>);
-      assert.strictEqual(fs.existsSync(lockDir), false);
     });
 
     it('cleans abandoned rebuild files and caps corrupt backup sets', () => {

@@ -8,7 +8,6 @@ import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
-import { createHash } from "node:crypto";
 import { registerConsolidateCommand, triggerConsolidation } from "../../src/handlers/auto-consolidate.js";
 import { resolveChildPiInvocation } from "../../src/handlers/pi-child-process.js";
 import { MemoryStore } from "../../src/store/memory-store.js";
@@ -185,38 +184,6 @@ describe("triggerConsolidation", () => {
       releases.forEach((release) => release());
       await fs.rm(root, { recursive: true, force: true });
     }
-  });
-
-  it("retries lock acquisition when an existing lock disappears before inspection", async () => {
-    const storageHash = createHash("sha256").update(path.join("mock-store", "memory")).digest("hex");
-    const lockPath = path.join(LOCK_DIR, `memory-memory-${storageHash}.lock`);
-    await fs.rm(lockPath, { recursive: true, force: true });
-    await fs.symlink(path.join(LOCK_DIR, "already-gone"), lockPath, "dir");
-
-    const result = await triggerConsolidation(createMockPi(), mockStore, "memory");
-
-    assert.strictEqual(result.consolidated, true);
-    assert.strictEqual(execCalls.length, 1);
-  });
-
-  it("does not release a successor consolidation lock", async () => {
-    const storageHash = createHash("sha256").update(path.join("mock-store", "memory")).digest("hex");
-    const lockPath = path.join(LOCK_DIR, `memory-memory-${storageHash}.lock`);
-    const ownerPath = path.join(lockPath, "owner.json");
-    await fs.rm(lockPath, { recursive: true, force: true });
-
-    const pi = createMockPi();
-    pi.exec = async (...args: any[]) => {
-      execCalls.push(captureExecArgs(args));
-      await fs.writeFile(ownerPath, JSON.stringify({ pid: process.pid, token: "successor" }), "utf-8");
-      return { code: 0, stdout: "Done", stderr: "" };
-    };
-
-    const result = await triggerConsolidation(pi, mockStore, "memory");
-
-    assert.strictEqual(result.consolidated, true);
-    assert.strictEqual(JSON.parse(await fs.readFile(ownerPath, "utf-8")).token, "successor");
-    await fs.rm(lockPath, { recursive: true, force: true });
   });
 
   it("returns { consolidated: false } on failure (non-zero exit code)", async () => {

@@ -208,6 +208,35 @@ describe('memory sqlite sync + markdown backfill', () => {
     );
   });
 
+  it('prunes a deleted project Markdown scope without touching unrelated rows', () => {
+    const deletedProjectDir = path.join(agentRoot, 'projects-memory', 'deleted-project');
+    const keptProjectDir = path.join(agentRoot, 'projects-memory', 'kept-project');
+    fs.mkdirSync(deletedProjectDir, { recursive: true });
+    fs.mkdirSync(keptProjectDir, { recursive: true });
+    fs.writeFileSync(path.join(deletedProjectDir, 'MEMORY.md'), 'deleted project memory', 'utf-8');
+    fs.writeFileSync(path.join(keptProjectDir, 'MEMORY.md'), 'kept project memory', 'utf-8');
+    fs.writeFileSync(path.join(globalDir, 'MEMORY.md'), 'kept global memory', 'utf-8');
+
+    syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+    dbManager.getDb().prepare(`
+      INSERT INTO memories (project, target, category, content, created, last_referenced)
+      VALUES ('deleted-project', 'user', NULL, 'unrelated project user', '2026-07-01', '2026-07-01')
+    `).run();
+    fs.rmSync(path.join(deletedProjectDir, 'MEMORY.md'));
+
+    const counters = syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(counters.removed, 1);
+    assert.deepStrictEqual(
+      getMemories(dbManager).map((entry) => `${entry.project ?? 'global'}:${entry.target}:${entry.content}`).sort(),
+      [
+        'deleted-project:user:unrelated project user',
+        'global:memory:kept global memory',
+        'kept-project:memory:kept project memory',
+      ],
+    );
+  });
+
   it('still scans project markdown under ~/.pi/agent when memoryDir is customized elsewhere', () => {
     const customGlobalDir = path.join(tmpDir, 'external-memory-root');
     fs.mkdirSync(customGlobalDir, { recursive: true });

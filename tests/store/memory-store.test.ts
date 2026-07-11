@@ -894,22 +894,5 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.match(await readRaw(userPath), /independent user writer/);
     });
 
-    it("does not remove a successor observed after stale mutation lock inspection", async () => {
-      const store = new MemoryStore(makeConfig());
-      await store.loadFromDisk();
-      const identity = await store.getStorageIdentity("memory");
-      const lockDir = `${identity}.mutation-lock`;
-      await fs.mkdir(lockDir);
-      await fs.writeFile(
-        path.join(lockDir, "owner.json"),
-        JSON.stringify({ pid: 999999, token: "successor" }),
-        "utf-8",
-      );
-
-      await (store as any).removeMutationLockIfOwned(lockDir, "stale-owner");
-
-      assert.strictEqual(JSON.parse(await fs.readFile(path.join(lockDir, "owner.json"), "utf-8")).token, "successor");
-      await fs.rm(lockDir, { recursive: true, force: true });
-    });
   });
 });

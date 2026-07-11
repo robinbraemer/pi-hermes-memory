@@ -110,11 +110,21 @@ export function syncMarkdownMemoriesToSqlite(
   reconcileFile(globalFailureFile, 'failure');
 
   const projects = scanProjectDirs(agentRoot, globalDir, projectsMemoryDir);
-  for (const project of projects) {
-    reconcileFile(project.memoryFile, 'memory', project.name);
+  const projectFiles = new Map(projects.map((project) => [project.name, project.memoryFile]));
+  const mirroredProjects = dbManager.getDb().prepare(`
+    SELECT DISTINCT project
+    FROM memories
+    WHERE project IS NOT NULL AND target = 'memory'
+  `).all() as Array<{ project: string }>;
+  const projectNames = new Set([
+    ...projectFiles.keys(),
+    ...mirroredProjects.map(({ project }) => project),
+  ]);
+  for (const projectName of projectNames) {
+    reconcileFile(projectFiles.get(projectName) ?? '', 'memory', projectName);
   }
 
-  return { ...counters, projectCount: projects.length };
+  return { ...counters, projectCount: projectNames.size };
 }
 
 export async function migrateThenSyncMarkdownMemories(

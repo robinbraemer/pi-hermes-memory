@@ -11,7 +11,7 @@
  * - Content scanning before any write
  */
 
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { scanContent } from "./content-scanner.js";
@@ -27,6 +27,7 @@ import {
 } from "../constants.js";
 import type { MemoryConfig, MemoryResult, MemorySnapshot, ConsolidationResult, MemoryCategory, MemoryOverflowStrategy } from "../types.js";
 import { AGENT_ROOT } from "../paths.js";
+import { AtomicLockCoordinator } from "./atomic-lock-coordinator.js";
 
 export class MemoryStore {
   private memoryEntries: string[] = [];
@@ -564,39 +565,20 @@ export class MemoryStore {
     mutation: () => Promise<MemoryResult>,
   ): Promise<MemoryResult> {
     const identity = await this.getStorageIdentity(target);
-    const lockDir = `${identity}.mutation-lock`;
-    const token = randomUUID();
+    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(identity), ".pi-hermes-locks.sqlite"));
+    const lockKey = `mutation:${identity}`;
     const deadline = Date.now() + 5000;
+    let lease = coordinator.tryAcquire(lockKey, { staleMs: 300000 });
 
-    while (true) {
-      try {
-        await fs.mkdir(lockDir);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const staleOwner = await this.mutationLockIsStale(lockDir);
-        if (staleOwner) {
-          await this.removeMutationLockIfOwned(lockDir, staleOwner);
-          continue;
-        }
-        if (Date.now() >= deadline) {
-          throw new Error(`Memory mutation already in progress for ${identity}`);
-        }
-        await new Promise((resolve) => setTimeout(resolve, 10));
-        continue;
+    while (!lease) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Memory mutation already in progress for ${identity}`);
       }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      lease = coordinator.tryAcquire(lockKey, { staleMs: 300000 });
+    }
 
-      try {
-        try {
-          await fs.writeFile(
-            path.join(lockDir, "owner.json"),
-            JSON.stringify({ pid: process.pid, token }),
-            { encoding: "utf-8", mode: 0o600 },
-          );
-        } catch (error) {
-          await fs.rm(lockDir, { recursive: true, force: true });
-          throw error;
-        }
-
+    try {
         const result = await mutation();
         if (result.success && this.mutationObserver) {
           const filePath = this.pathFor(target);
@@ -615,75 +597,8 @@ export class MemoryStore {
           }
         }
         return result;
-      } finally {
-        await this.releaseMutationLock(lockDir, token);
-      }
-    }
-  }
-
-  private async mutationLockIsStale(lockDir: string): Promise<{ token?: string; rawOwner?: string; mtimeMs: number } | null> {
-    try {
-      const stat = await fs.stat(lockDir);
-      let rawOwner: string | undefined;
-      try {
-        rawOwner = await fs.readFile(path.join(lockDir, "owner.json"), "utf-8");
-        const owner = JSON.parse(rawOwner) as { pid?: unknown; token?: unknown };
-        let ownerIsDead = false;
-        if (typeof owner.pid === "number" && owner.pid > 0) {
-          try {
-            process.kill(owner.pid, 0);
-            return null;
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ESRCH") return null;
-            ownerIsDead = true;
-          }
-        }
-        if (ownerIsDead && typeof owner.token === "string") {
-          return { token: owner.token, rawOwner, mtimeMs: stat.mtimeMs };
-        }
-      } catch {
-      }
-      return Date.now() - stat.mtimeMs > 300000
-        ? { rawOwner, mtimeMs: stat.mtimeMs }
-        : null;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { mtimeMs: -1 };
-      throw error;
-    }
-  }
-
-  private async removeMutationLockIfOwned(
-    lockDir: string,
-    observation: { token?: string; rawOwner?: string; mtimeMs: number } | string,
-  ): Promise<void> {
-    const expected: { token?: string; rawOwner?: string; mtimeMs?: number } = typeof observation === "string"
-      ? { token: observation }
-      : observation;
-    if (expected.mtimeMs === -1) return;
-    try {
-      const stat = await fs.stat(lockDir);
-      const rawOwner = await fs.readFile(path.join(lockDir, "owner.json"), "utf-8").catch((error) => {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-        throw error;
-      });
-      if (expected.token) {
-        const owner = rawOwner ? JSON.parse(rawOwner) as { token?: unknown } : null;
-        if (owner?.token !== expected.token) return;
-      } else if (stat.mtimeMs !== expected.mtimeMs || rawOwner !== expected.rawOwner) {
-        return;
-      }
-      await fs.rm(lockDir, { recursive: true, force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-  }
-
-  private async releaseMutationLock(lockDir: string, token: string): Promise<void> {
-    try {
-      const owner = JSON.parse(await fs.readFile(path.join(lockDir, "owner.json"), "utf-8")) as { token?: unknown };
-      if (owner.token === token) await fs.rm(lockDir, { recursive: true, force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    } finally {
+      lease.release();
     }
   }
 

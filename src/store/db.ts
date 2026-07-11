@@ -1,8 +1,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
-import { randomUUID } from 'node:crypto';
 import { SCHEMA_SQL } from './schema.js';
+import { AtomicLockCoordinator } from './atomic-lock-coordinator.js';
 
 type StatementLike = {
   run: (...args: any[]) => any;
@@ -335,20 +335,13 @@ export class DatabaseManager {
   }
 
   private recoverDatabaseFile(cause: unknown, verify: () => void): DatabaseRecoveryResult {
-    const lockDir = `${this.dbPath}.recovery-lock`;
+    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(this.dbPath), '.pi-hermes-locks.sqlite'));
+    const lockKey = `recovery:${this.dbPath}`;
     const deadline = Date.now() + Math.max(0, this.recoveryOptions.recoveryLockWaitMs);
 
     while (true) {
-      const token = randomUUID();
-      try {
-        fs.mkdirSync(lockDir);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        const staleOwner = this.recoveryLockIsStaleOrGone(lockDir);
-        if (staleOwner) {
-          this.removeRecoveryLockIfOwned(lockDir, staleOwner);
-          continue;
-        }
+      const lease = coordinator.tryAcquire(lockKey, { staleMs: this.recoveryOptions.recoveryLockStaleMs });
+      if (!lease) {
         if (Date.now() >= deadline) {
           throw new Error(`SQLite recovery already in progress for ${this.dbPath}; timed out after ${this.recoveryOptions.recoveryLockWaitMs}ms`);
         }
@@ -360,17 +353,6 @@ export class DatabaseManager {
       }
 
       try {
-        try {
-          fs.writeFileSync(
-            path.join(lockDir, 'owner.json'),
-            JSON.stringify({ pid: process.pid, token, startedAt: new Date().toISOString() }),
-            { encoding: 'utf-8', mode: 0o600 },
-          );
-        } catch (error) {
-          fs.rmSync(lockDir, { recursive: true, force: true });
-          throw error;
-        }
-
         if (this.currentDatabaseIsHealthy()) {
           try {
             verify();
@@ -395,7 +377,7 @@ export class DatabaseManager {
           throw error;
         }
       } finally {
-        this.releaseRecoveryLock(lockDir, token);
+        lease.release();
       }
     }
   }
@@ -431,71 +413,6 @@ export class DatabaseManager {
       return false;
     } finally {
       if (db) this.safeClose(db);
-    }
-  }
-
-  private recoveryLockIsStaleOrGone(lockDir: string): { token?: string; rawOwner?: string; mtimeMs: number } | null {
-    try {
-      const stat = fs.statSync(lockDir);
-      let rawOwner: string | undefined;
-      try {
-        rawOwner = fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8');
-        const owner = JSON.parse(rawOwner) as { pid?: unknown; token?: unknown };
-        let ownerIsDead = false;
-        if (typeof owner.pid === 'number' && owner.pid > 0) {
-          try {
-            process.kill(owner.pid, 0);
-            return null;
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return null;
-            ownerIsDead = true;
-          }
-        }
-        if (ownerIsDead && typeof owner.token === 'string') {
-          return { token: owner.token, rawOwner, mtimeMs: stat.mtimeMs };
-        }
-      } catch {
-      }
-      return Date.now() - stat.mtimeMs > Math.max(0, this.recoveryOptions.recoveryLockStaleMs)
-        ? { rawOwner, mtimeMs: stat.mtimeMs }
-        : null;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { mtimeMs: -1 };
-      throw error;
-    }
-  }
-
-  private removeRecoveryLockIfOwned(
-    lockDir: string,
-    observation: { token?: string; rawOwner?: string; mtimeMs: number } | string,
-  ): void {
-    const expected: { token?: string; rawOwner?: string; mtimeMs?: number } = typeof observation === 'string'
-      ? { token: observation }
-      : observation;
-    if (expected.mtimeMs === -1) return;
-    try {
-      const stat = fs.statSync(lockDir);
-      const rawOwner = fs.existsSync(path.join(lockDir, 'owner.json'))
-        ? fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')
-        : undefined;
-      if (expected.token) {
-        const owner = rawOwner ? JSON.parse(rawOwner) as { token?: unknown } : null;
-        if (owner?.token !== expected.token) return;
-      } else if (stat.mtimeMs !== expected.mtimeMs || rawOwner !== expected.rawOwner) {
-        return;
-      }
-      fs.rmSync(lockDir, { recursive: true, force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-  }
-
-  private releaseRecoveryLock(lockDir: string, token: string): void {
-    try {
-      const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')) as { token?: unknown };
-      if (owner.token === token) fs.rmSync(lockDir, { recursive: true, force: true });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
 
