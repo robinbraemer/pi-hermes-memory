@@ -83,11 +83,11 @@ function probeProcessIncarnation(pid: number): string | null {
   return result.status === 0 ? result.stdout.trim() || null : null;
 }
 
-const currentProcessIncarnation = probeProcessIncarnation(process.pid) ?? `pid-${process.pid}`;
+const currentProcessIncarnation = probeProcessIncarnation(process.pid);
 
 export class AtomicLockCoordinator {
   private readonly pid: number;
-  private readonly incarnation: string;
+  private readonly incarnation: string | null;
   private readonly probeIncarnation: (pid: number) => string | null;
 
   constructor(private readonly dbPath: string, options: AtomicLockCoordinatorOptions = {}) {
@@ -95,8 +95,8 @@ export class AtomicLockCoordinator {
     this.probeIncarnation = options.probeIncarnation
       ?? ((pid) => pid === process.pid ? currentProcessIncarnation : probeProcessIncarnation(pid));
     this.incarnation = options.incarnation
-      ?? (this.pid === process.pid ? currentProcessIncarnation : this.probeIncarnation(this.pid))
-      ?? `pid-${this.pid}`;
+      ?? this.probeIncarnation(this.pid)
+      ?? null;
   }
 
   tryAcquire(key: string, options: AtomicLockOptions): AtomicLockLease | null {

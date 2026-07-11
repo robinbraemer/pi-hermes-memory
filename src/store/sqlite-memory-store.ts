@@ -185,13 +185,18 @@ function escapeLikePattern(text: string): string {
   return text.replace(/[\\%_]/g, '\\$&');
 }
 
-function parseMetadataComment(raw: string): { text: string; created: string; lastReferenced: string } {
-  const match = raw.match(/^(.*?)\s*<!--\s*created=([^,]+),\s*last=([^>]+)\s*-->\s*$/);
+function parseMetadataComment(raw: string): { text: string; created: string; lastReferenced: string; project: string | null } {
+  const match = raw.match(/^(.*?)\s*<!--\s*created=([^,]+),\s*last=([^,>]+)(?:,\s*project64=([A-Za-z0-9_-]+))?\s*-->\s*$/);
   if (match) {
+    let project: string | null = null;
+    if (match[4]) {
+      try { project = Buffer.from(match[4], 'base64url').toString('utf-8').trim() || null; } catch {}
+    }
     return {
       text: match[1].trim(),
       created: match[2].trim(),
       lastReferenced: match[3].trim(),
+      project,
     };
   }
 
@@ -200,6 +205,7 @@ function parseMetadataComment(raw: string): { text: string; created: string; las
     text: raw.trim(),
     created: fallback,
     lastReferenced: fallback,
+    project: null,
   };
 }
 
@@ -257,7 +263,6 @@ export function formatFailureMemoryContent(
   if (options.failureReason) parts.push(`Failed: ${options.failureReason}`);
   if (options.toolState) parts.push(`Tool state: ${options.toolState}`);
   if (options.correctedTo) parts.push(`Corrected to: ${options.correctedTo}`);
-  if (options.project) parts.push(`Project: ${options.project}`);
   return parts.join(' — ');
 }
 
@@ -271,8 +276,9 @@ export function parseMarkdownMemoryEntry(
   target: 'memory' | 'user' | 'failure',
   project: string | null = null,
 ): ParsedMarkdownMemoryEntry {
-  const { text, created, lastReferenced } = parseMetadataComment(rawEntry);
-  const parsedProject = normalizeNullable(project);
+  const metadata = parseMetadataComment(rawEntry);
+  const { text, created, lastReferenced } = metadata;
+  const parsedProject = normalizeNullable(project) ?? metadata.project;
 
   if (target !== 'failure') {
     return {
@@ -461,13 +467,7 @@ export function reconcileMarkdownMemoryScope(
 }
 
 function failureProject(rawEntry: string): string | null {
-  const { text } = parseMetadataComment(rawEntry);
-  for (const segment of text.split(' — ').slice(1)) {
-    if (segment.startsWith('Project: ')) {
-      return normalizeNullable(segment.slice('Project: '.length));
-    }
-  }
-  return null;
+  return parseMetadataComment(rawEntry).project;
 }
 
 export function reconcileMarkdownFailureScopes(

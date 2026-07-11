@@ -32,6 +32,50 @@ describe("registerSessionSearchTool", () => {
     assert.strictEqual(captured.name, "session_search");
     assert.match(schema, /query/);
     assert.doesNotMatch(schema, /markdown/);
+    assert.match(schema, /"minimum":1/);
+    assert.match(schema, /"maximum":20/);
+  });
+
+  it("clamps negative and fractional legacy limits before querying", async () => {
+    let captured: any;
+    const mockPi = {
+      registerTool: (def: any) => { captured = def; },
+    } as any;
+    const memoryDir = makeSessionsDir();
+    const dbManager = new DatabaseManager(memoryDir);
+
+    try {
+      indexSession(dbManager, {
+        id: "bounded-limit-session",
+        project: "bounded-project",
+        cwd: "/work/bounded",
+        startedAt: "2026-07-11T00:00:00.000Z",
+        endedAt: null,
+        messages: Array.from({ length: 25 }, (_, index) => ({
+          id: `bounded-limit-message-${index}`,
+          role: "assistant",
+          content: `bounded-limit-needle ${index}`,
+          timestamp: `2026-07-11T00:${String(index).padStart(2, "0")}:00.000Z`,
+        })),
+      });
+      registerSessionSearchTool(mockPi, dbManager);
+
+      const negative = await captured.execute("tc-negative-limit", {
+        query: "bounded-limit-needle",
+        limit: -1,
+      });
+      const fractional = await captured.execute("tc-fractional-limit", {
+        query: "bounded-limit-needle",
+        limit: 2.9,
+      });
+
+      assert.strictEqual(negative.details.count, 1);
+      assert.strictEqual(fractional.details.count, 2);
+      assert.ok(negative.content[0].text.length < 2_000);
+      assert.ok(fractional.content[0].text.length < 4_000);
+    } finally {
+      dbManager.close();
+    }
   });
 
   it("bounds oversized legacy results and reports truncation without duplicating output in details", async () => {

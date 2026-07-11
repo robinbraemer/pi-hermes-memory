@@ -236,10 +236,14 @@ export class DatabaseManager {
   recoverFromCorruption(cause?: unknown): DatabaseRecoveryResult {
     this.close();
     let verifiedDb: DatabaseLike | null = null;
-    const recovery = this.recoverDatabaseFile(cause, () => {
-      verifiedDb = this.openUnchecked();
-    });
-    if (verifiedDb) this.safeClose(verifiedDb);
+    let recovery: DatabaseRecoveryResult;
+    try {
+      recovery = this.recoverDatabaseFile(cause, () => {
+        verifiedDb = this.openUnchecked();
+      });
+    } finally {
+      if (verifiedDb) this.safeClose(verifiedDb);
+    }
     this.lastRecovery = recovery;
     return recovery;
   }
@@ -261,9 +265,15 @@ export class DatabaseManager {
       }
 
       let recoveredDb: DatabaseLike | null = null;
-      const recovery = this.recoverDatabaseFile(err, () => {
-        recoveredDb = this.openUnchecked();
-      });
+      let recovery: DatabaseRecoveryResult;
+      try {
+        recovery = this.recoverDatabaseFile(err, () => {
+          recoveredDb = this.openUnchecked();
+        });
+      } catch (error) {
+        if (recoveredDb) this.safeClose(recoveredDb);
+        throw error;
+      }
       this.lastRecovery = recovery;
       if (!recoveredDb) throw new Error(`SQLite recovery verification did not open ${this.dbPath}`);
       return recoveredDb;
@@ -381,7 +391,7 @@ export class DatabaseManager {
         if (this.currentDatabaseIsHealthy()) {
           try {
             verify();
-            this.clearRecoveryFailures();
+            this.clearRecoveryFailuresBestEffort();
             return { strategy: 'reused', backupPaths: [] };
           } catch (error) {
             this.recordRecoveryFailure();
@@ -391,11 +401,11 @@ export class DatabaseManager {
 
         this.assertRecoveryCircuitClosed();
         try {
-          this.cleanupRecoveryArtifacts();
+          this.cleanupRecoveryArtifactsBestEffort();
           const result = this.recoverDatabaseFileUnlocked(cause);
           verify();
-          this.cleanupRecoveryArtifacts();
-          this.clearRecoveryFailures();
+          this.cleanupRecoveryArtifactsBestEffort();
+          this.clearRecoveryFailuresBestEffort();
           return result;
         } catch (error) {
           this.recordRecoveryFailure();
@@ -478,6 +488,14 @@ export class DatabaseManager {
 
   private clearRecoveryFailures(): void {
     fs.rmSync(this.recoveryCircuitPath(), { force: true });
+  }
+
+  private clearRecoveryFailuresBestEffort(): void {
+    try { this.clearRecoveryFailures(); } catch {}
+  }
+
+  private cleanupRecoveryArtifactsBestEffort(): void {
+    try { this.cleanupRecoveryArtifacts(); } catch {}
   }
 
   private cleanupRecoveryArtifacts(): void {

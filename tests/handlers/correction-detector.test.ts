@@ -436,7 +436,7 @@ describe("setupCorrectionDetector handler", () => {
     const projectFailures = getMemories(dbManager, { target: 'failure', project: 'project-a' });
     assert.strictEqual(projectFailures.length, 1);
     assert.match(projectFailures[0].content, /use pnpm in this repo/);
-    assert.match(projectFailures[0].content, /Project: project-a/);
+    assert.doesNotMatch(projectFailures[0].content, /Project: project-a/);
     assert.strictEqual(projectFailures[0].category, 'correction');
     assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
   });

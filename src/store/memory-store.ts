@@ -146,7 +146,7 @@ export class MemoryStore {
   }): Promise<MemoryResult> {
     const failureText = this.buildFailureMemoryText(content, options);
     return this.addWithConsolidation(
-      "failure", failureText, undefined, 1, "Failure memory saved: " + options.category,
+      "failure", failureText, undefined, 1, "Failure memory saved: " + options.category, options.project,
     );
   }
 
@@ -168,6 +168,7 @@ export class MemoryStore {
     content: string,
     signal?: AbortSignal,
     addedMessage = "Entry added.",
+    project?: string,
   ): Promise<MemoryResult> {
     content = content.trim();
     if (!content) return { success: false, error: "Content cannot be empty." };
@@ -187,7 +188,7 @@ export class MemoryStore {
 
     // Encode metadata: both dates = today
     const today = new Date().toISOString().split("T")[0];
-    const encoded = this.encodeEntry(content, today, today);
+    const encoded = this.encodeEntry(content, today, today, project);
 
     const newTotal = [...entries, encoded].join(ENTRY_DELIMITER).length;
     if (newTotal > limit) {
@@ -213,10 +214,11 @@ export class MemoryStore {
     signal: AbortSignal | undefined,
     retriesLeft: number,
     addedMessage: string,
+    project?: string,
   ): Promise<MemoryResult> {
     const result = await this.runTargetMutation(
       target,
-      () => this._add(target, content, signal, addedMessage),
+      () => this._add(target, content, signal, addedMessage, project),
     );
     if (
       result.success
@@ -232,7 +234,7 @@ export class MemoryStore {
       const consolidation = await this.consolidator(target, signal);
       if (consolidation.consolidated) {
         await this.loadFromDisk();
-        return this.addWithConsolidation(target, content, signal, retriesLeft - 1, addedMessage);
+        return this.addWithConsolidation(target, content, signal, retriesLeft - 1, addedMessage, project);
       }
     } catch {
     }
@@ -312,7 +314,7 @@ export class MemoryStore {
     // Preserve original created date, update last_referenced to today
     const decoded = this.decodeEntry(matches[0]);
     const today = new Date().toISOString().split("T")[0];
-    const encoded = this.encodeEntry(newContent, decoded.created, today);
+    const encoded = this.encodeEntry(newContent, decoded.created, today, decoded.project ?? undefined);
 
     const testEntries = [...entries];
     testEntries[idx] = encoded;
@@ -422,22 +424,29 @@ export class MemoryStore {
    * Encode metadata (created, lastReferenced) as an HTML comment appended to entry text.
    * The comment is invisible in markdown and transparent to the § delimiter.
    */
-  private encodeEntry(text: string, created: string, lastReferenced: string): string {
-    return `${text} <!-- created=${created}, last=${lastReferenced} -->`;
+  private encodeEntry(text: string, created: string, lastReferenced: string, project?: string): string {
+    const projectMetadata = project?.trim()
+      ? `, project64=${Buffer.from(project.trim(), "utf-8").toString("base64url")}`
+      : "";
+    return `${text} <!-- created=${created}, last=${lastReferenced}${projectMetadata} -->`;
   }
 
   /**
    * Decode entry text, extracting metadata if present.
    * Falls back to today's date for legacy entries without metadata.
    */
-  private decodeEntry(raw: string): { text: string; created: string; lastReferenced: string } {
-    const match = raw.match(/^(.*?)\s*<!--\s*created=([^,]+),\s*last=([^>]+)\s*-->\s*$/);
+  private decodeEntry(raw: string): { text: string; created: string; lastReferenced: string; project: string | null } {
+    const match = raw.match(/^(.*?)\s*<!--\s*created=([^,]+),\s*last=([^,>]+)(?:,\s*project64=([A-Za-z0-9_-]+))?\s*-->\s*$/);
     if (match) {
-      return { text: match[1].trim(), created: match[2].trim(), lastReferenced: match[3].trim() };
+      let project: string | null = null;
+      if (match[4]) {
+        try { project = Buffer.from(match[4], "base64url").toString("utf-8").trim() || null; } catch {}
+      }
+      return { text: match[1].trim(), created: match[2].trim(), lastReferenced: match[3].trim(), project };
     }
     // Legacy entry without metadata — use today as default
     const today = new Date().toISOString().split("T")[0];
-    return { text: raw.trim(), created: today, lastReferenced: today };
+    return { text: raw.trim(), created: today, lastReferenced: today, project: null };
   }
 
   /** Strip metadata comment from entry text for display. */
@@ -458,7 +467,6 @@ export class MemoryStore {
     if (options.failureReason) parts.push("Failed: " + options.failureReason);
     if (options.toolState) parts.push("Tool state: " + options.toolState);
     if (options.correctedTo) parts.push("Corrected to: " + options.correctedTo);
-    if (options.project) parts.push("Project: " + options.project);
     return parts.join(" — ");
   }
 

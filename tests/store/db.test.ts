@@ -414,6 +414,26 @@ describe('DatabaseManager', () => {
       assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'recreated-empty');
     });
 
+    it('keeps verified recovery successful when cleanup state removal fails', () => {
+      dbManager.close();
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'corrupt database');
+      dbManager = new DatabaseManager(tmpDir);
+      let cleanupCalls = 0;
+      (dbManager as any).cleanupRecoveryArtifacts = () => {
+        cleanupCalls++;
+        if (cleanupCalls > 1) throw new Error('injected cleanup failure');
+      };
+      (dbManager as any).clearRecoveryFailures = () => {
+        throw new Error('injected circuit cleanup failure');
+      };
+
+      const db = dbManager.getDb();
+
+      assert.ok(db);
+      assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'recreated-empty');
+      assertQuickCheckOk(db as InstanceType<typeof Database>);
+    });
+
     it('opens the recovery circuit after a failed recovery', () => {
       dbManager.close();
       fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'corrupt database');

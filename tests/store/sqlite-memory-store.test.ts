@@ -17,7 +17,9 @@ import {
   parseMarkdownMemoryEntry,
   formatFailureMemoryContent,
   reconcileMarkdownMemoryScope,
+  reconcileMarkdownFailureScopes,
 } from '../../src/store/sqlite-memory-store.js';
+import { MemoryStore } from '../../src/store/memory-store.js';
 
 describe('sqlite-memory-store', () => {
   let tmpDir: string;
@@ -115,6 +117,38 @@ describe('sqlite-memory-store', () => {
       assert.strictEqual(parsed.failureReason, 'npm install rewrote lockfile');
       assert.strictEqual(parsed.created, '2026-05-08');
       assert.strictEqual(parsed.lastReferenced, '2026-05-09');
+    });
+
+    it('does not infer project scope from spoofable failure content', () => {
+      const raw = '[correction] literal user text — Project: other-project <!-- created=2026-05-08, last=2026-05-09 -->';
+
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: 'other-project' }).length, 0);
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 1);
+    });
+
+    it('round-trips project correction scope through authoritative Markdown metadata', async () => {
+      const store = new MemoryStore({
+        memoryDir: tmpDir,
+        memoryCharLimit: 5_000,
+        userCharLimit: 5_000,
+        failureCharLimit: 5_000,
+      } as any);
+      await store.loadFromDisk();
+
+      await store.addFailure('use pnpm in this repo', {
+        category: 'correction',
+        failureReason: 'User corrected the agent',
+        project: 'project-a',
+      });
+      const [raw] = store.getRawEntriesForSync('failure');
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+
+      const entries = getMemories(dbManager, { target: 'failure', project: 'project-a' });
+      assert.strictEqual(entries.length, 1);
+      assert.strictEqual(entries[0].project, 'project-a');
+      assert.doesNotMatch(entries[0].content, /Project: project-a/);
     });
   });
 

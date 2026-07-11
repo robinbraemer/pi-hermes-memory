@@ -83,4 +83,29 @@ describe('AtomicLockCoordinator', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('keeps a live owner when either incarnation probe is unavailable', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    try {
+      const dbPath = path.join(tmpDir, 'locks.sqlite');
+      const owner = new AtomicLockCoordinator(dbPath, {
+        pid: process.pid,
+        probeIncarnation: () => null,
+      });
+      const lease = owner.tryAcquire('shared', { staleMs: 0 });
+      assert.ok(lease);
+
+      const contender = new AtomicLockCoordinator(dbPath, {
+        pid: process.pid,
+        incarnation: 'known-later',
+        probeIncarnation: () => 'known-later',
+      });
+      assert.strictEqual(contender.tryAcquire('shared', { staleMs: 0 }), null);
+
+      lease.release();
+      assert.ok(contender.tryAcquire('shared', { staleMs: 0 }));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
