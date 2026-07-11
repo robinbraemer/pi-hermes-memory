@@ -560,76 +560,82 @@ export function reconcileMarkdownFailureScopes(
   dbManager: DatabaseManager,
   rawEntries: string[],
 ): MarkdownMemoryReconcileResult {
-  const legacyAssignments = initializeLegacyFailureScopeAssignments(dbManager, rawEntries);
-  const explicitProjectsByIdentity = new Map<string, Set<string>>();
-  for (const rawEntry of rawEntries) {
-    const project = failureProject(rawEntry);
-    if (project === null) continue;
-    const projects = explicitProjectsByIdentity.get(failureIdentity(rawEntry)) ?? new Set<string>();
-    projects.add(project);
-    explicitProjectsByIdentity.set(failureIdentity(rawEntry), projects);
-  }
-  const unscopedIdentities = new Set(
-    rawEntries.filter((rawEntry) => failureProject(rawEntry) === null).map(failureIdentity),
-  );
-  for (const [identity, projects] of legacyAssignments) {
-    const retainedProjects = projects.filter(
-      (project) => !explicitProjectsByIdentity.get(identity)?.has(project),
-    );
-    if (!unscopedIdentities.has(identity) || retainedProjects.length === 0) {
-      legacyAssignments.delete(identity);
-    } else {
-      legacyAssignments.set(identity, retainedProjects);
+  const db = dbManager.getDb();
+  const reconcile = (): MarkdownMemoryReconcileResult => {
+    const legacyAssignments = initializeLegacyFailureScopeAssignments(dbManager, rawEntries);
+    const explicitProjectsByIdentity = new Map<string, Set<string>>();
+    for (const rawEntry of rawEntries) {
+      const project = failureProject(rawEntry);
+      if (project === null) continue;
+      const projects = explicitProjectsByIdentity.get(failureIdentity(rawEntry)) ?? new Set<string>();
+      projects.add(project);
+      explicitProjectsByIdentity.set(failureIdentity(rawEntry), projects);
     }
-  }
-  writeLegacyFailureScopeAssignments(dbManager, legacyAssignments);
-
-  const entriesByProject = new Map<string | null, string[]>();
-  const inferredIdentities = new Set<string>();
-  for (const rawEntry of rawEntries) {
-    const project = failureProject(rawEntry);
-    const identity = failureIdentity(rawEntry);
-    const inferredProjects = project === null && !inferredIdentities.has(identity)
-      ? legacyAssignments.get(identity) ?? []
-      : [];
-    const projects = project !== null
-      ? [project]
-      : inferredProjects.length > 0
-        ? inferredProjects
-        : [null];
-    if (inferredProjects.length > 0) inferredIdentities.add(identity);
-    for (const entryProject of projects) {
-      const entries = entriesByProject.get(entryProject) ?? [];
-      entries.push(rawEntry);
-      entriesByProject.set(entryProject, entries);
-    }
-  }
-
-  const mirroredProjects = dbManager.getDb().prepare(`
-    SELECT DISTINCT project
-    FROM memories
-    WHERE target = 'failure'
-  `).all() as Array<{ project: string | null }>;
-  const projects = new Set<string | null>([
-    null,
-    ...entriesByProject.keys(),
-    ...mirroredProjects.map(({ project }) => normalizeNullable(project)),
-  ]);
-  const total: MarkdownMemoryReconcileResult = { inserted: 0, existing: 0, removed: 0 };
-
-  for (const project of projects) {
-    const result = reconcileMarkdownMemoryScope(
-      dbManager,
-      entriesByProject.get(project) ?? [],
-      'failure',
-      project,
+    const unscopedIdentities = new Set(
+      rawEntries.filter((rawEntry) => failureProject(rawEntry) === null).map(failureIdentity),
     );
-    total.inserted += result.inserted;
-    total.existing += result.existing;
-    total.removed += result.removed;
-  }
+    for (const [identity, projects] of legacyAssignments) {
+      const retainedProjects = projects.filter(
+        (project) => !explicitProjectsByIdentity.get(identity)?.has(project),
+      );
+      if (!unscopedIdentities.has(identity) || retainedProjects.length === 0) {
+        legacyAssignments.delete(identity);
+      } else {
+        legacyAssignments.set(identity, retainedProjects);
+      }
+    }
+    writeLegacyFailureScopeAssignments(dbManager, legacyAssignments);
 
-  return total;
+    const entriesByProject = new Map<string | null, string[]>();
+    const inferredIdentities = new Set<string>();
+    for (const rawEntry of rawEntries) {
+      const project = failureProject(rawEntry);
+      const identity = failureIdentity(rawEntry);
+      const inferredProjects = project === null && !inferredIdentities.has(identity)
+        ? legacyAssignments.get(identity) ?? []
+        : [];
+      const projects = project !== null
+        ? [project]
+        : inferredProjects.length > 0
+          ? inferredProjects
+          : [null];
+      if (inferredProjects.length > 0) inferredIdentities.add(identity);
+      for (const entryProject of projects) {
+        const entries = entriesByProject.get(entryProject) ?? [];
+        entries.push(rawEntry);
+        entriesByProject.set(entryProject, entries);
+      }
+    }
+
+    const mirroredProjects = db.prepare(`
+      SELECT DISTINCT project
+      FROM memories
+      WHERE target = 'failure'
+    `).all() as Array<{ project: string | null }>;
+    const projects = new Set<string | null>([
+      null,
+      ...entriesByProject.keys(),
+      ...mirroredProjects.map(({ project }) => normalizeNullable(project)),
+    ]);
+    const total: MarkdownMemoryReconcileResult = { inserted: 0, existing: 0, removed: 0 };
+
+    for (const project of projects) {
+      const result = reconcileMarkdownMemoryScope(
+        dbManager,
+        entriesByProject.get(project) ?? [],
+        'failure',
+        project,
+      );
+      total.inserted += result.inserted;
+      total.existing += result.existing;
+      total.removed += result.removed;
+    }
+
+    return total;
+  };
+
+  const transactional = db.transaction?.(reconcile);
+  return transactional ? transactional() : reconcile();
 }
 
 /**

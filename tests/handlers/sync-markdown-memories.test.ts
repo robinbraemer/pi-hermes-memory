@@ -8,12 +8,14 @@ import { DatabaseManager } from '../../src/store/db.js';
 import { registerMemoryTool } from '../../src/tools/memory-tool.js';
 import {
   migrateThenSyncMarkdownMemories,
+  PersistenceReconciliationRetrier,
   registerSyncMarkdownMemoriesCommand,
   syncMarkdownMemoriesToSqlite,
 } from '../../src/handlers/sync-markdown-memories.js';
 import { ENTRY_DELIMITER } from '../../src/constants.js';
 import { addMemory, getMemories, searchMemories } from '../../src/store/sqlite-memory-store.js';
 import { AtomicLockCoordinator } from '../../src/store/atomic-lock-coordinator.js';
+import { markdownLockCoordinatorPath } from '../../src/store/markdown-mutation-lock.js';
 
 describe('memory sqlite sync + markdown backfill', () => {
   let tmpDir: string;
@@ -32,6 +34,56 @@ describe('memory sqlite sync + markdown backfill', () => {
   afterEach(() => {
     dbManager.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('retries failed startup scopes asynchronously before initialization', async () => {
+    const scheduled: Array<() => void> = [];
+    const failures: string[] = [];
+    let attempts = 0;
+    let initialized = false;
+    const retrier = new PersistenceReconciliationRetrier(
+      async () => ({ failedScopes: ++attempts === 1 ? ['global/memory'] : [] }),
+      () => { initialized = true; },
+      (message) => failures.push(message),
+      { setTimeoutFn: (callback) => scheduled.push(callback), retryDelayMs: 1 },
+    );
+
+    await retrier.start();
+
+    assert.equal(initialized, false);
+    assert.equal(attempts, 1);
+    assert.equal(scheduled.length, 1);
+    assert.match(failures[0], /global\/memory/);
+    scheduled.shift()!();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(initialized, true);
+    assert.equal(retrier.isInitialized(), true);
+    assert.equal(attempts, 2);
+  });
+
+  it('bounds failed startup reconciliation retries', async () => {
+    const scheduled: Array<() => void> = [];
+    const failures: string[] = [];
+    let attempts = 0;
+    const retrier = new PersistenceReconciliationRetrier(
+      async () => {
+        attempts++;
+        throw new Error('transient database failure');
+      },
+      () => assert.fail('failed reconciliation must not initialize persistence'),
+      (message) => failures.push(message),
+      { maxAttempts: 3, setTimeoutFn: (callback) => scheduled.push(callback), retryDelayMs: 1 },
+    );
+
+    await retrier.start();
+    while (scheduled.length > 0) {
+      scheduled.shift()!();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+
+    assert.equal(attempts, 3);
+    assert.equal(retrier.isInitialized(), false);
+    assert.match(failures.at(-1) ?? '', /failed after 3 attempts/);
   });
 
   it('memory tool writes are immediately searchable in SQLite', async () => {
@@ -183,6 +235,23 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.strictEqual(results[0].content, 'latest path searchable entry');
   });
 
+  it('reports failed reconciliation scopes separately from safety warnings', async () => {
+    addMemory(dbManager, 'stale global memory');
+    dbManager.getDb().exec(`
+      CREATE TRIGGER fail_global_memory_reconciliation
+      BEFORE DELETE ON memories
+      WHEN OLD.target = 'memory' AND OLD.project IS NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'injected scope failure');
+      END;
+    `);
+
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.deepStrictEqual(counters.failedScopes, ['global/memory']);
+    assert.ok(counters.warnings.some((warning) => warning.includes('injected scope failure')));
+  });
+
   it('prunes Markdown orphans while preserving other targets and projects', async () => {
     fs.writeFileSync(path.join(globalDir, 'MEMORY.md'), 'kept global memory', 'utf-8');
     fs.writeFileSync(path.join(globalDir, 'USER.md'), 'kept global user', 'utf-8');
@@ -253,7 +322,7 @@ describe('memory sqlite sync + markdown backfill', () => {
     addMemory(dbManager, 'stale memory');
 
     const identity = fs.realpathSync(memoryFile);
-    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(identity), '.pi-hermes-locks.sqlite'));
+    const coordinator = new AtomicLockCoordinator(markdownLockCoordinatorPath());
     const lease = coordinator.tryAcquire(`mutation:${identity}`, { staleMs: 300_000 });
     assert.ok(lease);
 

@@ -164,6 +164,39 @@ describe('sqlite-memory-store', () => {
       assert.deepStrictEqual(parsed.assignments.map((entry) => entry.projects), [['project-a']]);
     });
 
+    it('rolls back every failure scope and assignment metadata when a later scope fails', () => {
+      const content = '[correction] use pnpm';
+      const raw = `${content} <!-- created=2026-05-08, last=2026-05-09 -->`;
+      addMemory(dbManager, content, 'failure', 'project-a', 'correction');
+      addMemory(dbManager, content, 'failure', 'project-b', 'correction');
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+      const metadataBefore = dbManager.getDb().prepare(`
+        SELECT value FROM extension_metadata WHERE key = ?
+      `).get('markdown-failure-legacy-scopes-v1') as { value: string };
+      dbManager.getDb().exec(`
+        CREATE TRIGGER fail_project_b_reconciliation
+        BEFORE DELETE ON memories
+        WHEN OLD.target = 'failure' AND OLD.project = 'project-b'
+        BEGIN
+          SELECT RAISE(ABORT, 'injected later-scope failure');
+        END;
+      `);
+
+      assert.throws(
+        () => reconcileMarkdownFailureScopes(dbManager, []),
+        /injected later-scope failure/,
+      );
+
+      assert.deepStrictEqual(
+        getMemories(dbManager, { target: 'failure' }).map((entry) => entry.project).sort(),
+        ['project-a', 'project-b'],
+      );
+      const metadataAfter = dbManager.getDb().prepare(`
+        SELECT value FROM extension_metadata WHERE key = ?
+      `).get('markdown-failure-legacy-scopes-v1') as { value: string };
+      assert.strictEqual(metadataAfter.value, metadataBefore.value);
+    });
+
     it('allows an identical global failure after one-time legacy scope inference', () => {
       const content = '[correction] use pnpm — Project: project-a';
       const raw = `${content} <!-- created=2026-05-08, last=2026-05-09 -->`;

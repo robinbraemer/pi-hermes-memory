@@ -46,7 +46,11 @@ import { registerInterviewCommand } from "./handlers/interview.js";
 import { registerSwitchProjectCommand } from "./handlers/switch-project.js";
 import { registerIndexSessionsCommand } from "./handlers/index-sessions.js";
 import { registerLearnMemoryCommand } from "./handlers/learn-memory.js";
-import { migrateThenSyncMarkdownMemories, registerSyncMarkdownMemoriesCommand } from "./handlers/sync-markdown-memories.js";
+import {
+  migrateThenSyncMarkdownMemories,
+  PersistenceReconciliationRetrier,
+  registerSyncMarkdownMemoriesCommand,
+} from "./handlers/sync-markdown-memories.js";
 import { registerPreviewContextCommand } from "./handlers/preview-context.js";
 import { loadConfig } from "./config.js";
 import { detectProject, detectProjectSkills } from "./project.js";
@@ -99,6 +103,7 @@ export default function (pi: ExtensionAPI) {
 
   const shouldMigrateExtensionRoot = !configuredMemoryDir || pointsToLegacyMemoryDir;
   let persistenceInitialized = false;
+  let extensionRootMigrationPending = shouldMigrateExtensionRoot;
 
   const store = new MemoryStore({ ...config, memoryDir: globalDir });
   const project = detectProject(config.projectsMemoryDir);
@@ -122,6 +127,42 @@ export default function (pi: ExtensionAPI) {
     });
   }
   const sessionsDir = path.join(agentRoot, "sessions");
+  let persistenceContext: {
+    ui?: { notify?: (message: string, level?: string) => void };
+  } | null = null;
+  const notifyPersistence = (message: string, level: 'info' | 'warning' | 'error') => {
+    if (persistenceContext?.ui?.notify) {
+      persistenceContext.ui.notify(message, level);
+    } else if (level === 'warning' || level === 'error') {
+      console.warn(message);
+    } else {
+      console.info(message);
+    }
+  };
+  const scheduleBackfillAfterInitialization = () => {
+    scheduleSessionBackfill(dbManager, sessionsDir, { notify: notifyPersistence });
+  };
+  const persistenceRetrier = new PersistenceReconciliationRetrier(
+    async () => migrateThenSyncMarkdownMemories(
+      dbManager,
+      extensionRootMigrationPending ? legacyGlobalDir : null,
+      globalDir,
+      config.projectsMemoryDir,
+      agentRoot,
+      {
+        onMigrationSucceeded: () => {
+          extensionRootMigrationPending = false;
+          databaseMigrationPending = false;
+          dbManager.setOpenGuard(null);
+        },
+      },
+    ),
+    () => {
+      persistenceInitialized = true;
+      scheduleBackfillAfterInitialization();
+    },
+    (message) => notifyPersistence(message, 'warning'),
+  );
 
   const refreshSkillProjectContext = (cwd?: string) => {
     const resource = resolveProjectSkillDiscovery(skillStore, config.projectsMemoryDir, cwd);
@@ -145,26 +186,8 @@ export default function (pi: ExtensionAPI) {
 
   // ── 1. Load memory from disk on session start ──
   pi.on("session_start", async (_event, ctx) => {
-    if (!persistenceInitialized) {
-      try {
-        await migrateThenSyncMarkdownMemories(
-          dbManager,
-          shouldMigrateExtensionRoot ? legacyGlobalDir : null,
-          globalDir,
-          config.projectsMemoryDir,
-          agentRoot,
-          {
-            onMigrationSucceeded: () => {
-              databaseMigrationPending = false;
-              dbManager.setOpenGuard(null);
-            },
-          },
-        );
-        persistenceInitialized = true;
-      } catch {
-        // Best-effort only: migration or SQLite backfill must not block startup.
-      }
-    }
+    persistenceContext = ctx as typeof persistenceContext;
+    if (!persistenceInitialized) await persistenceRetrier.start();
 
     refreshSkillProjectContext(ctx.cwd);
     await skillStore.migrateLegacySkills();
@@ -172,18 +195,7 @@ export default function (pi: ExtensionAPI) {
     await store.loadFromDisk();
     if (projectStore) await projectStore.loadFromDisk();
 
-    if (persistenceInitialized) scheduleSessionBackfill(dbManager, sessionsDir, {
-      notify: (message, level) => {
-        const ui = (ctx as { ui?: { notify?: (message: string, level?: string) => void } }).ui;
-        if (ui?.notify) {
-          ui.notify(message, level);
-        } else if (level === "error" || level === "warning") {
-          console.warn(message);
-        } else {
-          console.info(message);
-        }
-      },
-    });
+    if (persistenceInitialized) scheduleBackfillAfterInitialization();
   });
 
   registerProjectSkillDiscoveryHandler(pi, skillStore, config.projectsMemoryDir);

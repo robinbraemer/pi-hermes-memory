@@ -27,6 +27,86 @@ export interface BackfillCounters {
   skipped: number;
   removed: number;
   warnings: string[];
+  failedScopes: string[];
+}
+
+interface PersistenceReconciliationRetrierOptions {
+  maxAttempts?: number;
+  retryDelayMs?: number;
+  setTimeoutFn?: (callback: () => void, delayMs: number) => unknown;
+}
+
+export class PersistenceReconciliationRetrier {
+  private state: 'idle' | 'running' | 'waiting' | 'succeeded' | 'exhausted' = 'idle';
+  private attempts = 0;
+  private readonly maxAttempts: number;
+  private readonly retryDelayMs: number;
+  private readonly setTimeoutFn: (callback: () => void, delayMs: number) => unknown;
+
+  constructor(
+    private readonly operation: () => Promise<
+      Pick<BackfillCounters, 'failedScopes'> & Partial<Pick<BackfillCounters, 'warnings'>>
+    >,
+    private readonly onSucceeded: () => void,
+    private readonly onFailed: (message: string) => void,
+    options: PersistenceReconciliationRetrierOptions = {},
+  ) {
+    this.maxAttempts = Math.max(1, options.maxAttempts ?? 3);
+    this.retryDelayMs = Math.max(0, options.retryDelayMs ?? 1_000);
+    this.setTimeoutFn = options.setTimeoutFn ?? setTimeout;
+  }
+
+  isInitialized(): boolean {
+    return this.state === 'succeeded';
+  }
+
+  async start(): Promise<void> {
+    if (this.state !== 'idle') return;
+    await this.attempt();
+  }
+
+  private async attempt(): Promise<void> {
+    this.state = 'running';
+    this.attempts++;
+    let failure: string | null = null;
+    try {
+      const result = await this.operation();
+      if (result.failedScopes.length > 0) {
+        const details = result.warnings?.filter((warning) =>
+          result.failedScopes.some((scope) => warning.startsWith(`${scope}:`))
+        );
+        failure = details?.length
+          ? `Markdown reconciliation failed: ${details.join('; ')}`
+          : `Markdown reconciliation failed for: ${result.failedScopes.join(', ')}`;
+      }
+    } catch (error) {
+      failure = error instanceof Error ? error.message : String(error);
+    }
+
+    if (!failure) {
+      this.state = 'succeeded';
+      try { this.onSucceeded(); } catch {}
+      return;
+    }
+
+    const exhausted = this.attempts >= this.maxAttempts;
+    this.state = exhausted ? 'exhausted' : 'waiting';
+    try {
+      this.onFailed(
+        exhausted
+          ? `Persistence initialization failed after ${this.attempts} attempts: ${failure}`
+          : `Persistence initialization attempt ${this.attempts} failed; retrying: ${failure}`,
+      );
+    } catch {
+    }
+    if (exhausted) return;
+
+    const timer = this.setTimeoutFn(() => {
+      if (this.state !== 'waiting') return;
+      void this.attempt();
+    }, this.retryDelayMs);
+    (timer as { unref?: () => void } | null)?.unref?.();
+  }
 }
 
 export interface MigrationSyncOptions extends ExtensionRootMigrationOptions {
@@ -168,6 +248,7 @@ export async function syncMarkdownMemoriesToSqlite(
     skipped: 0,
     removed: 0,
     warnings: [],
+    failedScopes: [],
   };
 
   const globalMemoryFile = path.join(globalDir, MEMORY_FILE);
@@ -192,8 +273,10 @@ export async function syncMarkdownMemoriesToSqlite(
         counters.skipped += result.existing;
         counters.removed += result.removed;
       } catch (err) {
+        const scope = `${path.basename(project ?? 'global')}/${target}`;
+        counters.failedScopes.push(scope);
         counters.warnings.push(
-          `${path.basename(project ?? 'global')}/${target}: ${err instanceof Error ? err.message : String(err)}`,
+          `${scope}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     };

@@ -31,6 +31,8 @@ import { canonicalMarkdownIdentity, withMarkdownMutationLock } from "./markdown-
 
 const MAX_EXTERNAL_WRITE_RETRIES = 2;
 const RECOVERY_ACTIVE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+const RECOVERY_ACTIVE_MAX_COUNT = 32;
+const RECOVERY_ACTIVE_MAX_BYTES = 64 * 1024 * 1024;
 const RETIRED_RECOVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const RETIRED_RECOVERY_MAX_COUNT = 32;
 const RETIRED_RECOVERY_MAX_BYTES = 64 * 1024 * 1024;
@@ -208,6 +210,7 @@ export class MemoryStore {
       const filePath = await this.refreshStoragePath(target);
       await withMarkdownMutationLock(filePath, async () => {
         await recoverInterruptedMarkdownPublication(filePath);
+        await this.pruneRecoveryFiles(filePath);
         const state = await this.readFileState(filePath);
         this.setEntries(target, [...new Set(state.entries)]);
         this.fileFingerprints[filePath] = state.fingerprint;
@@ -932,16 +935,41 @@ export class MemoryStore {
     const activeCutoff = Date.now() - RECOVERY_ACTIVE_GRACE_MS;
     try {
       const names = await fs.readdir(directory);
-      await Promise.all(names.filter((name) => recoveryPattern.test(name)).map(async (name) => {
+      let referencedRecoveryName: string | null = null;
+      try {
+        const candidate = (await fs.readFile(publicationPendingPath(filePath), "utf-8")).trim();
+        if (path.basename(candidate) === candidate && recoveryPattern.test(candidate)) {
+          referencedRecoveryName = candidate;
+        }
+      } catch {
+      }
+      const active = await Promise.all(names.filter((name) => recoveryPattern.test(name)).map(async (name) => {
         const recoveryPath = path.join(directory, name);
         try {
           const state = await fs.lstat(recoveryPath);
-          if (!state.isFile()) return;
-          if (state.mtimeMs >= activeCutoff) return;
-          await this.retireRecoveryFile(recoveryPath, filePath);
+          return state.isFile() ? { name, path: recoveryPath, state } : null;
         } catch {
+          return null;
         }
       }));
+      const activeCandidates = active
+        .filter((item): item is NonNullable<typeof item> => item !== null)
+        .sort((left, right) => right.state.mtimeMs - left.state.mtimeMs);
+      let activeCount = 0;
+      let activeBytes = 0;
+      for (const item of activeCandidates) {
+        const referenced = item.name === referencedRecoveryName;
+        const withinGrace = item.state.mtimeMs >= activeCutoff;
+        const withinCount = activeCount < RECOVERY_ACTIVE_MAX_COUNT;
+        const withinBytes = activeBytes + item.state.size <= RECOVERY_ACTIVE_MAX_BYTES;
+        const requiredGraceGeneration = withinGrace && activeCount === 0;
+        if (referenced || requiredGraceGeneration || (withinGrace && withinCount && withinBytes)) {
+          activeCount++;
+          activeBytes += item.state.size;
+          continue;
+        }
+        try { await this.retireRecoveryFile(item.path, filePath); } catch {}
+      }
 
       const retiredNames = (await fs.readdir(directory)).filter((name) => retiredPattern.test(name));
       const retired = await Promise.all(retiredNames.map(async (name) => {

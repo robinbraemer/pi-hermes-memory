@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { AtomicLockCoordinator, type AtomicLockLease } from "./atomic-lock-coordinator.js";
 import { canonicalStoragePath } from "./canonical-storage-path.js";
@@ -10,20 +11,24 @@ export async function canonicalMarkdownIdentity(filePath: string): Promise<strin
   return canonicalStoragePath(filePath);
 }
 
-function nearestExistingDirectory(filePath: string): string {
-  let directory = path.dirname(filePath);
-  while (!fs.existsSync(directory)) {
-    const parent = path.dirname(directory);
-    if (parent === directory) return directory;
-    directory = parent;
+export function markdownLockCoordinatorPath(): string {
+  const uid = typeof process.getuid === "function" ? `-${process.getuid()}` : "";
+  const coordinatorDir = path.join(os.tmpdir(), `pi-hermes-memory-locks${uid}`);
+  fs.mkdirSync(coordinatorDir, { recursive: true, mode: 0o700 });
+  const state = fs.lstatSync(coordinatorDir);
+  if (!state.isDirectory() || state.isSymbolicLink()) {
+    throw new Error(`Invalid Markdown lock coordinator directory at ${coordinatorDir}`);
   }
-  return directory;
+  if (typeof process.getuid === "function" && state.uid !== process.getuid()) {
+    throw new Error(`Markdown lock coordinator directory is owned by another user at ${coordinatorDir}`);
+  }
+  if (process.platform !== "win32") fs.chmodSync(coordinatorDir, 0o700);
+  return path.join(coordinatorDir, "coordinator.sqlite");
 }
 
 export async function acquireMarkdownMutationLock(filePath: string): Promise<AtomicLockLease> {
   const identity = await canonicalMarkdownIdentity(filePath);
-  const coordinatorDir = nearestExistingDirectory(identity);
-  const coordinator = new AtomicLockCoordinator(path.join(coordinatorDir, ".pi-hermes-locks.sqlite"));
+  const coordinator = new AtomicLockCoordinator(markdownLockCoordinatorPath());
   const lockKey = `mutation:${identity}`;
   const deadline = Date.now() + MUTATION_WAIT_MS;
   let lease = coordinator.tryAcquire(lockKey, { staleMs: MUTATION_STALE_MS });

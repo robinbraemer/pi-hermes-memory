@@ -1499,9 +1499,9 @@ describe("MemoryStore", { concurrency: 1 }, () => {
 
       const store = new MemoryStore(makeConfig());
       await store.loadFromDisk();
+      await assert.rejects(fs.stat(expiredPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
       await store.add("memory", `${TEST_MARKER} triggers recovery pruning`);
 
-      await assert.rejects(fs.stat(expiredPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
       assert.equal(await fs.readFile(activePath, "utf-8"), `${TEST_MARKER} active recovery`);
       const retiredFiles = (await fs.readdir(MEMORY_DIR))
         .filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
@@ -1555,6 +1555,50 @@ describe("MemoryStore", { concurrency: 1 }, () => {
         retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
       );
       assert.equal(retiredContents.some((content) => content.includes("outside sensitive content")), false);
+    });
+
+    it("bounds recent active recovery files during startup load", async () => {
+      const pathStore = new MemoryStore(makeConfig());
+      for (let index = 0; index < 40; index++) {
+        const recoveryPath = (pathStore as any).recoveryPathFor(memoryPath) as string;
+        await writeRaw(recoveryPath, `${TEST_MARKER} active recovery ${index}`);
+        await fs.truncate(recoveryPath, 2 * 1024 * 1024);
+      }
+
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+
+      const names = await fs.readdir(MEMORY_DIR);
+      const activeCandidates = names.filter((name) => name.startsWith(`.${MEMORY_FILE}.recovery-`));
+      const activeFiles: string[] = [];
+      for (const name of activeCandidates) {
+        if ((await fs.lstat(path.join(MEMORY_DIR, name))).isFile()) activeFiles.push(name);
+      }
+      const activeStats = await Promise.all(
+        activeFiles.map((name) => fs.stat(path.join(MEMORY_DIR, name))),
+      );
+      assert.ok(activeFiles.length <= 32);
+      assert.ok(activeStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
+    });
+
+    it("preserves the recovery generation referenced by an active publication marker", async () => {
+      const pathStore = new MemoryStore(makeConfig());
+      const referencedPath = (pathStore as any).recoveryPathFor(memoryPath) as string;
+      await writeRaw(referencedPath, `${TEST_MARKER} referenced recovery`);
+      await fs.writeFile(
+        path.join(MEMORY_DIR, `.${MEMORY_FILE}.publication-pending`),
+        path.basename(referencedPath),
+        "utf-8",
+      );
+      for (let index = 0; index < 40; index++) {
+        const recoveryPath = (pathStore as any).recoveryPathFor(memoryPath) as string;
+        await writeRaw(recoveryPath, `${TEST_MARKER} active recovery ${index}`);
+        await fs.truncate(recoveryPath, 2 * 1024 * 1024);
+      }
+
+      await (pathStore as any).pruneRecoveryFiles(memoryPath);
+
+      assert.equal(await fs.readFile(referencedPath, "utf-8"), `${TEST_MARKER} referenced recovery`);
     });
 
     it("bounds retired recovery snapshots by age, count, and bytes", async () => {

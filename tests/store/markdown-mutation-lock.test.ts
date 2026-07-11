@@ -4,24 +4,49 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { AtomicLockCoordinator } from "../../src/store/atomic-lock-coordinator.js";
-import { withMarkdownMutationLock } from "../../src/store/markdown-mutation-lock.js";
+import {
+  canonicalMarkdownIdentity,
+  markdownLockCoordinatorPath,
+  withMarkdownMutationLock,
+} from "../../src/store/markdown-mutation-lock.js";
 
 describe("markdown mutation lock", () => {
-  it("stores lock coordination beside a writable canonical target", { skip: process.platform === "win32" }, async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "markdown-lock-permissions-test-"));
-    const memoryDir = path.join(tmpDir, "memory");
+  it("uses one stable coordinator before and after target-directory creation", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "markdown-lock-location-test-"));
+    const memoryDir = path.join(tmpDir, "deleted-project", "memory");
     const filePath = path.join(memoryDir, "MEMORY.md");
-    fs.mkdirSync(memoryDir);
-    fs.writeFileSync(filePath, "memory", "utf-8");
-    fs.chmodSync(tmpDir, 0o500);
+    const coordinatorPath = markdownLockCoordinatorPath();
+    const identityBefore = await canonicalMarkdownIdentity(filePath);
+    const coordinator = new AtomicLockCoordinator(coordinatorPath);
+    const lease = coordinator.tryAcquire(`mutation:${identityBefore}`, { staleMs: 300_000 });
+    assert.ok(lease);
+
+    try {
+      fs.mkdirSync(memoryDir, { recursive: true });
+      const identityAfter = await canonicalMarkdownIdentity(filePath);
+      assert.equal(identityAfter, identityBefore);
+      assert.equal(markdownLockCoordinatorPath(), coordinatorPath);
+      assert.equal(
+        new AtomicLockCoordinator(coordinatorPath).tryAcquire(`mutation:${identityAfter}`, { staleMs: 300_000 }),
+        null,
+      );
+      assert.equal(fs.existsSync(path.join(memoryDir, ".pi-hermes-locks.sqlite")), false);
+    } finally {
+      lease.release();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not recreate a deleted target scope to coordinate mutations", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "markdown-lock-deleted-scope-test-"));
+    const memoryDir = path.join(tmpDir, "deleted-project");
+    const filePath = path.join(memoryDir, "MEMORY.md");
 
     try {
       const result = await withMarkdownMutationLock(filePath, async () => "mutated");
       assert.equal(result, "mutated");
-      assert.equal(fs.existsSync(path.join(memoryDir, ".pi-hermes-locks.sqlite")), true);
-      assert.equal(fs.existsSync(path.join(tmpDir, ".pi-hermes-locks.sqlite")), false);
+      assert.equal(fs.existsSync(memoryDir), false);
     } finally {
-      fs.chmodSync(tmpDir, 0o700);
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
