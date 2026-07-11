@@ -2,6 +2,12 @@ import { DatabaseManager } from './db.js';
 import { buildFallbackFts5Query, isFts5QueryError, normalizeFts5Query } from './fts-query.js';
 import { normalizeMemoryLookupText } from './memory-lookup.js';
 import type { MemoryCategory } from '../types.js';
+import {
+  buildRelevanceKey,
+  compareRelevance,
+  type RelevanceKey,
+  type SearchMatchMode,
+} from './search-relevance.js';
 
 const MEMORY_SELECT_COLUMNS = `
   id,
@@ -39,6 +45,22 @@ export interface SqliteMemoryEntry {
   correctedTo: string | null;
   created: string;
   lastReferenced: string;
+}
+
+export interface MemorySearchResult extends SqliteMemoryEntry {
+  matchMode: SearchMatchMode;
+  matchedTerms: number;
+  totalTerms: number;
+  sourceKey: string;
+}
+
+export interface MemorySearchOptions {
+  project?: string | null;
+  target?: string;
+  category?: MemoryCategory;
+  memoryId?: number;
+  limit?: number;
+  candidateLimit?: number;
 }
 
 export interface SqliteMemorySyncInput {
@@ -679,17 +701,21 @@ export function removeExactSyncedMemories(
 export function searchMemories(
   dbManager: DatabaseManager,
   query: string,
-  options: { project?: string; target?: string; category?: MemoryCategory; limit?: number } = {}
-): SqliteMemoryEntry[] {
+  options: MemorySearchOptions = {},
+): MemorySearchResult[] {
   if (query.trim().length === 0) {
     return [];
   }
 
   const db = dbManager.getDb();
-  const { project, target, category, limit = 10 } = options;
-
-  const conditions: string[] = [];
-  const params: unknown[] = [];
+  const { project, target, category, memoryId } = options;
+  const limit = Number.isFinite(options.limit)
+    ? Math.min(20, Math.max(1, Math.floor(options.limit!)))
+    : 10;
+  const defaultCandidateLimit = Math.min(300, Math.max(60, limit * 12));
+  const candidateLimit = Number.isFinite(options.candidateLimit)
+    ? Math.min(300, Math.max(1, Math.floor(options.candidateLimit!)))
+    : defaultCandidateLimit;
 
   // FTS5 match via subquery with escaped query
   const normalizedQuery = normalizeFts5Query(query);
@@ -723,18 +749,23 @@ export function searchMemories(
       params.push(category);
     }
 
+    if (memoryId !== undefined) {
+      conditions.push('m.id = ?');
+      params.push(memoryId);
+    }
+
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const sql = `
       SELECT ${MEMORY_SELECT_COLUMNS}
       FROM memories m
       ${whereClause}
-      ORDER BY m.last_referenced DESC
+      ORDER BY m.last_referenced DESC, m.id ASC
       LIMIT ?
     `;
 
     try {
-      const rows = db.prepare(sql).all(...params, limit) as Array<{
+      const rows = db.prepare(sql).all(...params, candidateLimit) as Array<{
         id: number;
         project: string | null;
         target: string;
@@ -756,17 +787,63 @@ export function searchMemories(
     }
   };
 
-  const exactResults = runSearch(normalizedQuery);
-  if (exactResults.length > 0) {
-    return exactResults;
-  }
+  type RankedMemory = MemorySearchResult & { key: RelevanceKey; diversityKey: string };
+  const candidates = new Map<number, RankedMemory>();
+  const addAttempt = (matchQuery: string, matchMode: SearchMatchMode): void => {
+    for (const entry of runSearch(matchQuery)) {
+      if (candidates.has(entry.id)) continue;
+      const sourceKey = `project:${entry.project ?? 'global'}|target:${entry.target}|category:${entry.category ?? 'none'}`;
+      const diversityParts: string[] = [];
+      if (project === undefined) diversityParts.push(`project:${entry.project ?? 'global'}`);
+      if (target === undefined) diversityParts.push(`target:${entry.target}`);
+      if (category === undefined) diversityParts.push(`category:${entry.category ?? 'none'}`);
+      const key = buildRelevanceKey(
+        entry.content,
+        query,
+        matchMode,
+        entry.lastReferenced,
+        sourceKey,
+        String(entry.id).padStart(20, '0'),
+      );
+      candidates.set(entry.id, {
+        ...entry,
+        matchMode,
+        matchedTerms: key.matchedTerms,
+        totalTerms: key.totalTerms,
+        sourceKey,
+        key,
+        diversityKey: diversityParts.join('|'),
+      });
+    }
+  };
 
+  addAttempt(normalizedQuery, 'exact');
   const fallbackQuery = buildFallbackFts5Query(query);
-  if (!fallbackQuery || fallbackQuery === normalizedQuery) {
-    return exactResults;
+  if (fallbackQuery && fallbackQuery !== normalizedQuery) {
+    addAttempt(fallbackQuery, 'fallback');
   }
 
-  return runSearch(fallbackQuery);
+  const ranked = [...candidates.values()].sort((a, b) => compareRelevance(a.key, b.key));
+  let selected: RankedMemory[];
+  if (memoryId !== undefined) {
+    selected = ranked.slice(0, limit);
+  } else {
+    selected = [];
+    const remainder: RankedMemory[] = [];
+    const sourceCounts = new Map<string, number>();
+    for (const candidate of ranked) {
+      const count = sourceCounts.get(candidate.diversityKey) ?? 0;
+      if (count < 2 && selected.length < limit) {
+        selected.push(candidate);
+        sourceCounts.set(candidate.diversityKey, count + 1);
+      } else {
+        remainder.push(candidate);
+      }
+    }
+    if (selected.length < limit) selected.push(...remainder.slice(0, limit - selected.length));
+  }
+
+  return selected.map(({ key: _key, diversityKey: _diversityKey, ...entry }) => entry);
 }
 
 /**

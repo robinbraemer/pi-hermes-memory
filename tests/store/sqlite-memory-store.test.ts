@@ -333,6 +333,97 @@ describe('sqlite-memory-store', () => {
       addMemory(dbManager, 'timezone: AEST', 'user');
     });
 
+    it('ranks exact coverage before newer fallback memory candidates', () => {
+      const exact = addMemory(dbManager, 'synthetic-memory-alpha beta');
+      const fallback = addMemory(dbManager, 'synthetic-memory-alpha');
+      const db = dbManager.getDb();
+      db.prepare('UPDATE memories SET last_referenced = ? WHERE id = ?').run('2026-01-01', exact.id);
+      db.prepare('UPDATE memories SET last_referenced = ? WHERE id = ?').run('2026-03-01', fallback.id);
+
+      const results = searchMemories(dbManager, 'synthetic-memory-alpha beta');
+
+      assert.deepStrictEqual(results.slice(0, 2).map((entry) => entry.id), [exact.id, fallback.id]);
+      assert.deepStrictEqual(results.slice(0, 2).map((entry) => entry.matchMode), ['exact', 'fallback']);
+      assert.ok(results.slice(0, 2).every((entry) => entry.matchedTerms > 0 && entry.totalTerms > 0));
+    });
+
+    it('uses last-referenced recency then stable numeric id for exact ties', () => {
+      const older = addMemory(dbManager, 'synthetic-memory-tie needle');
+      const first = addMemory(dbManager, 'synthetic-memory-tie needle first');
+      const second = addMemory(dbManager, 'synthetic-memory-tie needle second');
+      const db = dbManager.getDb();
+      db.prepare('UPDATE memories SET last_referenced = ? WHERE id = ?').run('2026-01-01', older.id);
+      db.prepare('UPDATE memories SET last_referenced = ? WHERE id IN (?, ?)').run('2026-02-01', first.id, second.id);
+
+      const results = searchMemories(dbManager, 'synthetic-memory-tie needle');
+
+      assert.deepStrictEqual(results.slice(0, 3).map((entry) => entry.id), [first.id, second.id, older.id]);
+    });
+
+    it('diversifies memory sources in the first pass and fills unused capacity', () => {
+      const sourceA = Array.from({ length: 3 }, (_, index) => syncMemoryEntry(dbManager, {
+        content: `synthetic-memory-diversity needle a-${index}`,
+        target: 'memory',
+        project: 'synthetic-project-a',
+        category: 'convention',
+        lastReferenced: `2026-03-0${index + 1}`,
+      }).entry);
+      const sourceB = syncMemoryEntry(dbManager, {
+        content: 'synthetic-memory-diversity needle b',
+        target: 'user',
+        project: 'synthetic-project-b',
+        category: 'preference',
+        lastReferenced: '2026-01-01',
+      }).entry;
+
+      const results = searchMemories(dbManager, 'synthetic-memory-diversity needle', { limit: 3 });
+
+      assert.strictEqual(results.length, 3);
+      assert.ok(results.some((entry) => entry.id === sourceB.id));
+      assert.strictEqual(results.filter((entry) => sourceA.some((candidate) => candidate.id === entry.id)).length, 2);
+      assert.ok(results.every((entry) => entry.sourceKey.startsWith('project:')));
+    });
+
+    it('preserves explicit filters while filling from the requested source', () => {
+      for (let index = 0; index < 3; index++) {
+        syncMemoryEntry(dbManager, {
+          content: `synthetic-memory-filter needle ${index}`,
+          target: 'failure',
+          project: 'synthetic-filter-project',
+          category: 'tool-quirk',
+        });
+      }
+      syncMemoryEntry(dbManager, {
+        content: 'synthetic-memory-filter needle outside',
+        target: 'memory',
+        project: 'synthetic-other-project',
+        category: 'convention',
+      });
+
+      const results = searchMemories(dbManager, 'synthetic-memory-filter needle', {
+        project: 'synthetic-filter-project',
+        target: 'failure',
+        category: 'tool-quirk',
+        limit: 3,
+      });
+
+      assert.strictEqual(results.length, 3);
+      assert.ok(results.every((entry) => entry.project === 'synthetic-filter-project'));
+      assert.ok(results.every((entry) => entry.target === 'failure'));
+      assert.ok(results.every((entry) => entry.category === 'tool-quirk'));
+    });
+
+    it('isolates an exact memory id and remains deterministic', () => {
+      addMemory(dbManager, 'synthetic-memory-id needle other');
+      const selected = addMemory(dbManager, 'synthetic-memory-id needle selected');
+
+      const first = searchMemories(dbManager, 'synthetic-memory-id needle', { memoryId: selected.id, limit: 1 });
+      const second = searchMemories(dbManager, 'synthetic-memory-id needle', { memoryId: selected.id, limit: 1 });
+
+      assert.deepStrictEqual(first, second);
+      assert.deepStrictEqual(first.map((entry) => entry.id), [selected.id]);
+    });
+
     it('should find memories by keyword', () => {
       const results = searchMemories(dbManager, 'pnpm');
       assert.ok(results.length > 0);
