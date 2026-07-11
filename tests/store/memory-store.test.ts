@@ -1156,6 +1156,57 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.equal(await fs.readFile(activePath, "utf-8"), `${TEST_MARKER} active recovery`);
     });
 
+    it("keeps a pathname for late writes after expired recovery retirement", async () => {
+      const expiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-late-writer`);
+      await writeRaw(expiredPath, `${TEST_MARKER} displaced original`);
+      const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+      await fs.utimes(expiredPath, expired, expired);
+      const handle = await fs.open(expiredPath, "r+");
+
+      try {
+        const store = new MemoryStore(makeConfig());
+        await store.loadFromDisk();
+        await store.add("memory", `${TEST_MARKER} triggers recovery retirement`);
+        await handle.truncate(0);
+        await handle.writeFile(`${TEST_MARKER} late retired descriptor write`, "utf-8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+
+      const siblings = await fs.readdir(MEMORY_DIR);
+      const retiredFiles = siblings.filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
+      assert.ok(retiredFiles.length > 0);
+      const retiredContents = await Promise.all(
+        retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+      );
+      assert.ok(retiredContents.some((content) => content.includes("late retired descriptor write")));
+    });
+
+    it("commits and observes a mutation when published-link cleanup fails", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing before cleanup failure`);
+
+      let cleanupAttempted = false;
+      let observed = false;
+      (store as any).unlinkPublishedTempLink = async () => {
+        cleanupAttempted = true;
+        throw new Error("injected published-link cleanup failure");
+      };
+      store.setMutationObserver(async () => {
+        observed = true;
+        return null;
+      });
+
+      const result = await store.add("memory", `${TEST_MARKER} committed despite cleanup failure`);
+
+      assert.equal(result.success, true);
+      assert.equal(cleanupAttempted, true);
+      assert.equal(observed, true);
+      assert.match(await readRaw(memoryPath), /committed despite cleanup failure/);
+    });
+
     it("replays when an editor recreates the path after displacement", async () => {
       const store = new MemoryStore(makeConfig());
       await store.loadFromDisk();

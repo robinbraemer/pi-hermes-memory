@@ -684,7 +684,7 @@ export class MemoryStore {
         }
       }
 
-      await fs.unlink(tmpPath);
+      try { await this.unlinkPublishedTempLink(tmpPath); } catch { /* ignore */ }
       this.fileFingerprints[filePath] = this.fingerprint(content);
     } catch (err) {
       try { await fs.unlink(tmpPath); } catch { /* ignore */ }
@@ -709,6 +709,17 @@ export class MemoryStore {
     );
   }
 
+  private retiredRecoveryPathFor(filePath: string): string {
+    return path.join(
+      path.dirname(filePath),
+      `.${path.basename(filePath)}.retired-${Date.now()}-${randomUUID()}`,
+    );
+  }
+
+  private async unlinkPublishedTempLink(tmpPath: string): Promise<void> {
+    await fs.unlink(tmpPath);
+  }
+
   private async pruneRecoveryFiles(filePath: string): Promise<void> {
     const directory = path.dirname(filePath);
     const prefix = `.${path.basename(filePath)}.recovery-`;
@@ -718,11 +729,9 @@ export class MemoryStore {
       await Promise.all(names.filter((name) => name.startsWith(prefix)).map(async (name) => {
         const recoveryPath = path.join(directory, name);
         try {
-          const before = await fs.stat(recoveryPath);
-          if (before.mtimeMs >= cutoff) return;
-          const after = await fs.stat(recoveryPath);
-          if (after.mtimeMs !== before.mtimeMs || after.size !== before.size || after.mtimeMs >= cutoff) return;
-          await fs.unlink(recoveryPath);
+          const state = await fs.stat(recoveryPath);
+          if (state.mtimeMs >= cutoff) return;
+          await fs.rename(recoveryPath, this.retiredRecoveryPathFor(filePath));
         } catch {
         }
       }));

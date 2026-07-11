@@ -4,6 +4,25 @@ import { AtomicLockCoordinator, type AtomicLockLease } from "./atomic-lock-coord
 
 const MUTATION_WAIT_MS = 5_000;
 const MUTATION_STALE_MS = 300_000;
+const RELEASE_ATTEMPTS = 3;
+const pendingReleases = new Map<string, () => void>();
+
+function releaseBestEffort(identity: string, release: () => void): void {
+  for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt++) {
+    try {
+      release();
+      if (pendingReleases.get(identity) === release) pendingReleases.delete(identity);
+      return;
+    } catch {
+    }
+  }
+  pendingReleases.set(identity, release);
+}
+
+function retryPendingRelease(identity: string): void {
+  const pending = pendingReleases.get(identity);
+  if (pending) releaseBestEffort(identity, pending);
+}
 
 export async function canonicalMarkdownIdentity(filePath: string): Promise<string> {
   const resolvedPath = path.resolve(filePath);
@@ -24,6 +43,7 @@ export async function canonicalMarkdownIdentity(filePath: string): Promise<strin
 
 export async function acquireMarkdownMutationLock(filePath: string): Promise<AtomicLockLease> {
   const identity = await canonicalMarkdownIdentity(filePath);
+  retryPendingRelease(identity);
   const coordinatorDir = path.dirname(path.dirname(identity));
   const coordinator = new AtomicLockCoordinator(path.join(coordinatorDir, ".pi-hermes-locks.sqlite"));
   const lockKey = `mutation:${identity}`;
@@ -35,10 +55,15 @@ export async function acquireMarkdownMutationLock(filePath: string): Promise<Ato
       throw new Error(`Memory mutation already in progress for ${identity}`);
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
+    retryPendingRelease(identity);
     lease = coordinator.tryAcquire(lockKey, { staleMs: MUTATION_STALE_MS });
   }
 
-  return lease;
+  const release = lease.release;
+  return {
+    token: lease.token,
+    release: () => releaseBestEffort(identity, release),
+  };
 }
 
 export async function withMarkdownMutationLock<T>(filePath: string, operation: () => Promise<T> | T): Promise<T> {
