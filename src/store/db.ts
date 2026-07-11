@@ -30,9 +30,15 @@ type BunDatabaseInstance = {
 
 type DatabaseFileSuffix = '' | '-wal' | '-shm';
 
+type DatabaseFileIdentity = {
+  dev: bigint;
+  ino: bigint;
+};
+
 type MovedDatabaseFile = {
   original: string;
   backup: string;
+  identity: DatabaseFileIdentity;
 };
 
 export interface DatabaseRecoveryResult {
@@ -577,11 +583,12 @@ export class DatabaseManager {
   }
 
   private copyRecoverableRows(source: DatabaseLike, target: DatabaseLike): Record<string, number> {
+    const sessions = this.copySessions(source, target);
     return {
       extension_metadata: this.copyExtensionMetadata(source, target),
-      sessions: this.copySessions(source, target),
-      messages: this.copyMessages(source, target),
-      session_files: this.copySessionFiles(source, target),
+      sessions: sessions.count,
+      messages: this.copyMessages(source, target, sessions.ids),
+      session_files: this.copySessionFiles(source, target, sessions.ids),
       memories: this.copyMemories(source, target),
     };
   }
@@ -599,12 +606,13 @@ export class DatabaseManager {
     return copied;
   }
 
-  private copySessions(source: DatabaseLike, target: DatabaseLike): number {
+  private copySessions(source: DatabaseLike, target: DatabaseLike): { count: number; ids: Set<string> } {
     const insert = target.prepare(`
       INSERT OR IGNORE INTO sessions (id, project, cwd, started_at, ended_at, message_count)
       VALUES (?, ?, ?, ?, ?, ?)
     `);
     let copied = 0;
+    const ids = new Set<string>();
 
     for (const row of this.readTableRows(source, 'sessions', ['id', 'project', 'cwd', 'started_at', 'ended_at', 'message_count'])) {
       if (typeof row.id !== 'string' || typeof row.cwd !== 'string' || typeof row.started_at !== 'string') continue;
@@ -618,12 +626,13 @@ export class DatabaseManager {
         this.integerOr(row.message_count, 0),
       );
       copied++;
+      ids.add(row.id);
     }
 
-    return copied;
+    return { count: copied, ids };
   }
 
-  private copyMessages(source: DatabaseLike, target: DatabaseLike): number {
+  private copyMessages(source: DatabaseLike, target: DatabaseLike, sessionIds: ReadonlySet<string>): number {
     const insert = target.prepare(`
       INSERT OR IGNORE INTO messages (id, session_id, role, content, timestamp, tool_calls)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -640,6 +649,7 @@ export class DatabaseManager {
       ) {
         continue;
       }
+      if (!sessionIds.has(row.session_id)) continue;
 
       insert.run(row.id, row.session_id, row.role, row.content, row.timestamp, this.nullableString(row.tool_calls));
       copied++;
@@ -648,7 +658,7 @@ export class DatabaseManager {
     return copied;
   }
 
-  private copySessionFiles(source: DatabaseLike, target: DatabaseLike): number {
+  private copySessionFiles(source: DatabaseLike, target: DatabaseLike, sessionIds: ReadonlySet<string>): number {
     const insert = target.prepare(`
       INSERT OR IGNORE INTO session_files (path, session_id, size, mtime_ms, indexed_at)
       VALUES (?, ?, ?, ?, ?)
@@ -657,6 +667,7 @@ export class DatabaseManager {
 
     for (const row of this.readTableRows(source, 'session_files', ['path', 'session_id', 'size', 'mtime_ms', 'indexed_at'])) {
       if (typeof row.path !== 'string' || typeof row.session_id !== 'string') continue;
+      if (!sessionIds.has(row.session_id)) continue;
       insert.run(
         row.path,
         row.session_id,
@@ -767,13 +778,14 @@ export class DatabaseManager {
   private swapRebuiltDatabase(tempPath: string, backupBase: string): MovedDatabaseFile[] {
     const moved = this.moveDatabaseFilesToBackup(backupBase);
     try {
-      fs.renameSync(tempPath, this.dbPath);
-      return moved;
+      fs.linkSync(tempPath, this.dbPath);
     } catch (err) {
       this.restoreMovedDatabaseFiles(moved);
       this.removeDatabaseFileSet(tempPath);
       throw err;
     }
+    try { fs.rmSync(tempPath, { force: true }); } catch {}
+    return moved;
   }
 
   private moveDatabaseFilesToBackup(backupBase: string): MovedDatabaseFile[] {
@@ -785,8 +797,13 @@ export class DatabaseManager {
 
         const backup = `${backupBase}${suffix}`;
         fs.rmSync(backup, { force: true });
+        const stat = fs.lstatSync(original, { bigint: true });
         fs.renameSync(original, backup);
-        moved.push({ original, backup });
+        moved.push({
+          original,
+          backup,
+          identity: { dev: stat.dev, ino: stat.ino },
+        });
       }
       return moved;
     } catch (error) {
@@ -796,14 +813,28 @@ export class DatabaseManager {
   }
 
   private restoreMovedDatabaseFiles(moved: MovedDatabaseFile[]): void {
-    for (const file of [...moved].reverse()) {
+    for (const file of moved) {
       try {
-        if (!fs.existsSync(file.backup)) continue;
-        fs.rmSync(file.original, { force: true });
-        fs.renameSync(file.backup, file.original);
+        if (!this.hasDatabaseFileIdentity(file.backup, file.identity)) break;
+        if (fs.existsSync(file.original)) {
+          if (!this.hasDatabaseFileIdentity(file.original, file.identity)) break;
+          fs.rmSync(file.backup, { force: true });
+          continue;
+        }
+        fs.linkSync(file.backup, file.original);
+        fs.rmSync(file.backup, { force: true });
       } catch {
-        // Best effort. The backup path remains available if restoration fails.
+        break;
       }
+    }
+  }
+
+  private hasDatabaseFileIdentity(filePath: string, identity: DatabaseFileIdentity): boolean {
+    try {
+      const stat = fs.lstatSync(filePath, { bigint: true });
+      return stat.dev === identity.dev && stat.ino === identity.ino;
+    } catch {
+      return false;
     }
   }
 

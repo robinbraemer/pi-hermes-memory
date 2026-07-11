@@ -710,6 +710,65 @@ describe('DatabaseManager', () => {
       assert.ok(fs.readdirSync(tmpDir).some((name) => name.startsWith('sessions.db.corrupt-')), 'corrupt DB should be quarantined');
     });
 
+    it('skips orphan child rows while preserving readable recovery data', () => {
+      const db = dbManager.getDb();
+      db.prepare(`
+        INSERT INTO sessions (id, project, cwd, started_at)
+        VALUES (?, ?, ?, ?)
+      `).run('kept-session', 'kept-project', '/work/kept', '2026-05-03T00:00:00Z');
+      const insertMessage = db.prepare(`
+        INSERT INTO messages (id, session_id, role, content, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (let i = 0; i < 50; i++) {
+        insertMessage.run(`kept-msg-${i}`, 'kept-session', 'assistant', `message ${i}`, `2026-05-03T00:${String(i).padStart(2, '0')}:00Z`);
+      }
+      db.prepare(`
+        INSERT INTO memories (project, target, content, created, last_referenced)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(null, 'memory', 'kept memory', '2026-05-03', '2026-05-03');
+      dbManager.close();
+
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const fixtureDb = new Database(dbPath);
+      fixtureDb.pragma('foreign_keys = OFF');
+      fixtureDb.prepare(`
+        INSERT INTO messages (id, session_id, role, content, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+      `).run('orphan-message', 'missing-session', 'assistant', 'orphan', '2026-05-03T01:00:00Z');
+      fixtureDb.prepare(`
+        INSERT INTO session_files (path, session_id, size, mtime_ms, indexed_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run('/sessions/kept.jsonl', 'kept-session', 10, 20, '2026-05-03T01:00:00Z');
+      fixtureDb.prepare(`
+        INSERT INTO session_files (path, session_id, size, mtime_ms, indexed_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run('/sessions/orphan.jsonl', 'missing-session', 10, 20, '2026-05-03T01:00:00Z');
+      fixtureDb.close();
+      corruptRecoverableIndexPage(dbPath, 'idx_messages_timestamp');
+
+      dbManager = new DatabaseManager(tmpDir);
+      const repairedDb = dbManager.getDb();
+
+      assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'rebuilt');
+      assert.deepStrictEqual(dbManager.getLastRecovery()?.recoveredRows, {
+        extension_metadata: 0,
+        sessions: 1,
+        messages: 50,
+        session_files: 1,
+        memories: 1,
+      });
+      assert.deepStrictEqual(
+        repairedDb.prepare('SELECT id FROM messages WHERE id = ?').all('orphan-message'),
+        [],
+      );
+      assert.deepStrictEqual(
+        repairedDb.prepare('SELECT path FROM session_files ORDER BY path').all(),
+        [{ path: '/sessions/kept.jsonl' }],
+      );
+      assertQuickCheckOk(repairedDb as InstanceType<typeof Database>);
+    });
+
     it('quarantines unrecoverable files and recreates an empty database', () => {
       dbManager.close();
       const dbPath = path.join(tmpDir, 'sessions.db');
@@ -743,6 +802,55 @@ describe('DatabaseManager', () => {
       assert.strictEqual(fs.readFileSync(walPath, 'utf-8'), 'wal generation');
       assert.strictEqual(fs.existsSync(backupBase), false);
       assert.strictEqual(fs.readFileSync(path.join(`${backupBase}-wal`, 'retained'), 'utf-8'), 'block replacement');
+    });
+
+    it('preserves a successor generation when quarantine rollback starts', () => {
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const walPath = `${dbPath}-wal`;
+      const backupBase = `${dbPath}.corrupt-test`;
+      fs.writeFileSync(dbPath, 'main generation');
+      fs.writeFileSync(walPath, 'wal generation');
+      fs.mkdirSync(`${backupBase}-wal`);
+      fs.writeFileSync(path.join(`${backupBase}-wal`, 'retained'), 'block replacement');
+      const restoreMovedDatabaseFiles = (dbManager as any).restoreMovedDatabaseFiles.bind(dbManager);
+      (dbManager as any).restoreMovedDatabaseFiles = (moved: unknown) => {
+        fs.writeFileSync(dbPath, 'successor generation');
+        restoreMovedDatabaseFiles(moved);
+      };
+
+      assert.throws(
+        () => (dbManager as any).moveDatabaseFilesToBackup(backupBase),
+        /directory|operation not permitted|EISDIR|EPERM/i,
+      );
+
+      assert.strictEqual(fs.readFileSync(dbPath, 'utf-8'), 'successor generation');
+      assert.strictEqual(fs.readFileSync(walPath, 'utf-8'), 'wal generation');
+      assert.strictEqual(fs.readFileSync(backupBase, 'utf-8'), 'main generation');
+      assert.strictEqual(fs.readFileSync(path.join(`${backupBase}-wal`, 'retained'), 'utf-8'), 'block replacement');
+    });
+
+    it('does not publish a rebuilt database over a successor generation', () => {
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const tempPath = path.join(tmpDir, 'sessions.db.rebuild-test.tmp');
+      const backupBase = `${dbPath}.corrupt-test`;
+      fs.writeFileSync(dbPath, 'original generation');
+      fs.writeFileSync(tempPath, 'rebuilt generation');
+      const moveDatabaseFilesToBackup = (dbManager as any).moveDatabaseFilesToBackup.bind(dbManager);
+      (dbManager as any).moveDatabaseFilesToBackup = (backup: string) => {
+        const moved = moveDatabaseFilesToBackup(backup);
+        fs.writeFileSync(dbPath, 'successor generation');
+        return moved;
+      };
+
+      assert.throws(
+        () => (dbManager as any).swapRebuiltDatabase(tempPath, backupBase),
+        /exist|EEXIST/i,
+      );
+
+      assert.strictEqual(fs.readFileSync(dbPath, 'utf-8'), 'successor generation');
+      assert.strictEqual(fs.readFileSync(backupBase, 'utf-8'), 'original generation');
     });
 
     it('retries a corrupt operation once after self-healing', () => {
