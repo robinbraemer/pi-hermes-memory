@@ -86,7 +86,6 @@ function probeProcessIncarnation(pid: number): string | null {
 }
 
 const currentProcessIncarnation = probeProcessIncarnation(process.pid);
-const RELEASE_ATTEMPTS = 3;
 const RELEASE_RETRY_WINDOW_MS = 30_000;
 const RELEASE_RETRY_INITIAL_DELAY_MS = 10;
 const RELEASE_RETRY_MAX_DELAY_MS = 1_000;
@@ -94,7 +93,6 @@ const RELEASE_PERSISTENT_RETRY_MAX_DELAY_MS = 60_000;
 
 interface PendingRelease {
   attempt: () => boolean;
-  persistentAttempt: () => boolean;
   deadline: number;
   nextDelayMs: number;
   persistentDelayMs: number;
@@ -254,14 +252,13 @@ export class AtomicLockCoordinator {
 
   release(key: string, token: string): void {
     const pendingKey = this.pendingReleaseKey(key, token);
-    if (this.tryDeleteOwnedLock(key, token)) {
+    if (this.tryDeleteOwnedLock(key, token, 1, 0)) {
       this.clearPendingRelease(pendingKey);
       return;
     }
     if (pendingReleases.has(pendingKey)) return;
     const pending: PendingRelease = {
-      attempt: () => this.tryDeleteOwnedLock(key, token),
-      persistentAttempt: () => this.tryDeleteOwnedLock(key, token, 1, 0),
+      attempt: () => this.tryDeleteOwnedLock(key, token, 1, 0),
       deadline: Date.now() + RELEASE_RETRY_WINDOW_MS,
       nextDelayMs: RELEASE_RETRY_INITIAL_DELAY_MS,
       persistentDelayMs: RELEASE_RETRY_MAX_DELAY_MS,
@@ -272,14 +269,13 @@ export class AtomicLockCoordinator {
 
   private releaseShared(key: string, token: string): void {
     const pendingKey = this.pendingReleaseKey(key, token);
-    if (this.tryDeleteOwnedReadLock(key, token)) {
+    if (this.tryDeleteOwnedReadLock(key, token, 1, 0)) {
       this.clearPendingRelease(pendingKey);
       return;
     }
     if (pendingReleases.has(pendingKey)) return;
     const pending: PendingRelease = {
-      attempt: () => this.tryDeleteOwnedReadLock(key, token),
-      persistentAttempt: () => this.tryDeleteOwnedReadLock(key, token, 1, 0),
+      attempt: () => this.tryDeleteOwnedReadLock(key, token, 1, 0),
       deadline: Date.now() + RELEASE_RETRY_WINDOW_MS,
       nextDelayMs: RELEASE_RETRY_INITIAL_DELAY_MS,
       persistentDelayMs: RELEASE_RETRY_MAX_DELAY_MS,
@@ -291,8 +287,8 @@ export class AtomicLockCoordinator {
   private tryDeleteOwnedLock(
     key: string,
     token: string,
-    attempts = RELEASE_ATTEMPTS,
-    busyTimeoutMs = 5_000,
+    attempts = 1,
+    busyTimeoutMs = 0,
   ): boolean {
     for (let attempt = 0; attempt < attempts; attempt++) {
       try {
@@ -304,7 +300,7 @@ export class AtomicLockCoordinator {
     return false;
   }
 
-  private deleteOwnedLock(key: string, token: string, busyTimeoutMs = 5_000): void {
+  private deleteOwnedLock(key: string, token: string, busyTimeoutMs = 0): void {
     const db = this.open(busyTimeoutMs);
     try {
       db.prepare('DELETE FROM locks WHERE lock_key = ? AND token = ?').run(key, token);
@@ -316,8 +312,8 @@ export class AtomicLockCoordinator {
   private tryDeleteOwnedReadLock(
     key: string,
     token: string,
-    attempts = RELEASE_ATTEMPTS,
-    busyTimeoutMs = 5_000,
+    attempts = 1,
+    busyTimeoutMs = 0,
   ): boolean {
     for (let attempt = 0; attempt < attempts; attempt++) {
       try {
@@ -352,16 +348,10 @@ export class AtomicLockCoordinator {
   private retryPendingReleases(key: string): void {
     const prefix = `${path.resolve(this.dbPath)}\0${key}\0`;
     for (const [pendingKey, pending] of [...pendingReleases.entries()]) {
-      if (pendingKey.startsWith(prefix) && this.attemptPendingRelease(pending)) {
+      if (pendingKey.startsWith(prefix) && pending.attempt()) {
         this.clearPendingRelease(pendingKey, pending);
       }
     }
-  }
-
-  private attemptPendingRelease(pending: PendingRelease): boolean {
-    return Date.now() >= pending.deadline
-      ? pending.persistentAttempt()
-      : pending.attempt();
   }
 
   private schedulePendingRelease(pendingKey: string, pending: PendingRelease): void {
@@ -373,7 +363,7 @@ export class AtomicLockCoordinator {
     pending.timer = setTimeout(() => {
       pending.timer = undefined;
       if (pendingReleases.get(pendingKey) !== pending) return;
-      if ((persistent ? pending.persistentAttempt : pending.attempt)()) {
+      if (pending.attempt()) {
         this.clearPendingRelease(pendingKey, pending);
         return;
       }

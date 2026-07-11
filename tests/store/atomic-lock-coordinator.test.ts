@@ -199,7 +199,7 @@ describe('AtomicLockCoordinator', () => {
     }
   });
 
-  it('retries a failed owner release before the next same-process acquisition', () => {
+  it('retries a failed owner release asynchronously before later acquisition', async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
     const prototype = AtomicLockCoordinator.prototype as any;
     const originalDeleteOwnedLock = prototype.deleteOwnedLock;
@@ -215,6 +215,7 @@ describe('AtomicLockCoordinator', () => {
       const first = coordinator.tryAcquire('shared', { staleMs: 60_000 });
       assert.ok(first);
       assert.doesNotThrow(() => first.release());
+      await new Promise((resolve) => setTimeout(resolve, 75));
 
       const second = coordinator.tryAcquire('shared', { staleMs: 60_000 });
       assert.ok(second);
@@ -232,8 +233,15 @@ describe('AtomicLockCoordinator', () => {
     const originalTryDeleteOwnedReadLock = prototype.tryDeleteOwnedReadLock;
     const originalDateNow = Date.now;
     let deletionBlocked = true;
-    prototype.tryDeleteOwnedReadLock = function (key: string, token: string): boolean {
-      return deletionBlocked ? false : originalTryDeleteOwnedReadLock.call(this, key, token);
+    prototype.tryDeleteOwnedReadLock = function (
+      key: string,
+      token: string,
+      attempts?: number,
+      busyTimeoutMs?: number,
+    ): boolean {
+      return deletionBlocked
+        ? false
+        : originalTryDeleteOwnedReadLock.call(this, key, token, attempts, busyTimeoutMs);
     };
 
     try {
@@ -264,6 +272,33 @@ describe('AtomicLockCoordinator', () => {
       assert.strictEqual(child.status, 0, child.stderr);
     } finally {
       Date.now = originalDateNow;
+      prototype.tryDeleteOwnedReadLock = originalTryDeleteOwnedReadLock;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses one nonblocking cleanup attempt during foreground release', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    const prototype = AtomicLockCoordinator.prototype as any;
+    const originalTryDeleteOwnedReadLock = prototype.tryDeleteOwnedReadLock;
+    const calls: Array<[number | undefined, number | undefined]> = [];
+    prototype.tryDeleteOwnedReadLock = function (
+      key: string,
+      token: string,
+      attempts?: number,
+      busyTimeoutMs?: number,
+    ): boolean {
+      calls.push([attempts, busyTimeoutMs]);
+      return originalTryDeleteOwnedReadLock.call(this, key, token, attempts, busyTimeoutMs);
+    };
+
+    try {
+      const coordinator = new AtomicLockCoordinator(path.join(tmpDir, 'locks.sqlite'));
+      const reader = coordinator.tryAcquireShared('database-access', { staleMs: 60_000 });
+      assert.ok(reader);
+      reader.release();
+      assert.deepStrictEqual(calls, [[1, 0]]);
+    } finally {
       prototype.tryDeleteOwnedReadLock = originalTryDeleteOwnedReadLock;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

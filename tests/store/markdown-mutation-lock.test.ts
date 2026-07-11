@@ -66,6 +66,7 @@ describe("markdown mutation lock", () => {
     try {
       const first = await withMarkdownMutationLock(filePath, async () => "committed");
       assert.equal(first, "committed");
+      await new Promise((resolve) => setTimeout(resolve, 75));
 
       const second = await withMarkdownMutationLock(filePath, async () => "next mutation");
       assert.equal(second, "next mutation");

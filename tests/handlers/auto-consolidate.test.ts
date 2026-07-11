@@ -122,6 +122,7 @@ describe("triggerConsolidation", () => {
     try {
       const pi = createMockPi();
       const first = await triggerConsolidation(pi, mockStore, "memory");
+      await new Promise((resolve) => setTimeout(resolve, 75));
       const second = await triggerConsolidation(pi, mockStore, "memory");
 
       assert.strictEqual(first.consolidated, true);
