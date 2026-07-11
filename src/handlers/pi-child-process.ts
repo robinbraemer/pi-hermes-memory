@@ -21,6 +21,16 @@ interface ExecChildPromptOptions {
   retryWithoutOverrides?: boolean;
 }
 
+interface ExecChildPromptDependencies {
+  removeTemporaryDirectory: (dir: string) => Promise<void>;
+}
+
+const DEFAULT_EXEC_CHILD_PROMPT_DEPENDENCIES: ExecChildPromptDependencies = {
+  removeTemporaryDirectory: async (dir) => {
+    await fs.rm(dir, { recursive: true, force: true });
+  },
+};
+
 export interface ChildPiInvocation {
   command: string;
   args: string[];
@@ -226,7 +236,7 @@ async function writePromptToTemporaryFile(prompt: string): Promise<{ dir: string
     await fs.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
     return { dir, filePath };
   } catch (error) {
-    await fs.rm(dir, { recursive: true, force: true });
+    try { await fs.rm(dir, { recursive: true, force: true }); } catch {}
     throw error;
   }
 }
@@ -236,6 +246,7 @@ export async function execChildPrompt(
   prompt: string,
   config: ChildLlmConfig,
   options: ExecChildPromptOptions,
+  dependencies: ExecChildPromptDependencies = DEFAULT_EXEC_CHILD_PROMPT_DEPENDENCIES,
 ): Promise<PiExecResult> {
   const execOptions = {
     signal: options.signal,
@@ -269,6 +280,6 @@ export async function execChildPrompt(
     const retryInvocation = resolveChildPiInvocation(basePromptArgs(promptReference, config));
     return await pi.exec(retryInvocation.command, retryInvocation.args, execOptions) as PiExecResult;
   } finally {
-    await fs.rm(temporaryPrompt.dir, { recursive: true, force: true });
+    try { await dependencies.removeTemporaryDirectory(temporaryPrompt.dir); } catch {}
   }
 }

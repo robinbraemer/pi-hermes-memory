@@ -14,6 +14,7 @@ import {
 import { ENTRY_DELIMITER, MEMORY_FILE, USER_FILE } from '../constants.js';
 import { AGENT_ROOT } from '../paths.js';
 import { migrateExtensionRoot } from '../extension-root-migration.js';
+import { withMarkdownMutationLock } from '../store/markdown-mutation-lock.js';
 
 export interface BackfillCounters {
   filesScanned: number;
@@ -67,12 +68,12 @@ function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir
     .filter(({ memoryFile }) => fs.existsSync(memoryFile));
 }
 
-export function syncMarkdownMemoriesToSqlite(
+export async function syncMarkdownMemoriesToSqlite(
   dbManager: DatabaseManager,
   globalDir: string,
   projectsMemoryDir?: string,
   agentRoot = AGENT_ROOT,
-): BackfillCounters & { projectCount: number } {
+): Promise<BackfillCounters & { projectCount: number }> {
   const counters: BackfillCounters = {
     filesScanned: 0,
     entriesScanned: 0,
@@ -86,31 +87,33 @@ export function syncMarkdownMemoriesToSqlite(
   const globalUserFile = path.join(globalDir, USER_FILE);
   const globalFailureFile = path.join(globalDir, 'failures.md');
 
-  const reconcileFile = (
+  const reconcileFile = async (
     filePath: string,
     target: 'memory' | 'user' | 'failure',
     project: string | null = null,
   ) => {
-    if (fs.existsSync(filePath)) counters.filesScanned++;
-    const entries = readEntries(filePath);
-    counters.entriesScanned += entries.length;
-    try {
-      const result = target === 'failure'
-        ? reconcileMarkdownFailureScopes(dbManager, entries)
-        : reconcileMarkdownMemoryScope(dbManager, entries, target, project);
-      counters.imported += result.inserted;
-      counters.skipped += result.existing;
-      counters.removed += result.removed;
-    } catch (err) {
-      counters.warnings.push(
-        `${path.basename(project ?? 'global')}/${target}: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    await withMarkdownMutationLock(filePath, () => {
+      if (fs.existsSync(filePath)) counters.filesScanned++;
+      const entries = readEntries(filePath);
+      counters.entriesScanned += entries.length;
+      try {
+        const result = target === 'failure'
+          ? reconcileMarkdownFailureScopes(dbManager, entries)
+          : reconcileMarkdownMemoryScope(dbManager, entries, target, project);
+        counters.imported += result.inserted;
+        counters.skipped += result.existing;
+        counters.removed += result.removed;
+      } catch (err) {
+        counters.warnings.push(
+          `${path.basename(project ?? 'global')}/${target}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
   };
 
-  reconcileFile(globalMemoryFile, 'memory');
-  reconcileFile(globalUserFile, 'user');
-  reconcileFile(globalFailureFile, 'failure');
+  await reconcileFile(globalMemoryFile, 'memory');
+  await reconcileFile(globalUserFile, 'user');
+  await reconcileFile(globalFailureFile, 'failure');
 
   const projects = scanProjectDirs(agentRoot, globalDir, projectsMemoryDir);
   const projectFiles = new Map(projects.map((project) => [project.name, project.memoryFile]));
@@ -124,7 +127,9 @@ export function syncMarkdownMemoriesToSqlite(
     ...mirroredProjects.map(({ project }) => project),
   ]);
   for (const projectName of projectNames) {
-    reconcileFile(projectFiles.get(projectName) ?? '', 'memory', projectName);
+    const memoryFile = projectFiles.get(projectName)
+      ?? path.join(agentRoot, projectsMemoryDir ?? 'projects-memory', projectName, MEMORY_FILE);
+    await reconcileFile(memoryFile, 'memory', projectName);
   }
 
   return { ...counters, projectCount: projectNames.size };
@@ -140,7 +145,7 @@ export async function migrateThenSyncMarkdownMemories(
   if (legacyGlobalDir) {
     await migrateExtensionRoot(legacyGlobalDir, globalDir);
   }
-  return syncMarkdownMemoriesToSqlite(dbManager, globalDir, projectsMemoryDir, agentRoot);
+  return await syncMarkdownMemoriesToSqlite(dbManager, globalDir, projectsMemoryDir, agentRoot);
 }
 
 export function registerSyncMarkdownMemoriesCommand(
@@ -156,7 +161,7 @@ export function registerSyncMarkdownMemoriesCommand(
       ctx.ui.notify('🔄 Reconciling the SQLite search mirror with Markdown memories...', 'info');
 
       try {
-        const counters = syncMarkdownMemoriesToSqlite(dbManager, globalDir, projectsMemoryDir, agentRoot);
+        const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, projectsMemoryDir, agentRoot);
 
         let output = `\n✅ Markdown → SQLite sync complete!\n\n`;
         output += `📊 Results:\n`;

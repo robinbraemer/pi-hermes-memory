@@ -179,6 +179,53 @@ describe('sqlite-memory-store', () => {
         ['kept global memory', 'unrelated global user', 'unrelated project memory'].sort(),
       );
     });
+
+    it('removes duplicate and stale-category rows by full Markdown identity', () => {
+      const first = addMemory(
+        dbManager,
+        '[correction] use pnpm',
+        'failure',
+        'project-a',
+        'correction',
+        'original reason',
+        null,
+        'pnpm install',
+        '2026-06-01',
+        '2026-07-05',
+      );
+      addMemory(dbManager, '[correction] use pnpm', 'failure', 'project-a', 'correction');
+      addMemory(dbManager, '[correction] use pnpm', 'failure', 'project-a', 'tool-quirk');
+
+      const result = reconcileMarkdownMemoryScope(
+        dbManager,
+        ['[correction] use pnpm <!-- created=2026-07-01, last=2026-07-02, project64=cHJvamVjdC1h -->'],
+        'failure',
+        'project-a',
+      );
+
+      const rows = dbManager.getDb().prepare(`
+        SELECT id, category, failure_reason, corrected_to, created, last_referenced
+        FROM memories
+        WHERE project = 'project-a' AND target = 'failure'
+      `).all() as Array<{
+        id: number;
+        category: string | null;
+        failure_reason: string | null;
+        corrected_to: string | null;
+        created: string;
+        last_referenced: string;
+      }>;
+
+      assert.strictEqual(result.removed, 2);
+      assert.deepStrictEqual(rows, [{
+        id: first.id,
+        category: 'correction',
+        failure_reason: 'original reason',
+        corrected_to: 'pnpm install',
+        created: '2026-06-01',
+        last_referenced: '2026-07-05',
+      }]);
+    });
   });
 
   describe('replace/remove synced memories', () => {

@@ -27,7 +27,7 @@ import {
 } from "../constants.js";
 import type { MemoryConfig, MemoryResult, MemorySnapshot, ConsolidationResult, MemoryCategory, MemoryOverflowStrategy } from "../types.js";
 import { AGENT_ROOT } from "../paths.js";
-import { AtomicLockCoordinator } from "./atomic-lock-coordinator.js";
+import { canonicalMarkdownIdentity, withMarkdownMutationLock } from "./markdown-mutation-lock.js";
 
 export class MemoryStore {
   private memoryEntries: string[] = [];
@@ -67,20 +67,7 @@ export class MemoryStore {
   }
 
   async getStorageIdentity(target: "memory" | "user" | "failure"): Promise<string> {
-    const filePath = path.resolve(this.pathFor(target));
-    try {
-      return await fs.realpath(filePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    }
-
-    try {
-      const canonicalDir = await fs.realpath(path.dirname(filePath));
-      return path.join(canonicalDir, path.basename(filePath));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      return filePath;
-    }
+    return canonicalMarkdownIdentity(this.pathFor(target));
   }
 
   private entriesFor(target: "memory" | "user" | "failure"): string[] {
@@ -181,8 +168,13 @@ export class MemoryStore {
     const limit = this.charLimit(target);
 
     // Check for duplicate — strip metadata from existing entries before comparing
-    const strippedEntries = entries.map((e) => this.stripMetadata(e));
-    if (strippedEntries.includes(content)) {
+    const normalizedProject = project?.trim() || null;
+    const duplicate = entries.some((entry) => {
+      const decoded = this.decodeEntry(entry);
+      return decoded.text === content
+        && (target !== "failure" || decoded.project === normalizedProject);
+    });
+    if (duplicate) {
       return this.successResponse(target, "Entry already exists (no duplicate added).");
     }
 
@@ -572,42 +564,26 @@ export class MemoryStore {
     target: "memory" | "user" | "failure",
     mutation: () => Promise<MemoryResult>,
   ): Promise<MemoryResult> {
-    const identity = await this.getStorageIdentity(target);
-    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(identity), ".pi-hermes-locks.sqlite"));
-    const lockKey = `mutation:${identity}`;
-    const deadline = Date.now() + 5000;
-    let lease = coordinator.tryAcquire(lockKey, { staleMs: 300000 });
-
-    while (!lease) {
-      if (Date.now() >= deadline) {
-        throw new Error(`Memory mutation already in progress for ${identity}`);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      lease = coordinator.tryAcquire(lockKey, { staleMs: 300000 });
-    }
-
-    try {
-        const result = await mutation();
-        if (result.success && this.mutationObserver) {
-          const filePath = this.pathFor(target);
-          const state = await this.readFileState(filePath);
-          this.setEntries(target, [...new Set(state.entries)]);
-          this.fileFingerprints[filePath] = state.fingerprint;
-          const warning = await this.mutationObserver(target, [...state.entries]);
-          if (warning) {
-            const warnings = [...(result.warnings ?? []), warning];
-            return {
-              ...result,
-              message: result.message ? `${result.message} Warning: ${warning}` : warning,
-              warning,
-              warnings,
-            };
-          }
+    return withMarkdownMutationLock(this.pathFor(target), async () => {
+      const result = await mutation();
+      if (result.success && this.mutationObserver) {
+        const filePath = this.pathFor(target);
+        const state = await this.readFileState(filePath);
+        this.setEntries(target, [...new Set(state.entries)]);
+        this.fileFingerprints[filePath] = state.fingerprint;
+        const warning = await this.mutationObserver(target, [...state.entries]);
+        if (warning) {
+          const warnings = [...(result.warnings ?? []), warning];
+          return {
+            ...result,
+            message: result.message ? `${result.message} Warning: ${warning}` : warning,
+            warning,
+            warnings,
+          };
         }
-        return result;
-    } finally {
-      lease.release();
-    }
+      }
+      return result;
+    });
   }
 
   /**

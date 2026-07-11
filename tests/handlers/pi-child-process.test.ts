@@ -193,6 +193,38 @@ describe("execChildPrompt", () => {
     await assert.rejects(fs.access(promptPath), { code: "ENOENT" });
   });
 
+  it("returns a successful child result when temporary cleanup fails", async () => {
+    let cleanupCalls = 0;
+    let promptDirectory = "";
+    const pi = {
+      exec: async (_cmd: string, args: string[]) => {
+        promptDirectory = path.dirname(args.at(-1)!.slice(1));
+        return { code: 0, stdout: "completed", stderr: "" };
+      },
+    };
+
+    try {
+      const result = await execChildPrompt(
+        pi as any,
+        "cleanup failure prompt",
+        {},
+        { timeoutMs: 30000 },
+        {
+          removeTemporaryDirectory: async () => {
+            cleanupCalls++;
+            throw new Error("cleanup denied");
+          },
+        },
+      );
+
+      assert.equal(result.code, 0);
+      assert.equal(result.stdout, "completed");
+      assert.equal(cleanupCalls, 1);
+    } finally {
+      if (promptDirectory) await fs.rm(promptDirectory, { recursive: true, force: true });
+    }
+  });
+
   it("passes configured auth adapters to both override attempts", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-child-auth-"));
     const adapterPath = path.join(dir, "adapter.ts");

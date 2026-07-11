@@ -395,6 +395,36 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       const count = raw.split(ENTRY_DELIMITER).filter(Boolean).length;
       assert.equal(count, 1);
     });
+
+    it("keeps identical failure text in global and distinct project scopes", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+
+      const first = await store.addFailure(`${TEST_MARKER} use pnpm`, {
+        category: "correction",
+        project: "project-a",
+      });
+      const second = await store.addFailure(`${TEST_MARKER} use pnpm`, {
+        category: "correction",
+        project: "project-b",
+      });
+      const global = await store.addFailure(`${TEST_MARKER} use pnpm`, {
+        category: "correction",
+      });
+      const duplicate = await store.addFailure(`${TEST_MARKER} use pnpm`, {
+        category: "correction",
+        project: "project-a",
+      });
+
+      assert.ok(first.success);
+      assert.ok(second.success);
+      assert.equal(second.entry_count, 2);
+      assert.ok(global.success);
+      assert.equal(global.entry_count, 3);
+      assert.equal(duplicate.message, "Entry already exists (no duplicate added).");
+      assert.equal(duplicate.entry_count, 3);
+      assert.equal(store.getRawEntriesForSync("failure").length, 3);
+    });
   });
 
   // ─── replace() tests ───

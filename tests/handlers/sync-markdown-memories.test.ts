@@ -12,7 +12,8 @@ import {
   syncMarkdownMemoriesToSqlite,
 } from '../../src/handlers/sync-markdown-memories.js';
 import { ENTRY_DELIMITER } from '../../src/constants.js';
-import { getMemories, searchMemories } from '../../src/store/sqlite-memory-store.js';
+import { addMemory, getMemories, searchMemories } from '../../src/store/sqlite-memory-store.js';
+import { AtomicLockCoordinator } from '../../src/store/atomic-lock-coordinator.js';
 
 describe('memory sqlite sync + markdown backfill', () => {
   let tmpDir: string;
@@ -160,7 +161,7 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.strictEqual(projectRows[0].content, 'legacy project entry');
   });
 
-  it('makes new-layout project markdown searchable when startup sync runs', () => {
+  it('makes new-layout project markdown searchable when startup sync runs', async () => {
     const projectDir = path.join(agentRoot, 'projects-memory', 'latest-project');
     fs.mkdirSync(projectDir, { recursive: true });
     fs.writeFileSync(
@@ -169,7 +170,7 @@ describe('memory sqlite sync + markdown backfill', () => {
       'utf-8',
     );
 
-    const counters = syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
 
     assert.strictEqual(counters.projectCount, 1);
     assert.strictEqual(counters.imported, 1);
@@ -182,20 +183,20 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.strictEqual(results[0].content, 'latest path searchable entry');
   });
 
-  it('prunes Markdown orphans while preserving other targets and projects', () => {
+  it('prunes Markdown orphans while preserving other targets and projects', async () => {
     fs.writeFileSync(path.join(globalDir, 'MEMORY.md'), 'kept global memory', 'utf-8');
     fs.writeFileSync(path.join(globalDir, 'USER.md'), 'kept global user', 'utf-8');
     const projectDir = path.join(agentRoot, 'projects-memory', 'project-a');
     fs.mkdirSync(projectDir, { recursive: true });
     fs.writeFileSync(path.join(projectDir, 'MEMORY.md'), 'kept project memory', 'utf-8');
 
-    syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+    await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
     dbManager.getDb().prepare(`
       INSERT INTO memories (project, target, category, content, created, last_referenced)
       VALUES (NULL, 'memory', NULL, 'orphaned global memory', '2026-07-01', '2026-07-01')
     `).run();
 
-    const counters = syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
 
     assert.strictEqual(counters.removed, 1);
     assert.deepStrictEqual(
@@ -208,7 +209,39 @@ describe('memory sqlite sync + markdown backfill', () => {
     );
   });
 
-  it('prunes a deleted project Markdown scope without touching unrelated rows', () => {
+  it('waits for the canonical Markdown mutation before reading and reconciling', async () => {
+    const memoryFile = path.join(globalDir, 'MEMORY.md');
+    fs.writeFileSync(memoryFile, 'stale memory', 'utf-8');
+    addMemory(dbManager, 'stale memory');
+
+    const identity = fs.realpathSync(memoryFile);
+    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(path.dirname(identity)), '.pi-hermes-locks.sqlite'));
+    const lease = coordinator.tryAcquire(`mutation:${identity}`, { staleMs: 300_000 });
+    assert.ok(lease);
+
+    let settled = false;
+    const syncing = Promise.resolve()
+      .then(() => syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot))
+      .then((result) => {
+        settled = true;
+        return result;
+      });
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const waitedForMutation = !settled;
+    fs.writeFileSync(memoryFile, ['stale memory', 'newer writer memory'].join(ENTRY_DELIMITER), 'utf-8');
+    addMemory(dbManager, 'newer writer memory');
+    lease.release();
+    await syncing;
+
+    assert.ok(waitedForMutation, 'reconciliation must wait for the active Markdown mutation');
+    assert.deepStrictEqual(
+      getMemories(dbManager, { target: 'memory', project: null }).map((entry) => entry.content).sort(),
+      ['newer writer memory', 'stale memory'],
+    );
+  });
+
+  it('prunes a deleted project Markdown scope without touching unrelated rows', async () => {
     const deletedProjectDir = path.join(agentRoot, 'projects-memory', 'deleted-project');
     const keptProjectDir = path.join(agentRoot, 'projects-memory', 'kept-project');
     fs.mkdirSync(deletedProjectDir, { recursive: true });
@@ -217,16 +250,17 @@ describe('memory sqlite sync + markdown backfill', () => {
     fs.writeFileSync(path.join(keptProjectDir, 'MEMORY.md'), 'kept project memory', 'utf-8');
     fs.writeFileSync(path.join(globalDir, 'MEMORY.md'), 'kept global memory', 'utf-8');
 
-    syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+    await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
     dbManager.getDb().prepare(`
       INSERT INTO memories (project, target, category, content, created, last_referenced)
       VALUES ('deleted-project', 'user', NULL, 'unrelated project user', '2026-07-01', '2026-07-01')
     `).run();
-    fs.rmSync(path.join(deletedProjectDir, 'MEMORY.md'));
+    fs.rmSync(deletedProjectDir, { recursive: true });
 
-    const counters = syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
 
     assert.strictEqual(counters.removed, 1);
+    assert.ok(!fs.existsSync(deletedProjectDir));
     assert.deepStrictEqual(
       getMemories(dbManager).map((entry) => `${entry.project ?? 'global'}:${entry.target}:${entry.content}`).sort(),
       [
@@ -237,7 +271,7 @@ describe('memory sqlite sync + markdown backfill', () => {
     );
   });
 
-  it('still scans project markdown under ~/.pi/agent when memoryDir is customized elsewhere', () => {
+  it('still scans project markdown under ~/.pi/agent when memoryDir is customized elsewhere', async () => {
     const customGlobalDir = path.join(tmpDir, 'external-memory-root');
     fs.mkdirSync(customGlobalDir, { recursive: true });
 
@@ -251,7 +285,7 @@ describe('memory sqlite sync + markdown backfill', () => {
         'utf-8',
       );
 
-      const counters = syncMarkdownMemoriesToSqlite(customDbManager, customGlobalDir, undefined, agentRoot);
+      const counters = await syncMarkdownMemoriesToSqlite(customDbManager, customGlobalDir, undefined, agentRoot);
 
       assert.strictEqual(counters.projectCount, 1);
       const results = searchMemories(customDbManager, 'custom root project entry', {

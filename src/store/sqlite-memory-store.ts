@@ -432,11 +432,14 @@ export function reconcileMarkdownMemoryScope(
   const reconcile = (): MarkdownMemoryReconcileResult => {
     let inserted = 0;
     let existing = 0;
-    const desiredContent = new Set<string>();
+    const desiredIdentities = new Set<string>();
 
     for (const rawEntry of rawEntries) {
       const parsed = parseMarkdownMemoryEntry(rawEntry, target, normalizedProject);
-      desiredContent.add(parsed.content.trim());
+      desiredIdentities.add(JSON.stringify([
+        normalizeCategory(parsed.category),
+        parsed.content.trim(),
+      ]));
       const result = syncMemoryEntry(dbManager, parsed);
       if (result.action === 'inserted') inserted++;
       else existing++;
@@ -445,13 +448,21 @@ export function reconcileMarkdownMemoryScope(
     const params: unknown[] = [];
     const conditions = buildScopeConditions(params, target, normalizedProject);
     const scopedRows = db.prepare(`
-      SELECT id, content
+      SELECT id, content, category
       FROM memories
       WHERE ${conditions.join(' AND ')}
-    `).all(...params) as Array<{ id: number; content: string }>;
-    const orphanIds = scopedRows
-      .filter((row) => !desiredContent.has(row.content.trim()))
-      .map((row) => row.id);
+      ORDER BY id ASC
+    `).all(...params) as Array<{ id: number; content: string; category: MemoryCategory | null }>;
+    const retainedIdentities = new Set<string>();
+    const orphanIds: number[] = [];
+    for (const row of scopedRows) {
+      const identity = JSON.stringify([normalizeCategory(row.category), row.content.trim()]);
+      if (!desiredIdentities.has(identity) || retainedIdentities.has(identity)) {
+        orphanIds.push(row.id);
+      } else {
+        retainedIdentities.add(identity);
+      }
+    }
 
     let removed = 0;
     if (orphanIds.length > 0) {
