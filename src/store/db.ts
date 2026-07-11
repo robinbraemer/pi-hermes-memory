@@ -205,12 +205,13 @@ export class DatabaseManager {
    * Get the database instance. Creates/opens on first call.
    */
   getDb(): DatabaseLike {
+    if (this.dbFacade) return this.dbFacade;
     if (this.databaseAccessDepth > 0) {
       this.ensureCurrentDb();
     } else {
       this.withDatabaseAccess(() => this.ensureCurrentDb(), 'exclusive');
     }
-    if (!this.dbFacade) this.dbFacade = this.createDatabaseFacade();
+    this.dbFacade = this.createDatabaseFacade();
     return this.dbFacade;
   }
 

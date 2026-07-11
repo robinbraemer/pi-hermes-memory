@@ -379,10 +379,10 @@ describe('DatabaseManager', () => {
     it('allows another manager to read during a read transaction', () => {
       const firstDb = dbManager.getDb();
       const secondManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 0 });
-      const secondDb = secondManager.getDb();
+      secondManager.getDb();
       try {
         const read = firstDb.transaction?.(() => {
-          return secondDb.prepare('SELECT COUNT(*) AS count FROM sessions').get();
+          return secondManager.getDb().prepare('SELECT COUNT(*) AS count FROM sessions').get();
         });
         assert.deepStrictEqual(read?.(), { count: 0 });
       } finally {
