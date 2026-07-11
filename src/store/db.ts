@@ -34,10 +34,28 @@ type MovedDatabaseFile = {
 };
 
 export interface DatabaseRecoveryResult {
-  strategy: 'rebuilt' | 'recreated-empty';
+  strategy: 'rebuilt' | 'recreated-empty' | 'reused';
   backupPaths: string[];
   recoveredRows?: Record<string, number>;
   error?: string;
+}
+
+export interface DatabaseRecoveryOptions {
+  recoveryLockWaitMs?: number;
+  recoveryLockPollMs?: number;
+  recoveryLockStaleMs?: number;
+  recoveryCircuitLimit?: number;
+  recoveryCircuitWindowMs?: number;
+  recoveryBackupRetention?: number;
+}
+
+interface ResolvedDatabaseRecoveryOptions {
+  recoveryLockWaitMs: number;
+  recoveryLockPollMs: number;
+  recoveryLockStaleMs: number;
+  recoveryCircuitLimit: number;
+  recoveryCircuitWindowMs: number;
+  recoveryBackupRetention: number;
 }
 
 class DatabaseCorruptionError extends Error {
@@ -54,6 +72,14 @@ export const SQLITE_WAL_AUTOCHECKPOINT_PAGES = 1000;
 const DATABASE_FILE_SUFFIXES: readonly DatabaseFileSuffix[] = ['', '-wal', '-shm'];
 const MEMORY_TARGETS = new Set(['memory', 'user', 'failure']);
 const MEMORY_CATEGORIES = new Set(['failure', 'correction', 'insight', 'preference', 'convention', 'tool-quirk']);
+const DEFAULT_RECOVERY_OPTIONS: ResolvedDatabaseRecoveryOptions = {
+  recoveryLockWaitMs: 5000,
+  recoveryLockPollMs: 50,
+  recoveryLockStaleMs: 300000,
+  recoveryCircuitLimit: 3,
+  recoveryCircuitWindowMs: 300000,
+  recoveryBackupRetention: 3,
+};
 
 function quoteIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
@@ -111,10 +137,12 @@ const Database = loadDatabaseCtor();
 export class DatabaseManager {
   private db: DatabaseLike | null = null;
   private readonly dbPath: string;
+  private readonly recoveryOptions: ResolvedDatabaseRecoveryOptions;
   private lastRecovery: DatabaseRecoveryResult | null = null;
 
-  constructor(memoryDir: string) {
+  constructor(memoryDir: string, recoveryOptions: DatabaseRecoveryOptions = {}) {
     this.dbPath = path.join(memoryDir, 'sessions.db');
+    this.recoveryOptions = { ...DEFAULT_RECOVERY_OPTIONS, ...recoveryOptions };
   }
 
   /**
@@ -298,6 +326,50 @@ export class DatabaseManager {
   }
 
   private recoverDatabaseFile(cause?: unknown): DatabaseRecoveryResult {
+    const lockDir = `${this.dbPath}.recovery-lock`;
+    const deadline = Date.now() + Math.max(0, this.recoveryOptions.recoveryLockWaitMs);
+
+    while (true) {
+      try {
+        fs.mkdirSync(lockDir);
+        try {
+          fs.writeFileSync(
+            path.join(lockDir, 'owner.json'),
+            JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+            { encoding: 'utf-8', mode: 0o600 },
+          );
+
+          if (this.currentDatabaseIsHealthy()) {
+            return { strategy: 'reused', backupPaths: [] };
+          }
+
+          this.assertRecoveryCircuitClosed();
+          this.recordRecoveryAttempt();
+          this.cleanupRecoveryArtifacts();
+          const result = this.recoverDatabaseFileUnlocked(cause);
+          this.cleanupRecoveryArtifacts();
+          return result;
+        } finally {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        if (this.recoveryLockIsStaleOrGone(lockDir)) {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(`SQLite recovery already in progress for ${this.dbPath}; timed out after ${this.recoveryOptions.recoveryLockWaitMs}ms`);
+        }
+        DatabaseManager.sleepSync(Math.min(
+          this.recoveryOptions.recoveryLockPollMs,
+          Math.max(1, deadline - Date.now()),
+        ));
+      }
+    }
+  }
+
+  private recoverDatabaseFileUnlocked(cause?: unknown): DatabaseRecoveryResult {
     const backupBase = this.corruptBackupBase();
     let rebuildError: unknown;
 
@@ -315,6 +387,121 @@ export class DatabaseManager {
       backupPaths: moved.map((file) => file.backup),
       error: DatabaseManager.errorMessage(rebuildError ?? cause ?? 'unknown corruption'),
     };
+  }
+
+  private currentDatabaseIsHealthy(): boolean {
+    if (!this.hasExistingMainDatabaseFile()) return false;
+    let db: DatabaseLike | null = null;
+    try {
+      db = new Database(this.dbPath);
+      this.assertIntegrityOk(db, 'quick_check', 'while joining corruption recovery');
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (db) this.safeClose(db);
+    }
+  }
+
+  private recoveryLockIsStaleOrGone(lockDir: string): boolean {
+    try {
+      try {
+        const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')) as { pid?: unknown };
+        if (typeof owner.pid === 'number' && owner.pid > 0 && owner.pid !== process.pid) {
+          try {
+            process.kill(owner.pid, 0);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+          }
+        }
+      } catch {
+        // Missing or malformed owner metadata falls back to lock age.
+      }
+      return Date.now() - fs.statSync(lockDir).mtimeMs > Math.max(0, this.recoveryOptions.recoveryLockStaleMs);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw error;
+    }
+  }
+
+  private recoveryCircuitPath(): string {
+    return `${this.dbPath}.recovery-state.json`;
+  }
+
+  private recentRecoveryAttempts(): number[] {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.recoveryCircuitPath(), 'utf-8')) as { attempts?: unknown };
+      if (!Array.isArray(parsed.attempts)) return [];
+      const cutoff = Date.now() - Math.max(0, this.recoveryOptions.recoveryCircuitWindowMs);
+      return parsed.attempts.filter((value): value is number => typeof value === 'number' && value >= cutoff);
+    } catch {
+      return [];
+    }
+  }
+
+  private assertRecoveryCircuitClosed(): void {
+    if (this.recentRecoveryAttempts().length >= Math.max(1, this.recoveryOptions.recoveryCircuitLimit)) {
+      throw new Error(
+        `SQLite recovery circuit is open for ${this.dbPath}: too many recovery attempts within ${this.recoveryOptions.recoveryCircuitWindowMs}ms`,
+      );
+    }
+  }
+
+  private recordRecoveryAttempt(): void {
+    const statePath = this.recoveryCircuitPath();
+    const tempPath = `${statePath}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+    const attempts = [...this.recentRecoveryAttempts(), Date.now()];
+    try {
+      fs.writeFileSync(tempPath, JSON.stringify({ attempts }), { encoding: 'utf-8', mode: 0o600 });
+      fs.renameSync(tempPath, statePath);
+    } finally {
+      fs.rmSync(tempPath, { force: true });
+    }
+  }
+
+  private cleanupRecoveryArtifacts(): void {
+    const dir = path.dirname(this.dbPath);
+    const databaseName = path.basename(this.dbPath);
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      return;
+    }
+
+    for (const name of names) {
+      if (name.startsWith(`${databaseName}.rebuild-`)) {
+        fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+      }
+    }
+
+    const backupGroups = new Map<string, number>();
+    for (const name of names) {
+      if (!name.startsWith(`${databaseName}.corrupt-`)) continue;
+      const group = name.replace(/-(?:wal|shm)$/, '');
+      try {
+        const mtimeMs = fs.statSync(path.join(dir, name)).mtimeMs;
+        backupGroups.set(group, Math.max(backupGroups.get(group) ?? 0, mtimeMs));
+      } catch {
+        // Artifact disappeared while scanning.
+      }
+    }
+
+    const retained = Math.max(0, this.recoveryOptions.recoveryBackupRetention);
+    const expired = [...backupGroups.entries()]
+      .sort((left, right) => right[1] - left[1])
+      .slice(retained);
+    for (const [group] of expired) {
+      for (const suffix of DATABASE_FILE_SUFFIXES) {
+        fs.rmSync(path.join(dir, `${group}${suffix}`), { force: true });
+      }
+    }
+  }
+
+  private static sleepSync(milliseconds: number): void {
+    if (milliseconds <= 0) return;
+    const signal = new Int32Array(new SharedArrayBuffer(4));
+    Atomics.wait(signal, 0, 0, milliseconds);
   }
 
   private rebuildDatabaseFromReadableRows(backupBase: string): DatabaseRecoveryResult {

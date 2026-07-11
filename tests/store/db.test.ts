@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { spawn } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { DatabaseManager, SQLITE_WAL_AUTOCHECKPOINT_PAGES } from '../../src/store/db.js';
 
@@ -295,6 +296,78 @@ describe('DatabaseManager', () => {
   });
 
   describe('corruption recovery', () => {
+    it('waits for a recovery owner and reuses the healthy database it leaves behind', () => {
+      dbManager.getDb();
+      dbManager.close();
+      const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid }));
+      spawn(process.execPath, [
+        '-e',
+        'setTimeout(() => require("node:fs").rmSync(process.argv[1], { recursive: true, force: true }), 100)',
+        lockDir,
+      ], { stdio: 'ignore' });
+
+      dbManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 1000, recoveryLockPollMs: 10 });
+      const started = Date.now();
+      const result = dbManager.recoverFromCorruption(corruptSqliteError());
+
+      assert.strictEqual(result.strategy, 'reused');
+      assert.ok(Date.now() - started >= 50, 'peer should wait for the active recovery owner');
+      assert.strictEqual(fs.readdirSync(tmpDir).filter((name) => name.startsWith('sessions.db.corrupt-')).length, 0);
+    });
+
+    it('takes over a stale recovery lock', () => {
+      dbManager.close();
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'not a sqlite database');
+      const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
+      fs.mkdirSync(lockDir);
+      const stale = new Date(Date.now() - 10_000);
+      fs.utimesSync(lockDir, stale, stale);
+
+      dbManager = new DatabaseManager(tmpDir, { recoveryLockStaleMs: 50 });
+      const db = dbManager.getDb();
+
+      assertQuickCheckOk(db as InstanceType<typeof Database>);
+      assert.strictEqual(fs.existsSync(lockDir), false);
+    });
+
+    it('cleans abandoned rebuild files and caps corrupt backup sets', () => {
+      dbManager.close();
+      for (let index = 0; index < 5; index++) {
+        fs.writeFileSync(path.join(tmpDir, `sessions.db.corrupt-20260701-${index}`), `backup-${index}`);
+      }
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db.rebuild-abandoned.tmp'), 'abandoned');
+      fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'not a sqlite database');
+
+      dbManager = new DatabaseManager(tmpDir, { recoveryBackupRetention: 3 });
+      dbManager.getDb();
+
+      const names = fs.readdirSync(tmpDir);
+      assert.strictEqual(names.some((name) => name.startsWith('sessions.db.rebuild-')), false);
+      assert.ok(names.filter((name) => name.startsWith('sessions.db.corrupt-')).length <= 3);
+    });
+
+    it('opens a circuit after repeated recovery attempts in the configured window', () => {
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      fs.writeFileSync(dbPath, 'first corrupt database');
+      dbManager = new DatabaseManager(tmpDir, {
+        recoveryCircuitLimit: 1,
+        recoveryCircuitWindowMs: 60_000,
+      });
+      dbManager.getDb();
+      dbManager.close();
+
+      fs.writeFileSync(dbPath, 'second corrupt database');
+      dbManager = new DatabaseManager(tmpDir, {
+        recoveryCircuitLimit: 1,
+        recoveryCircuitWindowMs: 60_000,
+      });
+
+      assert.throws(() => dbManager.getDb(), /recovery circuit is open/i);
+    });
+
     it('repairs recoverable corruption on open and preserves readable rows', () => {
       const db = dbManager.getDb();
       db.prepare(`
@@ -362,7 +435,7 @@ describe('DatabaseManager', () => {
 
       assert.strictEqual(result, 'ok');
       assert.strictEqual(attempts, 2);
-      assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'rebuilt');
+      assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'reused');
     });
   });
 
