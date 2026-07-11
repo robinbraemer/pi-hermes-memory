@@ -94,7 +94,7 @@ describe("registerSessionSearchTool", () => {
       indexSession(dbManager, {
         id: "oversized-session",
         project: "oversized-project",
-        cwd: "/work/oversized",
+        cwd: "/synthetic/oversized",
         startedAt: "2026-07-11T00:00:00.000Z",
         endedAt: null,
         messages: [{
@@ -133,7 +133,7 @@ describe("registerSessionSearchTool", () => {
       indexSession(dbManager, {
         id: "bounded-override-session",
         project: "bounded-project",
-        cwd: "/work/bounded",
+        cwd: "/synthetic/bounded",
         startedAt: "2026-07-11T00:00:00.000Z",
         endedAt: null,
         messages: [{
@@ -215,7 +215,7 @@ describe("registerSessionSearchTool", () => {
       indexSession(dbManager, {
         id: "zero-result-session",
         project: "zero-result-project",
-        cwd: "/work/zero-result",
+        cwd: "/synthetic/zero-result",
         startedAt: "2026-07-11T00:00:00.000Z",
         endedAt: null,
         messages: [{
@@ -343,7 +343,7 @@ describe("registerSessionSearchTool", () => {
       type: "message",
       timestamp: "2026-05-15T10:00:00.000Z",
       sessionId: "session-1",
-      cwd: "/work/project",
+      cwd: "/synthetic/project",
       message: { role: "user", content: "needle" },
     })}\n`);
 

@@ -282,6 +282,20 @@ Search behavior notes:
 - Multi-word natural-language queries are supported for both `memory_search` and `session_search`.
 - Exact phrases can be requested with quotes, for example `"memory search"`.
 - Advanced FTS queries with operators like `OR` still work when you need them.
+- FTS produces a widened candidate set, then results are ranked deterministically by lexical relevance and last-reference/message recency. Stable source and ID keys break remaining ties.
+- Session hits collapse to one result per session lineage. Known `cron` and `automation` sources are demoted rather than hidden, and project/source diversity prevents one source from filling the first result pass while still filling unused capacity.
+- Session results include a small query-anchored message window and non-overlapping opener/closer bookends. Empty or tool-call-only prose does not displace useful context.
+- Both tools return query-local snippets bounded to 1,200 characters by default (`snippetChars`: 100–4,000) and enforce a hard 50 KiB total response ceiling.
+- Compact refs identify results as `session:<session-id>/message:<message-id>` or `memory:<id>`. Details contain counts and opaque IDs, not duplicated snippets, working directories, or full stored content.
+
+To read one result more deeply without opening an unbounded browse mode, repeat the same query with its returned ref and a larger bounded snippet:
+
+```text
+session_search({ query: "same terms", sessionId: "<session-id>", limit: 1, snippetChars: 4_000 })
+memory_search({ query: "same terms", memoryId: 42, limit: 1, snippetChars: 4_000 })
+```
+
+Retrieval is local-only: ranking and snippet selection read the extension's SQLite store and do not call an LLM, network provider, embedding service, or telemetry endpoint.
 
 Session history is indexed automatically during the active session and on session shutdown. Startup also runs a bounded incremental backfill for missed sessions: it compares stored file metadata and only parses files without matching metadata, capped per startup. To bulk-import existing sessions manually:
 
@@ -289,7 +303,7 @@ Session history is indexed automatically during the active session and on sessio
 /memory-index-sessions
 ```
 
-For users who prefer source anchors over snippets, `sessionSearch.variant` can be set to `anchors`. In that opt-in mode, the same `session_search` tool reads session JSONL files directly and accepts a Markdown request with fields such as `from`, `to`, `cwd`, and `limit`, plus `all`, `any`, and `exclude` lists. It returns plain text with `count`, an optional `message`, and compact `path:startLine-endLine` style anchors with short reasons instead of summaries or previews.
+For users who prefer source anchors over snippets, `sessionSearch.variant` can be set to `anchors`. This opt-in mode is unchanged by hybrid retrieval: the same `session_search` tool reads session JSONL files directly and accepts a Markdown request with fields such as `from`, `to`, `cwd`, and `limit`, plus `all`, `any`, and `exclude` lists. It returns plain text with `count`, an optional `message`, and compact `path:startLine-endLine` style anchors with short reasons instead of summaries or previews.
 
 ### Extended Memory Store
 
@@ -299,6 +313,7 @@ This means:
 - Fresh `memory` tool writes become searchable immediately
 - Older Markdown entries can be backfilled with `/memory-sync-markdown`
 - SQLite search does **not** replace the core Markdown limit
+- Memory recall uses the same deterministic relevance ranking, source diversity, query-local snippet bounds, compact refs, and 50 KiB response ceiling as session recall
 
 This is the **hybrid memory architecture**:
 - **Core memory** (MEMORY.md/USER.md/failures.md): Human-readable, size-limited, searchable by default

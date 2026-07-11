@@ -27,7 +27,7 @@ describe('session-search', () => {
     return {
       id,
       project: 'test-project',
-      cwd: '/test',
+      cwd: '/synthetic/test',
       startedAt: '2026-05-03T00:00:00Z',
       endedAt: null,
       parentSessionId: null,
