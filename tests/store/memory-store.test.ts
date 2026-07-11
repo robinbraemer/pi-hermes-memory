@@ -1057,6 +1057,89 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       }
     });
 
+    it("does not commit a failed add during a later mutation", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing`);
+
+      const originalSave = (store as any).saveToDisk.bind(store);
+      let failNextSave = true;
+      (store as any).saveToDisk = async (target: "memory") => {
+        if (failNextSave) {
+          failNextSave = false;
+          throw new Error("injected add save failure");
+        }
+        await originalSave(target);
+      };
+
+      await assert.rejects(
+        store.add("memory", `${TEST_MARKER} failed add`),
+        /injected add save failure/,
+      );
+      const result = await store.add("memory", `${TEST_MARKER} later add`);
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /existing/);
+      assert.match(raw, /later add/);
+      assert.doesNotMatch(raw, /failed add/);
+    });
+
+    it("does not commit a failed replacement during a later mutation", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} original entry`);
+
+      const originalSave = (store as any).saveToDisk.bind(store);
+      let failNextSave = true;
+      (store as any).saveToDisk = async (target: "memory") => {
+        if (failNextSave) {
+          failNextSave = false;
+          throw new Error("injected replace save failure");
+        }
+        await originalSave(target);
+      };
+
+      await assert.rejects(
+        store.replace("memory", `${TEST_MARKER} original entry`, `${TEST_MARKER} failed replacement`),
+        /injected replace save failure/,
+      );
+      const result = await store.add("memory", `${TEST_MARKER} later add`);
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /original entry/);
+      assert.match(raw, /later add/);
+      assert.doesNotMatch(raw, /failed replacement/);
+    });
+
+    it("does not commit a failed removal during a later mutation", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} retained entry`);
+
+      const originalSave = (store as any).saveToDisk.bind(store);
+      let failNextSave = true;
+      (store as any).saveToDisk = async (target: "memory") => {
+        if (failNextSave) {
+          failNextSave = false;
+          throw new Error("injected remove save failure");
+        }
+        await originalSave(target);
+      };
+
+      await assert.rejects(
+        store.remove("memory", `${TEST_MARKER} retained entry`),
+        /injected remove save failure/,
+      );
+      const result = await store.add("memory", `${TEST_MARKER} later add`);
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /retained entry/);
+      assert.match(raw, /later add/);
+    });
+
     it("prunes expired recovery files but retains recently active ones", async () => {
       const expiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-expired`);
       const activePath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-active`);

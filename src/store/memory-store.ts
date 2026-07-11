@@ -597,11 +597,12 @@ export class MemoryStore {
           }
           return result;
         } catch (error) {
-          if (!(error instanceof ExternalMemoryWriteConflict)) throw error;
           const filePath = this.pathFor(target);
+          delete this.fileFingerprints[filePath];
           const state = await this.readFileState(filePath);
           this.setEntries(target, [...new Set(state.entries)]);
           this.fileFingerprints[filePath] = state.fingerprint;
+          if (!(error instanceof ExternalMemoryWriteConflict)) throw error;
           if (attempt >= MAX_EXTERNAL_WRITE_RETRIES) {
             return {
               success: false,
