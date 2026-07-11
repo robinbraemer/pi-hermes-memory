@@ -7,7 +7,7 @@
  * - Two stores: MEMORY.md (agent notes) and USER.md (user profile)
  * - §-delimited entries with character limits
  * - Frozen snapshot at load time for system prompt (preserves Pi's prompt cache)
- * - Atomic writes via temp file + fs.rename()
+ * - Guarded publication via a temporary inode, hard links, and recovery rename
  * - Content scanning before any write
  */
 
@@ -747,10 +747,9 @@ export class MemoryStore {
   }
 
   /**
-   * Atomic write: temp file + fs.rename().
-   * Creates temp files in the same directory as the target to avoid
-   * cross-device rename errors (EXDEV) when os.tmpdir() is on a different
-   * drive than the memory directory (common on Windows).
+   * Guarded publication that preserves the displaced inode for recovery.
+   * Temporary files live beside the target so links and rename stay on one
+   * filesystem (important when os.tmpdir() is on another drive on Windows).
    */
   private async saveToDisk(target: "memory" | "user" | "failure"): Promise<void> {
     const filePath = await this.resolveStoragePath(target);

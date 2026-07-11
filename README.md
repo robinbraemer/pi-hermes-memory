@@ -299,7 +299,7 @@ The extension keeps Markdown memory as the human-readable source of truth, and m
 
 Before each mutation, the extension compares the exact on-disk content with its loaded state. Manual edits and writes from other Pi processes are incorporated instead of being overwritten, including same-size rewrites.
 
-Markdown overwrites retain displaced originals at stable recovery paths for seven days so late writes through an already-open editor handle remain recoverable. Grace-period generations remain reachable even when they temporarily exceed artifact caps. After that finite grace period, each original becomes a durable retired snapshot; later writes prune retired snapshots older than 30 days and cap each Markdown target at 32 files or 64 MiB, whichever limit is reached first.
+Markdown overwrites preserve displaced originals as recovery artifacts so late writes through an already-open editor handle can remain recoverable. A recent active generation and any generation referenced by an interrupted publication are protected. Active, retired, and conflict artifacts are otherwise bounded independently to 32 files or 64 MiB per Markdown target, with recent generations prioritized and retired artifacts eligible for pruning after 30 days.
 
 This means:
 - Fresh `memory` tool writes become searchable immediately
@@ -536,7 +536,7 @@ If SQLite reports corruption, recovery is serialized so only one process rebuild
 ## Known Limitations
 
 - **`§` delimiter**: Memory entries are separated by `§` (section sign). If an entry naturally contains `§`, it will be split incorrectly on reload. This is rare in English text but possible. [Hermes uses the same delimiter.]
-- **Background review cost**: Each review cycle costs one full LLM API call via a child `pi -p` process. Correction detection and explicit skill saves can add additional calls when the agent decides they are worth it.
+- **Background review cost**: Each review cycle costs one LLM API call through the in-process transport by default; transport failures may retry through a child `pi -p` process. Correction saves, session flushes, and consolidation can add calls when triggered.
 - **Session search requires indexing**: Past sessions must be indexed before they're searchable. Run `/memory-index-sessions` to bulk-import, or let the extension auto-index on session shutdown.
 - **Older Markdown memories may need reconciliation**: If you saved memories before the SQLite mirror existed or search looks stale, run `/memory-sync-markdown`; it also removes mirror rows absent from Markdown.
 - **Core memory limits still apply**: SQLite search mirroring does not bypass the 5,000-char core Markdown limit. If consolidation cannot free space, the write fails instead of becoming SQLite-only memory invisibly.
