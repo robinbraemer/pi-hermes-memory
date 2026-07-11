@@ -30,6 +30,8 @@ describe('session-search', () => {
       cwd: '/test',
       startedAt: '2026-05-03T00:00:00Z',
       endedAt: null,
+      parentSessionId: null,
+      source: 'interactive',
       messages: [
         { id: `${id}-msg-1`, role: 'user', content: 'How do I set up Prisma with PostgreSQL?', timestamp: '2026-05-03T00:01:00Z' },
         { id: `${id}-msg-2`, role: 'assistant', content: 'To set up Prisma, install the package and run prisma init. Then configure your DATABASE_URL in .env', timestamp: '2026-05-03T00:01:30Z' },
@@ -43,6 +45,215 @@ describe('session-search', () => {
   }
 
   describe('searchSessions', () => {
+    it('widens the scan and demotes synthetic automation without excluding it', () => {
+      for (let index = 0; index < 59; index++) {
+        indexSession(dbManager, createTestSession({
+          id: `synthetic-cron-${String(index).padStart(2, '0')}`,
+          project: 'synthetic-automation',
+          source: 'cron',
+          messages: [{
+            id: `synthetic-cron-message-${String(index).padStart(2, '0')}`,
+            role: 'assistant',
+            content: 'synthetic retrieval needle',
+            timestamp: `2026-02-${String((index % 27) + 1).padStart(2, '0')}T00:00:00Z`,
+          }],
+        }));
+      }
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-interactive',
+        project: 'synthetic-human',
+        source: 'interactive',
+        messages: [{
+          id: 'synthetic-interactive-message',
+          role: 'assistant',
+          content: 'synthetic retrieval needle',
+          timestamp: '2026-01-01T00:00:00Z',
+        }],
+      }));
+
+      const results = searchSessions(dbManager, 'synthetic retrieval needle', { limit: 3 });
+
+      assert.strictEqual(results[0].sessionId, 'synthetic-interactive');
+      assert.ok(results.some((result) => result.source === 'cron'));
+    });
+
+    it('returns automation when it is the only synthetic match', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-cron-only',
+        source: 'automation',
+        messages: [{
+          id: 'synthetic-cron-only-message',
+          role: 'assistant',
+          content: 'synthetic automation only needle',
+          timestamp: '2026-01-01T00:00:00Z',
+        }],
+      }));
+
+      const results = searchSessions(dbManager, 'synthetic automation only needle');
+
+      assert.strictEqual(results.length, 1);
+      assert.strictEqual(results[0].source, 'automation');
+    });
+
+    it('collapses root and child hits while retaining the winning child anchor', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-root',
+        messages: [{ id: 'synthetic-root-message', role: 'user', content: 'synthetic lineage needle', timestamp: '2026-01-01T00:00:00Z' }],
+      }));
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-child',
+        parentSessionId: 'synthetic-root',
+        messages: [{ id: 'synthetic-child-message', role: 'assistant', content: 'synthetic lineage needle', timestamp: '2026-02-01T00:00:00Z' }],
+      }));
+
+      const results = searchSessions(dbManager, 'synthetic lineage needle');
+
+      assert.strictEqual(results.length, 1);
+      assert.strictEqual(results[0].rootSessionId, 'synthetic-root');
+      assert.strictEqual(results[0].sessionId, 'synthetic-child');
+      assert.strictEqual(results[0].messageId, 'synthetic-child-message');
+    });
+
+    it('collapses parent cycles deterministically', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-cycle-a',
+        messages: [{ id: 'synthetic-cycle-a-message', role: 'user', content: 'synthetic cycle needle', timestamp: '2026-01-01T00:00:00Z' }],
+      }));
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-cycle-b',
+        parentSessionId: 'synthetic-cycle-a',
+        messages: [{ id: 'synthetic-cycle-b-message', role: 'assistant', content: 'synthetic cycle needle', timestamp: '2026-02-01T00:00:00Z' }],
+      }));
+      indexSession(dbManager, createTestSession({ id: 'synthetic-cycle-a', parentSessionId: 'synthetic-cycle-b' }));
+
+      const first = searchSessions(dbManager, 'synthetic cycle needle');
+      const second = searchSessions(dbManager, 'synthetic cycle needle');
+
+      assert.deepStrictEqual(first, second);
+      assert.strictEqual(first.length, 1);
+      assert.strictEqual(first[0].rootSessionId, 'synthetic-cycle-a');
+    });
+
+    it('ranks exact term coverage ahead of a newer fallback hit', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-exact',
+        messages: [{ id: 'synthetic-exact-message', role: 'assistant', content: 'synthetic alpha beta', timestamp: '2026-01-01T00:00:00Z' }],
+      }));
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-fallback',
+        messages: [{ id: 'synthetic-fallback-message', role: 'assistant', content: 'synthetic alpha', timestamp: '2026-03-01T00:00:00Z' }],
+      }));
+
+      const results = searchSessions(dbManager, 'alpha beta');
+
+      assert.deepStrictEqual(results.map((result) => result.sessionId), ['synthetic-exact', 'synthetic-fallback']);
+      assert.deepStrictEqual(results.map((result) => result.matchMode), ['exact', 'fallback']);
+    });
+
+    it('breaks exact ties by timestamp, project, then message id', () => {
+      const fixtures = [
+        ['synthetic-tie-old', 'project-a', 'synthetic-tie-old-message', '2026-01-01T00:00:00Z'],
+        ['synthetic-tie-b', 'project-b', 'synthetic-tie-b-message', '2026-02-01T00:00:00Z'],
+        ['synthetic-tie-a2', 'project-a', 'synthetic-tie-message-b', '2026-02-01T00:00:00Z'],
+        ['synthetic-tie-a1', 'project-a', 'synthetic-tie-message-a', '2026-02-01T00:00:00Z'],
+      ] as const;
+      for (const [id, project, messageId, timestamp] of fixtures) {
+        indexSession(dbManager, createTestSession({
+          id,
+          project,
+          messages: [{ id: messageId, role: 'assistant', content: 'synthetic tie needle', timestamp }],
+        }));
+      }
+
+      const results = searchSessions(dbManager, 'synthetic tie needle');
+
+      assert.deepStrictEqual(results.map((result) => result.messageId), [
+        'synthetic-tie-message-a',
+        'synthetic-tie-message-b',
+        'synthetic-tie-b-message',
+        'synthetic-tie-old-message',
+      ]);
+    });
+
+    it('diversifies projects in the first pass and then fills capacity', () => {
+      for (let index = 0; index < 3; index++) {
+        indexSession(dbManager, createTestSession({
+          id: `synthetic-project-a-${index}`,
+          project: 'project-a',
+          messages: [{
+            id: `synthetic-project-a-message-${index}`,
+            role: 'assistant',
+            content: 'synthetic diversity needle',
+            timestamp: `2026-03-0${index + 1}T00:00:00Z`,
+          }],
+        }));
+      }
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-project-b',
+        project: 'project-b',
+        messages: [{ id: 'synthetic-project-b-message', role: 'assistant', content: 'synthetic diversity needle', timestamp: '2026-01-01T00:00:00Z' }],
+      }));
+
+      const diverse = searchSessions(dbManager, 'synthetic diversity needle', { limit: 3 });
+      const filtered = searchSessions(dbManager, 'synthetic diversity needle', { limit: 3, project: 'project-a' });
+
+      assert.strictEqual(diverse.length, 3);
+      assert.ok(diverse.some((result) => result.project === 'project-b'));
+      assert.strictEqual(filtered.length, 3);
+      assert.ok(filtered.every((result) => result.project === 'project-a'));
+    });
+
+    it('filters by the owning session id', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-session-filter-a',
+        messages: [{ id: 'synthetic-session-filter-a-message', role: 'user', content: 'synthetic session filter needle', timestamp: '2026-01-01T00:00:00Z' }],
+      }));
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-session-filter-b',
+        messages: [{ id: 'synthetic-session-filter-b-message', role: 'user', content: 'synthetic session filter needle', timestamp: '2026-02-01T00:00:00Z' }],
+      }));
+
+      const results = searchSessions(dbManager, 'synthetic session filter needle', { sessionId: 'synthetic-session-filter-a' });
+
+      assert.deepStrictEqual(results.map((result) => result.sessionId), ['synthetic-session-filter-a']);
+    });
+
+    it('returns an ordered bounded local window and non-overlapping bookends', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-context',
+        messages: [
+          { id: 'synthetic-context-1', role: 'user', content: 'synthetic opener', timestamp: '2026-01-01T00:00:00Z' },
+          { id: 'synthetic-context-2', role: 'assistant', content: 'synthetic earlier prose', timestamp: '2026-01-01T00:01:00Z' },
+          { id: 'synthetic-context-3', role: 'system', content: 'synthetic system prose', timestamp: '2026-01-01T00:02:00Z' },
+          { id: 'synthetic-context-4', role: 'user', content: 'synthetic previous prose', timestamp: '2026-01-01T00:03:00Z' },
+          { id: 'synthetic-context-5', role: 'assistant', content: `synthetic ${'x'.repeat(500)} context needle ${'y'.repeat(500)}`, timestamp: '2026-01-01T00:04:00Z' },
+          { id: 'synthetic-context-6', role: 'assistant', content: 'synthetic next prose', timestamp: '2026-01-01T00:05:00Z' },
+          { id: 'synthetic-context-7', role: 'user', content: 'synthetic closer', timestamp: '2026-01-01T00:06:00Z' },
+          { id: 'synthetic-context-8', role: 'assistant', content: '', timestamp: '2026-01-01T00:07:00Z' },
+        ],
+      }));
+
+      const [result] = searchSessions(dbManager, 'context needle', { snippetChars: 120 });
+
+      assert.match(result.snippet, /context needle/);
+      assert.ok(result.snippet.length <= 120);
+      assert.deepStrictEqual(result.window.map((message) => message.id), [
+        'synthetic-context-4',
+        'synthetic-context-5',
+        'synthetic-context-6',
+      ]);
+      assert.deepStrictEqual(result.bookendStart.map((message) => message.id), ['synthetic-context-1']);
+      assert.deepStrictEqual(result.bookendEnd.map((message) => message.id), ['synthetic-context-7']);
+      assert.strictEqual(result.messagesBefore, 2);
+      assert.strictEqual(result.messagesAfter, 1);
+      const ids = [result.window, result.bookendStart, result.bookendEnd].flat().map((message) => message.id);
+      assert.strictEqual(new Set(ids).size, ids.length);
+      assert.ok(result.window.every((message) => message.role === 'user' || message.role === 'assistant'));
+      assert.strictEqual(result.window.find((message) => message.anchor)?.id, 'synthetic-context-5');
+      assert.ok([...result.window, ...result.bookendStart, ...result.bookendEnd]
+        .every((message) => message.snippet.length <= (message.anchor ? 120 : 240)));
+    });
+
     it('should find messages matching a search query', () => {
       indexSession(dbManager, createTestSession());
 
@@ -137,7 +348,14 @@ describe('session-search', () => {
     });
 
     it('should preserve valid operator queries', () => {
-      indexSession(dbManager, createTestSession());
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-operator-prisma',
+        messages: [{ id: 'synthetic-operator-prisma-message', role: 'user', content: 'synthetic Prisma operator hit', timestamp: '2026-01-01T00:00:00Z' }],
+      }));
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-operator-gpu',
+        messages: [{ id: 'synthetic-operator-gpu-message', role: 'user', content: 'synthetic gpu timeout issue operator hit', timestamp: '2026-01-02T00:00:00Z' }],
+      }));
 
       const results = searchSessions(dbManager, 'Prisma OR gpu');
       assert.ok(results.length >= 2);
