@@ -58,6 +58,27 @@ describe('AtomicLockCoordinator', () => {
     }
   });
 
+  it('allows shared leases together and excludes them from exclusive leases', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    try {
+      const coordinator = new AtomicLockCoordinator(path.join(tmpDir, 'locks.sqlite'));
+      const first = coordinator.tryAcquireShared('database-access', { staleMs: 0 });
+      const second = coordinator.tryAcquireShared('database-access', { staleMs: 0 });
+      assert.ok(first);
+      assert.ok(second);
+      assert.strictEqual(coordinator.tryAcquireExclusive('database-access', { staleMs: 0 }), null);
+
+      first.release();
+      second.release();
+      const exclusive = coordinator.tryAcquireExclusive('database-access', { staleMs: 0 });
+      assert.ok(exclusive);
+      assert.strictEqual(coordinator.tryAcquireShared('database-access', { staleMs: 0 }), null);
+      exclusive.release();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('takes over a reused PID without taking over the original incarnation', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
     try {

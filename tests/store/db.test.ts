@@ -352,6 +352,44 @@ describe('DatabaseManager', () => {
   });
 
   describe('corruption recovery', () => {
+    it('acquires database access before the recovery lease', () => {
+      dbManager.getDb();
+      dbManager.close();
+      const events: string[] = [];
+      const prototype = AtomicLockCoordinator.prototype as any;
+      const originalTryAcquire = prototype.tryAcquire;
+      prototype.tryAcquire = function (key: string, options: unknown) {
+        if (key.startsWith('recovery:')) events.push('recovery');
+        return originalTryAcquire.call(this, key, options);
+      };
+      (dbManager as any).acquireDatabaseAccessLease = () => {
+        events.push('access');
+        return { token: 'test-access', release: () => {} };
+      };
+      (dbManager as any).currentDatabaseIsHealthy = () => true;
+
+      try {
+        assert.strictEqual(dbManager.recoverFromCorruption(corruptSqliteError()).strategy, 'reused');
+        assert.deepStrictEqual(events.slice(0, 2), ['access', 'recovery']);
+      } finally {
+        prototype.tryAcquire = originalTryAcquire;
+      }
+    });
+
+    it('allows another manager to read during a read transaction', () => {
+      const firstDb = dbManager.getDb();
+      const secondManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 0 });
+      const secondDb = secondManager.getDb();
+      try {
+        const read = firstDb.transaction?.(() => {
+          return secondDb.prepare('SELECT COUNT(*) AS count FROM sessions').get();
+        });
+        assert.deepStrictEqual(read?.(), { count: 0 });
+      } finally {
+        secondManager.close();
+      }
+    });
+
     it('waits for a recovery owner and reuses the healthy database it leaves behind', () => {
       dbManager.getDb();
       dbManager.close();

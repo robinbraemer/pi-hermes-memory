@@ -135,14 +135,7 @@ export class AtomicLockCoordinator {
           `).run(key, token, this.pid, this.incarnation, now);
           acquired = true;
         } else {
-          const observedIncarnation = this.probeIncarnation(owner.pid);
-          const alive = observedIncarnation !== null || processIsAlive(owner.pid);
-          const sameIncarnation = alive
-            && owner.incarnation !== null
-            && observedIncarnation !== null
-            && owner.incarnation === observedIncarnation;
-          const unknownIncarnation = alive && (owner.incarnation === null || observedIncarnation === null);
-          if (!sameIncarnation && !unknownIncarnation) {
+          if (!this.ownerIsActive(owner.pid, owner.incarnation)) {
             db.prepare(`
               UPDATE locks
               SET token = ?, pid = ?, incarnation = ?, acquired_at = ?
@@ -168,6 +161,78 @@ export class AtomicLockCoordinator {
     };
   }
 
+  tryAcquireShared(key: string, options: AtomicLockOptions): AtomicLockLease | null {
+    this.retryPendingReleases(key);
+    const gate = this.tryAcquire(this.readWriteGateKey(key), options);
+    if (!gate) return null;
+    const token = randomUUID();
+    let db: DatabaseLike;
+    try {
+      db = this.open();
+    } catch (error) {
+      gate.release();
+      throw error;
+    }
+    try {
+      db.prepare(`
+        INSERT INTO read_locks (lock_key, token, pid, incarnation, acquired_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(key, token, this.pid, this.incarnation, Date.now());
+    } finally {
+      db.close();
+      gate.release();
+    }
+    return {
+      token,
+      release: () => this.releaseShared(key, token),
+    };
+  }
+
+  tryAcquireExclusive(key: string, options: AtomicLockOptions): AtomicLockLease | null {
+    this.retryPendingReleases(key);
+    const gate = this.tryAcquire(this.readWriteGateKey(key), options);
+    if (!gate) return null;
+    let db: DatabaseLike;
+    try {
+      db = this.open();
+    } catch (error) {
+      gate.release();
+      throw error;
+    }
+    let hasReaders = false;
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const readers = db.prepare(`
+          SELECT token, pid, incarnation
+          FROM read_locks
+          WHERE lock_key = ?
+        `).all(key) as Array<{ token: string; pid: number; incarnation: string | null }>;
+        for (const reader of readers) {
+          if (!this.ownerIsActive(reader.pid, reader.incarnation)) {
+            db.prepare('DELETE FROM read_locks WHERE lock_key = ? AND token = ?').run(key, reader.token);
+          } else {
+            hasReaders = true;
+          }
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch {}
+        throw error;
+      }
+    } catch (error) {
+      gate.release();
+      throw error;
+    } finally {
+      db.close();
+    }
+    if (hasReaders) {
+      gate.release();
+      return null;
+    }
+    return gate;
+  }
+
   release(key: string, token: string): void {
     const pendingKey = this.pendingReleaseKey(key, token);
     if (this.tryDeleteOwnedLock(key, token)) {
@@ -177,6 +242,22 @@ export class AtomicLockCoordinator {
     if (pendingReleases.has(pendingKey)) return;
     const pending: PendingRelease = {
       attempt: () => this.tryDeleteOwnedLock(key, token),
+      deadline: Date.now() + RELEASE_RETRY_WINDOW_MS,
+      nextDelayMs: RELEASE_RETRY_INITIAL_DELAY_MS,
+    };
+    pendingReleases.set(pendingKey, pending);
+    this.schedulePendingRelease(pendingKey, pending);
+  }
+
+  private releaseShared(key: string, token: string): void {
+    const pendingKey = this.pendingReleaseKey(key, token);
+    if (this.tryDeleteOwnedReadLock(key, token)) {
+      this.clearPendingRelease(pendingKey);
+      return;
+    }
+    if (pendingReleases.has(pendingKey)) return;
+    const pending: PendingRelease = {
+      attempt: () => this.tryDeleteOwnedReadLock(key, token),
       deadline: Date.now() + RELEASE_RETRY_WINDOW_MS,
       nextDelayMs: RELEASE_RETRY_INITIAL_DELAY_MS,
     };
@@ -202,6 +283,37 @@ export class AtomicLockCoordinator {
     } finally {
       db.close();
     }
+  }
+
+  private tryDeleteOwnedReadLock(key: string, token: string): boolean {
+    for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt++) {
+      try {
+        const db = this.open();
+        try {
+          db.prepare('DELETE FROM read_locks WHERE lock_key = ? AND token = ?').run(key, token);
+        } finally {
+          db.close();
+        }
+        return true;
+      } catch {
+      }
+    }
+    return false;
+  }
+
+  private ownerIsActive(pid: number, incarnation: string | null): boolean {
+    const observedIncarnation = this.probeIncarnation(pid);
+    const alive = observedIncarnation !== null || processIsAlive(pid);
+    const sameIncarnation = alive
+      && incarnation !== null
+      && observedIncarnation !== null
+      && incarnation === observedIncarnation;
+    const unknownIncarnation = alive && (incarnation === null || observedIncarnation === null);
+    return sameIncarnation || unknownIncarnation;
+  }
+
+  private readWriteGateKey(key: string): string {
+    return `read-write-gate:${key}`;
   }
 
   private retryPendingReleases(key: string): void {
@@ -259,6 +371,14 @@ export class AtomicLockCoordinator {
           incarnation TEXT,
           acquired_at INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS read_locks (
+          lock_key TEXT NOT NULL,
+          token TEXT PRIMARY KEY,
+          pid INTEGER NOT NULL,
+          incarnation TEXT,
+          acquired_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_read_locks_key ON read_locks(lock_key);
       `);
       const columns = db.prepare('PRAGMA table_info(locks)').all() as Array<{ name: string }>;
       if (!columns.some(({ name }) => name === 'incarnation')) {

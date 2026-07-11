@@ -141,12 +141,14 @@ function loadDatabaseCtor(): DatabaseCtor {
 }
 
 const Database = loadDatabaseCtor();
+type DatabaseAccessMode = 'shared' | 'exclusive';
 
 export class DatabaseManager {
   private db: DatabaseLike | null = null;
   private dbFacade: DatabaseLike | null = null;
   private dbIdentity: DatabaseFileIdentity | null = null;
   private databaseAccessDepth = 0;
+  private databaseAccessMode: DatabaseAccessMode | null = null;
   private databaseInitialized = false;
   private readonly displayDbPath: string;
   private canonicalDbPath: string | null = null;
@@ -203,7 +205,11 @@ export class DatabaseManager {
    * Get the database instance. Creates/opens on first call.
    */
   getDb(): DatabaseLike {
-    this.withDatabaseAccess(() => this.ensureCurrentDb());
+    if (this.databaseAccessDepth > 0) {
+      this.ensureCurrentDb();
+    } else {
+      this.withDatabaseAccess(() => this.ensureCurrentDb(), 'exclusive');
+    }
     if (!this.dbFacade) this.dbFacade = this.createDatabaseFacade();
     return this.dbFacade;
   }
@@ -269,14 +275,21 @@ export class DatabaseManager {
     };
   }
 
-  private withDatabaseAccess<T>(operation: () => T): T {
-    if (this.databaseAccessDepth > 0) return operation();
-    const lease = this.acquireDatabaseAccessLease();
+  private withDatabaseAccess<T>(operation: () => T, mode: DatabaseAccessMode = 'shared'): T {
+    if (this.databaseAccessDepth > 0) {
+      if (this.databaseAccessMode === 'shared' && mode === 'exclusive') {
+        throw new Error(`Cannot upgrade active SQLite database access for ${this.displayDbPath}`);
+      }
+      return operation();
+    }
+    const lease = this.acquireDatabaseAccessLease(mode);
+    this.databaseAccessMode = mode;
     this.databaseAccessDepth++;
     try {
       return operation();
     } finally {
       this.databaseAccessDepth--;
+      this.databaseAccessMode = null;
       this.closePhysicalConnection();
       lease.release();
     }
@@ -288,13 +301,15 @@ export class DatabaseManager {
     this.dbIdentity = null;
   }
 
-  private acquireDatabaseAccessLease(): AtomicLockLease {
+  private acquireDatabaseAccessLease(mode: DatabaseAccessMode): AtomicLockLease {
     const coordinator = new AtomicLockCoordinator(path.join(path.dirname(this.dbPath), '.pi-hermes-locks.sqlite'));
     const lockKey = `database-access:${this.dbPath}`;
     const waitMs = Math.max(0, this.recoveryOptions.recoveryLockWaitMs);
     const deadline = Date.now() + waitMs;
     while (true) {
-      const lease = coordinator.tryAcquire(lockKey, { staleMs: this.recoveryOptions.recoveryLockStaleMs });
+      const lease = mode === 'exclusive'
+        ? coordinator.tryAcquireExclusive(lockKey, { staleMs: this.recoveryOptions.recoveryLockStaleMs })
+        : coordinator.tryAcquireShared(lockKey, { staleMs: this.recoveryOptions.recoveryLockStaleMs });
       if (lease) return lease;
       if (Date.now() >= deadline) {
         throw new Error(`SQLite database access timed out after ${waitMs}ms for ${this.displayDbPath}`);
@@ -471,6 +486,13 @@ export class DatabaseManager {
   }
 
   private recoverDatabaseFile(cause: unknown, verify: () => void): DatabaseRecoveryResult {
+    return this.withDatabaseAccess(
+      () => this.recoverDatabaseFileWithExclusiveAccess(cause, verify),
+      'exclusive',
+    );
+  }
+
+  private recoverDatabaseFileWithExclusiveAccess(cause: unknown, verify: () => void): DatabaseRecoveryResult {
     const coordinator = new AtomicLockCoordinator(path.join(path.dirname(this.dbPath), '.pi-hermes-locks.sqlite'));
     const lockKey = `recovery:${this.dbPath}`;
     const deadline = Date.now() + Math.max(0, this.recoveryOptions.recoveryLockWaitMs);
@@ -489,7 +511,7 @@ export class DatabaseManager {
       }
 
       try {
-        return this.withDatabaseAccess(() => this.recoverDatabaseFileExclusively(cause, verify));
+        return this.recoverDatabaseFileExclusively(cause, verify);
       } finally {
         lease.release();
       }
