@@ -30,7 +30,7 @@ pi install npm:pi-hermes-memory
 # Index your past sessions (one-time)
 /memory-index-sessions
 
-# Backfill older Markdown memories into SQLite search (optional)
+# Reconcile older Markdown memories with SQLite search (optional)
 /memory-sync-markdown
 
 # Learn how to use it
@@ -283,6 +283,8 @@ Search behavior notes:
 - Exact phrases can be requested with quotes, for example `"memory search"`.
 - Advanced FTS queries with operators like `OR` still work when you need them.
 
+Legacy `session_search` results default to 1,200 characters per snippet and accept `snippetChars` from 100 to 4,000. Total output is capped at 50 KiB, and truncated results report their original character count so the agent can refine the query.
+
 Session history is indexed automatically during the active session and on session shutdown. Startup also runs a bounded incremental backfill for missed sessions: it compares stored file metadata and only parses files without matching metadata, capped per startup. To bulk-import existing sessions manually:
 
 ```
@@ -294,6 +296,8 @@ For users who prefer source anchors over snippets, `sessionSearch.variant` can b
 ### Extended Memory Store
 
 The extension keeps Markdown memory as the human-readable source of truth, and mirrors successful writes into the SQLite-backed search store used by `memory_search`.
+
+Before each mutation, the extension compares the exact on-disk content with its loaded state. Manual edits and writes from other Pi processes are incorporated instead of being overwritten, including same-size rewrites.
 
 Markdown overwrites retain displaced originals at stable recovery paths for seven days so late writes through an already-open editor handle remain recoverable. Grace-period generations remain reachable even when they temporarily exceed artifact caps. After that finite grace period, each original becomes a durable retired snapshot; later writes prune retired snapshots older than 30 days and cap each Markdown target at 32 files or 64 MiB, whichever limit is reached first.
 
@@ -526,6 +530,8 @@ These are plain markdown files. You can read and edit them directly if you want 
 If you are upgrading from a version that stored project memory directly at `~/.pi/agent/<project>/MEMORY.md`, the extension copies or merges those entries into `~/.pi/agent/projects-memory/<project>/MEMORY.md` on startup. The old folders are left in place as a backup.
 
 The `sessions.db` SQLite database stores session history and extended memory entries. It's searchable via FTS5 full-text search.
+
+If SQLite reports corruption, recovery is serialized so only one process rebuilds the database while others reuse its result. Recoverable rows are salvaged when possible, corrupt backup sets are capped at three, and a circuit breaker stops repeated rebuild attempts after three failures within five minutes.
 
 ## Known Limitations
 
