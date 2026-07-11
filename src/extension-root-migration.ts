@@ -90,7 +90,13 @@ async function databaseFilesAt(root: string): Promise<string[]> {
 }
 
 async function databaseRetirementArtifacts(legacyRoot: string): Promise<string[]> {
-  const entries = await fs.readdir(legacyRoot, { withFileTypes: true });
+  let entries: Array<{ isDirectory: () => boolean; name: string }>;
+  try {
+    entries = await fs.readdir(legacyRoot, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
   const directories: string[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith(".sessions-db-retirement-")) continue;
@@ -615,7 +621,10 @@ async function migrateDatabaseGeneration(
   let stagingArtifacts = hadPendingMarker
     ? await databaseStagingArtifacts(targetRoot)
     : [];
-  if (hadPendingMarker && targetNames.length === 0 && await recoverOwnedPreparingMigration(
+  if (hadPendingMarker
+    && sourceNames.includes("sessions.db")
+    && targetNames.length === 0
+    && await recoverOwnedPreparingMigration(
     legacyRoot,
     targetRoot,
     pendingMarker,
@@ -996,7 +1005,9 @@ export async function migrateExtensionRoot(
   };
 
   if (path.resolve(legacyRoot) === path.resolve(targetRoot)) return result;
-  if (!existsSync(legacyRoot)) return result;
+  const legacyRootExists = existsSync(legacyRoot);
+  const pendingMarkerExists = existsSync(path.join(targetRoot, DATABASE_MIGRATION_PENDING_FILE));
+  if (!legacyRootExists && !pendingMarkerExists) return result;
 
   await fs.mkdir(targetRoot, { recursive: true });
   await migrateDatabaseGeneration(
@@ -1009,7 +1020,9 @@ export async function migrateExtensionRoot(
     options.onDatabaseBackupProgress,
   );
   if (result.criticalFailures.some((failure) => failure.name === "sessions.db")) return result;
-  await moveDirContents(legacyRoot, targetRoot, result, options.moveFile ?? moveFileSafe);
+  if (existsSync(legacyRoot)) {
+    await moveDirContents(legacyRoot, targetRoot, result, options.moveFile ?? moveFileSafe);
+  }
 
   try {
     const remaining = await fs.readdir(legacyRoot);

@@ -226,13 +226,34 @@ describe('memory sqlite sync + markdown backfill', () => {
     );
   });
 
+  it('recovers a file-symlinked Markdown publication through its canonical target', { skip: process.platform === 'win32' }, async () => {
+    const memoryFile = path.join(globalDir, 'MEMORY.md');
+    const canonicalDir = path.join(tmpDir, 'canonical-memory');
+    const canonicalFile = path.join(canonicalDir, 'MEMORY.md');
+    fs.mkdirSync(canonicalDir, { recursive: true });
+    fs.symlinkSync(canonicalFile, memoryFile, 'file');
+    const recoveryName = `.MEMORY.md.recovery-${Date.now()}-00000000-0000-4000-8000-000000000000`;
+    fs.writeFileSync(path.join(canonicalDir, recoveryName), 'authoritative recovered memory', 'utf-8');
+    fs.writeFileSync(path.join(canonicalDir, '.MEMORY.md.publication-pending'), recoveryName, 'utf-8');
+    addMemory(dbManager, 'authoritative recovered memory');
+
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(fs.readFileSync(canonicalFile, 'utf-8'), 'authoritative recovered memory');
+    assert.strictEqual(counters.removed, 0);
+    assert.deepStrictEqual(
+      getMemories(dbManager, { target: 'memory', project: null }).map((entry) => entry.content),
+      ['authoritative recovered memory'],
+    );
+  });
+
   it('waits for the canonical Markdown mutation before reading and reconciling', async () => {
     const memoryFile = path.join(globalDir, 'MEMORY.md');
     fs.writeFileSync(memoryFile, 'stale memory', 'utf-8');
     addMemory(dbManager, 'stale memory');
 
     const identity = fs.realpathSync(memoryFile);
-    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(path.dirname(identity)), '.pi-hermes-locks.sqlite'));
+    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(identity), '.pi-hermes-locks.sqlite'));
     const lease = coordinator.tryAcquire(`mutation:${identity}`, { staleMs: 300_000 });
     assert.ok(lease);
 

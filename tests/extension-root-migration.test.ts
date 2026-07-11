@@ -595,6 +595,48 @@ describe("migrateExtensionRoot", () => {
     }
   });
 
+  it("finishes a verified published migration when the legacy root is absent", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(target, { recursive: true });
+    const targetDb = path.join(target, "sessions.db");
+    const published = new Database(targetDb);
+    published.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('published generation')");
+    published.close();
+    const targetState = fs.lstatSync(targetDb);
+    const pendingMarker = path.join(target, ".sessions-db-migration-pending");
+    fs.writeFileSync(pendingMarker, JSON.stringify({
+      version: 1,
+      state: "publishing",
+      retirementDirectory: ".sessions-db-retirement-cleaned",
+      retiredNames: ["sessions.db"],
+      publication: "snapshot",
+      targets: {
+        "sessions.db": { type: "file", dev: targetState.dev, ino: targetState.ino },
+      },
+    }), "utf-8");
+
+    const result = await migrateExtensionRoot(legacy, target);
+
+    assert.deepStrictEqual(result.criticalFailures, []);
+    assert.equal(fs.existsSync(pendingMarker), false);
+    assert.equal(fs.existsSync(legacy), false);
+  });
+
+  it("keeps an uncertain pending migration guarded when the legacy root is absent", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(target, { recursive: true });
+    const pendingMarker = path.join(target, ".sessions-db-migration-pending");
+    fs.writeFileSync(pendingMarker, "interrupted", "utf-8");
+
+    const result = await migrateExtensionRoot(legacy, target);
+
+    assert.deepStrictEqual(result.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+    assert.equal(fs.existsSync(pendingMarker), true);
+    assert.equal(fs.existsSync(path.join(target, "sessions.db")), false);
+  });
+
   it("keeps cleanup tracked until migration-owned staging is removed", { skip: process.platform === "win32" }, async () => {
     const legacy = path.join(tmpDir, "memory");
     const target = path.join(tmpDir, "pi-hermes-memory");

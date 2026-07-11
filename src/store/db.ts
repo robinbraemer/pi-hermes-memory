@@ -230,6 +230,7 @@ export class DatabaseManager {
    */
   recoverFromCorruption(cause?: unknown): DatabaseRecoveryResult {
     this.close();
+    this.refreshCanonicalDbPath();
     let verifiedDb: DatabaseLike | null = null;
     let recovery: DatabaseRecoveryResult;
     try {

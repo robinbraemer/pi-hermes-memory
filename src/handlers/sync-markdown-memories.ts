@@ -17,7 +17,7 @@ import {
   migrateExtensionRoot,
   type ExtensionRootMigrationOptions,
 } from '../extension-root-migration.js';
-import { withMarkdownMutationLock } from '../store/markdown-mutation-lock.js';
+import { canonicalMarkdownIdentity, withMarkdownMutationLock } from '../store/markdown-mutation-lock.js';
 import { recoverInterruptedMarkdownPublication } from '../store/memory-store.js';
 
 export interface BackfillCounters {
@@ -179,10 +179,10 @@ export async function syncMarkdownMemoriesToSqlite(
     target: 'memory' | 'user' | 'failure',
     project: string | null = null,
   ) => {
-    const reconcile = async () => {
-      if (filePath) await recoverInterruptedMarkdownPublication(filePath);
-      if (filePath && fs.existsSync(filePath)) counters.filesScanned++;
-      const entries = filePath ? readEntries(filePath) : [];
+    const reconcile = async (authoritativePath: string | null) => {
+      if (authoritativePath) await recoverInterruptedMarkdownPublication(authoritativePath);
+      if (authoritativePath && fs.existsSync(authoritativePath)) counters.filesScanned++;
+      const entries = authoritativePath ? readEntries(authoritativePath) : [];
       counters.entriesScanned += entries.length;
       try {
         const result = target === 'failure'
@@ -197,8 +197,12 @@ export async function syncMarkdownMemoriesToSqlite(
         );
       }
     };
-    if (filePath) await withMarkdownMutationLock(filePath, reconcile);
-    else await reconcile();
+    if (filePath) {
+      const authoritativePath = await canonicalMarkdownIdentity(filePath);
+      await withMarkdownMutationLock(authoritativePath, () => reconcile(authoritativePath));
+    } else {
+      await reconcile(null);
+    }
   };
 
   await reconcileFile(globalMemoryFile, 'memory');

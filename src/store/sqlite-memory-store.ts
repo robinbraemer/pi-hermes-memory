@@ -24,6 +24,7 @@ const FAILURE_CATEGORY_SET = new Set<MemoryCategory>([
   'convention',
   'tool-quirk',
 ]);
+const LEGACY_FAILURE_SCOPE_METADATA_KEY = 'markdown-failure-legacy-scopes-v1';
 
 /**
  * A memory entry stored in SQLite.
@@ -481,38 +482,122 @@ function failureProject(rawEntry: string): string | null {
   return parseMetadataComment(rawEntry).project;
 }
 
-export function reconcileMarkdownFailureScopes(
+function failureIdentity(rawEntry: string): string {
+  const parsed = parseMarkdownMemoryEntry(rawEntry, 'failure');
+  return JSON.stringify([normalizeCategory(parsed.category), parsed.content.trim()]);
+}
+
+function readLegacyFailureScopeAssignments(dbManager: DatabaseManager): Map<string, string[]> | null {
+  const row = dbManager.getDb().prepare(`
+    SELECT value
+    FROM extension_metadata
+    WHERE key = ?
+  `).get(LEGACY_FAILURE_SCOPE_METADATA_KEY) as { value: string } | undefined;
+  if (!row) return null;
+
+  try {
+    const parsed = JSON.parse(row.value) as { version?: unknown; assignments?: unknown };
+    if (parsed.version !== 1 || !Array.isArray(parsed.assignments)) return new Map();
+    const assignments = new Map<string, string[]>();
+    for (const value of parsed.assignments) {
+      if (!value || typeof value !== 'object') continue;
+      const entry = value as { identity?: unknown; projects?: unknown };
+      if (typeof entry.identity !== 'string' || !Array.isArray(entry.projects)) continue;
+      const projects = [...new Set(entry.projects
+        .filter((project): project is string => typeof project === 'string')
+        .map((project) => project.trim())
+        .filter(Boolean))];
+      if (projects.length > 0) assignments.set(entry.identity, projects);
+    }
+    return assignments;
+  } catch {
+    return new Map();
+  }
+}
+
+function writeLegacyFailureScopeAssignments(
+  dbManager: DatabaseManager,
+  assignments: Map<string, string[]>,
+): void {
+  dbManager.getDb().prepare(`
+    INSERT OR REPLACE INTO extension_metadata (key, value)
+    VALUES (?, ?)
+  `).run(LEGACY_FAILURE_SCOPE_METADATA_KEY, JSON.stringify({
+    version: 1,
+    assignments: [...assignments].map(([identity, projects]) => ({ identity, projects })),
+  }));
+}
+
+function initializeLegacyFailureScopeAssignments(
   dbManager: DatabaseManager,
   rawEntries: string[],
-): MarkdownMemoryReconcileResult {
-  const scopedRows = dbManager.getDb().prepare(`
+): Map<string, string[]> {
+  const existing = readLegacyFailureScopeAssignments(dbManager);
+  if (existing) return existing;
+
+  const unscopedIdentities = new Set(
+    rawEntries.filter((rawEntry) => failureProject(rawEntry) === null).map(failureIdentity),
+  );
+  const rows = dbManager.getDb().prepare(`
     SELECT project, category, content
     FROM memories
     WHERE target = 'failure' AND project IS NOT NULL
   `).all() as Array<{ project: string; category: MemoryCategory | null; content: string }>;
-  const mirroredProjectsByIdentity = new Map<string, Set<string>>();
-  for (const row of scopedRows) {
+  const assignments = new Map<string, string[]>();
+  for (const row of rows) {
     const identity = JSON.stringify([normalizeCategory(row.category), row.content.trim()]);
-    const projects = mirroredProjectsByIdentity.get(identity) ?? new Set<string>();
-    projects.add(row.project);
-    mirroredProjectsByIdentity.set(identity, projects);
+    if (!unscopedIdentities.has(identity)) continue;
+    const projects = assignments.get(identity) ?? [];
+    if (!projects.includes(row.project)) projects.push(row.project);
+    assignments.set(identity, projects);
   }
 
-  const entriesByProject = new Map<string | null, string[]>();
+  writeLegacyFailureScopeAssignments(dbManager, assignments);
+  return assignments;
+}
+
+export function reconcileMarkdownFailureScopes(
+  dbManager: DatabaseManager,
+  rawEntries: string[],
+): MarkdownMemoryReconcileResult {
+  const legacyAssignments = initializeLegacyFailureScopeAssignments(dbManager, rawEntries);
+  const explicitProjectsByIdentity = new Map<string, Set<string>>();
   for (const rawEntry of rawEntries) {
     const project = failureProject(rawEntry);
-    const parsed = project === null ? parseMarkdownMemoryEntry(rawEntry, 'failure') : null;
-    const inferredProjects = parsed
-      ? mirroredProjectsByIdentity.get(JSON.stringify([
-        normalizeCategory(parsed.category),
-        parsed.content.trim(),
-      ]))
-      : null;
+    if (project === null) continue;
+    const projects = explicitProjectsByIdentity.get(failureIdentity(rawEntry)) ?? new Set<string>();
+    projects.add(project);
+    explicitProjectsByIdentity.set(failureIdentity(rawEntry), projects);
+  }
+  const unscopedIdentities = new Set(
+    rawEntries.filter((rawEntry) => failureProject(rawEntry) === null).map(failureIdentity),
+  );
+  for (const [identity, projects] of legacyAssignments) {
+    const retainedProjects = projects.filter(
+      (project) => !explicitProjectsByIdentity.get(identity)?.has(project),
+    );
+    if (!unscopedIdentities.has(identity) || retainedProjects.length === 0) {
+      legacyAssignments.delete(identity);
+    } else {
+      legacyAssignments.set(identity, retainedProjects);
+    }
+  }
+  writeLegacyFailureScopeAssignments(dbManager, legacyAssignments);
+
+  const entriesByProject = new Map<string | null, string[]>();
+  const inferredIdentities = new Set<string>();
+  for (const rawEntry of rawEntries) {
+    const project = failureProject(rawEntry);
+    const identity = failureIdentity(rawEntry);
+    const inferredProjects = project === null && !inferredIdentities.has(identity)
+      ? legacyAssignments.get(identity) ?? []
+      : [];
     const projects = project !== null
       ? [project]
-      : inferredProjects && inferredProjects.size > 0
-        ? [...inferredProjects]
+      : inferredProjects.length > 0
+        ? inferredProjects
         : [null];
+    if (inferredProjects.length > 0) inferredIdentities.add(identity);
     for (const entryProject of projects) {
       const entries = entriesByProject.get(entryProject) ?? [];
       entries.push(rawEntry);

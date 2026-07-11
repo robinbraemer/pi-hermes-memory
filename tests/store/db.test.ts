@@ -453,6 +453,38 @@ describe('DatabaseManager', () => {
       }
     });
 
+    it('refreshes a retargeted database symlink before direct corruption recovery', { skip: process.platform === 'win32' }, () => {
+      dbManager.close();
+      const memoryDir = path.join(tmpDir, 'memory');
+      const targetsDir = path.join(tmpDir, 'targets');
+      const firstTarget = path.join(targetsDir, 'first.db');
+      const secondTarget = path.join(targetsDir, 'second.db');
+      const aliasPath = path.join(memoryDir, 'sessions.db');
+      fs.mkdirSync(memoryDir);
+      fs.mkdirSync(targetsDir);
+      fs.symlinkSync(firstTarget, aliasPath, 'file');
+      const manager = new DatabaseManager(memoryDir);
+      manager.getDb().prepare("INSERT INTO extension_metadata (key, value) VALUES ('target', 'first')").run();
+      manager.close();
+      fs.unlinkSync(aliasPath);
+      fs.writeFileSync(secondTarget, 'not a sqlite database');
+      fs.symlinkSync(secondTarget, aliasPath, 'file');
+
+      const result = manager.recoverFromCorruption(corruptSqliteError());
+      manager.close();
+
+      assert.strictEqual(result.strategy, 'recreated-empty');
+      const first = new Database(firstTarget, { readonly: true });
+      const second = new Database(secondTarget, { readonly: true });
+      try {
+        assert.deepStrictEqual(first.prepare("SELECT value FROM extension_metadata WHERE key = 'target'").all(), [{ value: 'first' }]);
+        assertQuickCheckOk(second);
+      } finally {
+        first.close();
+        second.close();
+      }
+    });
+
     it('creates and repairs a dangling absolute database symlink through its target', { skip: process.platform === 'win32' }, () => {
       dbManager.close();
       const realDir = path.join(tmpDir, 'real');

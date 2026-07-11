@@ -140,6 +140,33 @@ describe('sqlite-memory-store', () => {
       assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
     });
 
+    it('allows an identical global failure after one-time legacy scope inference', () => {
+      const content = '[correction] use pnpm — Project: project-a';
+      const raw = `${content} <!-- created=2026-05-08, last=2026-05-09 -->`;
+      const scopedRaw = `${content} <!-- created=2026-05-08, last=2026-05-09, project64=cHJvamVjdC1h -->`;
+      addMemory(dbManager, content, 'failure', 'project-a', 'correction');
+
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+      reconcileMarkdownFailureScopes(dbManager, [scopedRaw, raw]);
+
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: 'project-a' }).length, 1);
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 1);
+    });
+
+    it('retires legacy scope inference after explicit project metadata becomes authoritative', () => {
+      const content = '[correction] use pnpm — Project: project-a';
+      const raw = `${content} <!-- created=2026-05-08, last=2026-05-09 -->`;
+      const scopedRaw = `${content} <!-- created=2026-05-08, last=2026-05-09, project64=cHJvamVjdC1h -->`;
+      addMemory(dbManager, content, 'failure', 'project-a', 'correction');
+
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+      reconcileMarkdownFailureScopes(dbManager, [scopedRaw, raw]);
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: 'project-a' }).length, 0);
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 1);
+    });
+
     it('round-trips project correction scope through authoritative Markdown metadata', async () => {
       const store = new MemoryStore({
         memoryDir: tmpDir,
