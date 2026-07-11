@@ -196,6 +196,10 @@ export async function syncMarkdownMemoriesToSqlite(
   for (const projectName of projectNames) {
     const memoryFile = projectFiles.get(projectName)
       ?? resolveAuthoritativeMemoryFile(projectsRoot, projectName);
+    if (!memoryFile) {
+      counters.warnings.push(`${projectName}/memory: authoritative project path was rejected as unsafe; SQLite rows were preserved`);
+      continue;
+    }
     await reconcileFile(memoryFile, 'memory', projectName);
   }
 

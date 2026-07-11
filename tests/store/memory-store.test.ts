@@ -941,6 +941,46 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       });
     }
 
+    it("restarts a mutation when MEMORY.md is retargeted immediately before publication", { skip: process.platform === "win32" }, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-mid-mutation-retarget-test-"));
+      const aliasDir = path.join(root, "alias");
+      const firstDir = path.join(root, "first");
+      const secondDir = path.join(root, "second");
+      await Promise.all([fs.mkdir(aliasDir), fs.mkdir(firstDir), fs.mkdir(secondDir)]);
+      const aliasPath = path.join(aliasDir, MEMORY_FILE);
+      const firstPath = path.join(firstDir, MEMORY_FILE);
+      const secondPath = path.join(secondDir, MEMORY_FILE);
+      await fs.writeFile(firstPath, `${TEST_MARKER} first target`, "utf-8");
+      await fs.writeFile(secondPath, `${TEST_MARKER} second target`, "utf-8");
+      await fs.symlink(firstPath, aliasPath, "file");
+
+      try {
+        const store = new MemoryStore(makeConfig({ memoryDir: aliasDir }));
+        await store.loadFromDisk();
+        const mutableStore = store as any;
+        const pruneRecoveryFiles = mutableStore.pruneRecoveryFiles.bind(store);
+        let retargeted = false;
+        mutableStore.pruneRecoveryFiles = async (filePath: string) => {
+          await pruneRecoveryFiles(filePath);
+          if (retargeted) return;
+          retargeted = true;
+          await fs.unlink(aliasPath);
+          await fs.symlink(secondPath, aliasPath, "file");
+        };
+
+        const result = await store.add("memory", `${TEST_MARKER} retargeted during mutation`);
+
+        assert.equal(result.success, true);
+        assert.equal(await fs.readFile(firstPath, "utf-8"), `${TEST_MARKER} first target`);
+        const second = await fs.readFile(secondPath, "utf-8");
+        assert.match(second, /second target/);
+        assert.match(second, /retargeted during mutation/);
+        assert.doesNotMatch(second, /first target/);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
     it("rejects Markdown symlink loops before mutation", { skip: process.platform === "win32" }, async () => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-symlink-loop-test-"));
       await fs.symlink(USER_FILE, path.join(root, MEMORY_FILE), "file");

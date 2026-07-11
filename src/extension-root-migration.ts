@@ -229,10 +229,14 @@ async function isVerifiedCompletedMigration(
   } catch {
     return false;
   }
-  if (!marker || retirementArtifacts.length !== 1) return false;
+  if (!marker || retirementArtifacts.length > 1) return false;
   const retirementDir = path.join(legacyRoot, marker.retirementDirectory);
-  if (path.resolve(retirementArtifacts[0]) !== path.resolve(retirementDir)) return false;
-  if (!sameNames(await fs.readdir(retirementDir), marker.retiredNames)) return false;
+  if (retirementArtifacts.length === 1) {
+    if (path.resolve(retirementArtifacts[0]) !== path.resolve(retirementDir)) return false;
+    if (!sameNames(await fs.readdir(retirementDir), marker.retiredNames)) return false;
+  } else if (await pathEntryExists(retirementDir)) {
+    return false;
+  }
   if (!sameNames(targetNames, Object.keys(marker.targets))) return false;
   for (const [name, expected] of Object.entries(marker.targets)) {
     if (!await matchesExpectedDatabaseEntry(path.join(targetRoot, name), expected)) return false;
@@ -324,10 +328,14 @@ async function moveDatabaseGeneration(
   sourceRoot: string,
   holdingRoot: string,
   move: (source: string, target: string) => Promise<void>,
+  mainFirst = false,
 ): Promise<string[]> {
   const moved: string[] = [];
   await fs.mkdir(holdingRoot, { mode: 0o700 });
-  const orderedNames = [...names].sort((left, right) => Number(left === "sessions.db") - Number(right === "sessions.db"));
+  const direction = mainFirst ? -1 : 1;
+  const orderedNames = [...names].sort(
+    (left, right) => direction * (Number(left === "sessions.db") - Number(right === "sessions.db")),
+  );
   try {
     for (const name of orderedNames) {
       const source = path.join(sourceRoot, name);
@@ -595,47 +603,70 @@ async function migrateDatabaseGeneration(
       }
       await stageDatabaseSymlink(source, staged);
       corruptGeneration = false;
-    } else if (sourceState.isFile()) {
-      if (!corruptGeneration) {
-        try {
-          await backup(source, staged, onBackupProgress);
-        } catch (error) {
-          if (!isDatabaseCorruption(error)) throw error;
-          corruptGeneration = true;
-          try { await fs.unlink(staged); } catch {}
-        }
-      }
-      if (corruptGeneration) {
-        try {
-          retired = await moveDatabaseGeneration(generationNames, legacyRoot, retirementDir, retire);
-        } catch (error) {
-          if (error instanceof DatabaseGenerationMoveError) retired = error.moved;
-          throw error;
-        }
-        const rawSources = Object.fromEntries(
-          retired.map((name) => [name, path.join(retirementDir, name)]),
-        );
-        await writeMigrationMarker(
-          pendingMarker,
-          await publishingMarker(retirementDir, retired, "raw", rawSources),
-        );
-        for (const name of retired) {
-          const target = path.join(targetRoot, name);
-          await publish(path.join(retirementDir, name), target);
-          published.set(target, await fileIdentity(target));
-        }
-      }
-    } else {
+    } else if (!sourceState.isFile()) {
       throw new Error("sessions.db is not a regular file or symlink");
     }
 
-    if (!corruptGeneration) {
+    if (writeLock) {
+      writeLock.exec("COMMIT");
+      writeLock.close();
+      writeLock = null;
+    }
+    generationNames = await databaseFilesAt(legacyRoot);
+    if (!generationNames.includes("sessions.db")) {
+      throw new Error("legacy SQLite generation changed before retirement");
+    }
+
+    try {
+      retired = await moveDatabaseGeneration(
+        generationNames,
+        legacyRoot,
+        retirementDir,
+        retire,
+        !corruptGeneration && sourceState.isFile(),
+      );
+    } catch (error) {
+      if (error instanceof DatabaseGenerationMoveError) retired = error.moved;
+      throw error;
+    }
+    const successorNames = await databaseFilesAt(legacyRoot);
+    if (successorNames.length > 0) {
+      throw new Error(`legacy SQLite generation changed during retirement: ${successorNames.join(", ")}`);
+    }
+
+    if (!corruptGeneration && sourceState.isFile()) {
+      const retiredSource = path.join(retirementDir, "sessions.db");
       try {
-        retired = await moveDatabaseGeneration(generationNames, legacyRoot, retirementDir, retire);
+        writeLock = new Database(retiredSource, { fileMustExist: true, timeout: 0 });
+        writeLock.pragma("busy_timeout = 0");
+        writeLock.exec("BEGIN IMMEDIATE");
+        await backup(retiredSource, staged, onBackupProgress);
       } catch (error) {
-        if (error instanceof DatabaseGenerationMoveError) retired = error.moved;
-        throw error;
+        if (!isDatabaseCorruption(error)) throw error;
+        if (writeLock) {
+          try { writeLock.exec("ROLLBACK"); } catch {}
+          try { writeLock.close(); } catch {}
+          writeLock = null;
+        }
+        corruptGeneration = true;
+        try { await fs.unlink(staged); } catch {}
       }
+    }
+
+    if (corruptGeneration) {
+      const rawSources = Object.fromEntries(
+        retired.map((name) => [name, path.join(retirementDir, name)]),
+      );
+      await writeMigrationMarker(
+        pendingMarker,
+        await publishingMarker(retirementDir, retired, "raw", rawSources),
+      );
+      for (const name of retired) {
+        const target = path.join(targetRoot, name);
+        await publish(path.join(retirementDir, name), target);
+        published.set(target, await fileIdentity(target));
+      }
+    } else {
       const target = path.join(targetRoot, "sessions.db");
       await writeMigrationMarker(
         pendingMarker,
@@ -651,6 +682,11 @@ async function migrateDatabaseGeneration(
     for (const [target, identity] of [...published.entries()].reverse()) {
       try { await unlinkIfOwned(target, identity); } catch {}
     }
+    if (writeLock) {
+      try { writeLock.exec("ROLLBACK"); } catch {}
+      try { writeLock.close(); } catch {}
+      writeLock = null;
+    }
     let restoreFailures: string[] = [];
     if (retired.length > 0) {
       restoreFailures = await restoreDatabaseGeneration(retired, retirementDir, legacyRoot);
@@ -659,9 +695,6 @@ async function migrateDatabaseGeneration(
     }
     const destinationPreserved = await pathEntryExists(path.join(targetRoot, "sessions.db"));
     if (destinationPreserved) keepPendingMarker = true;
-    if (writeLock) {
-      try { writeLock.exec("ROLLBACK"); } catch {}
-    }
     const baseMessage = error instanceof Error ? error.message : String(error);
     let message = restoreFailures.length > 0
       ? `${baseMessage}; recovery artifacts preserved at ${retirementDir} (${restoreFailures.join("; ")})`

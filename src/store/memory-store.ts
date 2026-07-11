@@ -41,6 +41,7 @@ const CONFLICT_MAX_BYTES = 64 * 1024 * 1024;
 const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 
 class ExternalMemoryWriteConflict extends Error {}
+class MarkdownTargetChanged extends Error {}
 
 function publicationPendingPath(filePath: string): string {
   return path.join(path.dirname(filePath), `.${path.basename(filePath)}.publication-pending`);
@@ -162,6 +163,15 @@ export class MemoryStore {
       this.storagePaths[target] = resolved;
     }
     return resolved;
+  }
+
+  private async requireStoragePath(
+    target: "memory" | "user" | "failure",
+    expectedPath: string,
+  ): Promise<void> {
+    if (await this.refreshStoragePath(target) !== expectedPath) {
+      throw new MarkdownTargetChanged();
+    }
   }
 
   private entriesFor(target: "memory" | "user" | "failure"): string[] {
@@ -694,9 +704,13 @@ export class MemoryStore {
           } catch (error) {
             const filePath = storagePath;
             delete this.fileFingerprints[filePath];
-            const state = await this.readFileState(filePath);
+            const currentPath = error instanceof MarkdownTargetChanged
+              ? await this.refreshStoragePath(target)
+              : filePath;
+            const state = await this.readFileState(currentPath);
             this.setEntries(target, [...new Set(state.entries)]);
-            this.fileFingerprints[filePath] = state.fingerprint;
+            this.fileFingerprints[currentPath] = state.fingerprint;
+            if (error instanceof MarkdownTargetChanged) return null;
             if (!(error instanceof ExternalMemoryWriteConflict)) throw error;
             if (attempt >= MAX_EXTERNAL_WRITE_RETRIES) {
               return {
@@ -730,6 +744,7 @@ export class MemoryStore {
     try {
       await fs.writeFile(tmpPath, content, "utf-8");
       await this.pruneRecoveryFiles(filePath);
+      await this.requireStoragePath(target, filePath);
       const currentState = await this.readFileState(filePath);
       if (currentState.fingerprint !== expectedFingerprint) {
         throw new ExternalMemoryWriteConflict();
@@ -737,6 +752,7 @@ export class MemoryStore {
 
       if (expectedFingerprint === "missing") {
         try {
+          await this.requireStoragePath(target, filePath);
           await fs.link(tmpPath, filePath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "EEXIST") {
@@ -750,6 +766,7 @@ export class MemoryStore {
         const publishedIdentity = await this.fileIdentity(tmpPath);
         await writePublicationMarker(tmpDir, pendingPath, recoveryPath);
         try {
+          await this.requireStoragePath(target, filePath);
           await fs.rename(filePath, recoveryPath);
         } catch (error) {
           try { await fs.unlink(pendingPath); } catch {}

@@ -307,7 +307,7 @@ describe('memory sqlite sync + markdown backfill', () => {
     );
   });
 
-  it('reconciles unsafe SQLite project scopes empty without reading outside projects-memory', async () => {
+  it('preserves unsafe SQLite project scopes without reading outside projects-memory', async () => {
     const outsideDir = path.join(agentRoot, 'outside');
     fs.mkdirSync(outsideDir, { recursive: true });
     fs.writeFileSync(path.join(outsideDir, 'MEMORY.md'), 'outside traversal bait', 'utf-8');
@@ -315,12 +315,16 @@ describe('memory sqlite sync + markdown backfill', () => {
 
     const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
 
-    assert.strictEqual(counters.removed, 1);
-    assert.deepStrictEqual(getMemories(dbManager, { project: '../outside', target: 'memory' }), []);
+    assert.strictEqual(counters.removed, 0);
+    assert.deepStrictEqual(
+      getMemories(dbManager, { project: '../outside', target: 'memory' }).map((entry) => entry.content),
+      ['outside traversal bait'],
+    );
+    assert.ok(counters.warnings.some((warning) => warning.includes('../outside')));
     assert.strictEqual(fs.readFileSync(path.join(outsideDir, 'MEMORY.md'), 'utf-8'), 'outside traversal bait');
   });
 
-  it('reconciles a symlinked project directory empty without reading its target', async (t) => {
+  it('preserves a symlinked project directory mirror without reading its target', async (t) => {
     const outsideDir = path.join(tmpDir, 'outside-project');
     const projectLink = path.join(agentRoot, 'projects-memory', 'linked-project');
     fs.mkdirSync(outsideDir, { recursive: true });
@@ -336,11 +340,15 @@ describe('memory sqlite sync + markdown backfill', () => {
 
     const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
 
-    assert.strictEqual(counters.removed, 1);
-    assert.deepStrictEqual(getMemories(dbManager, { project: 'linked-project', target: 'memory' }), []);
+    assert.strictEqual(counters.removed, 0);
+    assert.deepStrictEqual(
+      getMemories(dbManager, { project: 'linked-project', target: 'memory' }).map((entry) => entry.content),
+      ['stale linked project row'],
+    );
+    assert.ok(counters.warnings.some((warning) => warning.includes('linked-project')));
   });
 
-  it('reconciles a symlinked project memory file empty without reading its target', async (t) => {
+  it('preserves a symlinked project memory file mirror without reading its target', async (t) => {
     const outsideFile = path.join(tmpDir, 'outside-memory.md');
     const projectDir = path.join(agentRoot, 'projects-memory', 'linked-file-project');
     const memoryLink = path.join(projectDir, 'MEMORY.md');
@@ -356,8 +364,12 @@ describe('memory sqlite sync + markdown backfill', () => {
 
     const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
 
-    assert.strictEqual(counters.removed, 1);
-    assert.deepStrictEqual(getMemories(dbManager, { project: 'linked-file-project', target: 'memory' }), []);
+    assert.strictEqual(counters.removed, 0);
+    assert.deepStrictEqual(
+      getMemories(dbManager, { project: 'linked-file-project', target: 'memory' }).map((entry) => entry.content),
+      ['stale linked file row'],
+    );
+    assert.ok(counters.warnings.some((warning) => warning.includes('linked-file-project')));
   });
 
   it('still scans project markdown under ~/.pi/agent when memoryDir is customized elsewhere', async () => {
