@@ -91,6 +91,15 @@ describe('DatabaseManager', () => {
       assert.strictEqual(db1, db2);
     });
 
+    it('does not retain a physical SQLite handle between coordinated operations', () => {
+      const db = dbManager.getDb();
+      assert.strictEqual((dbManager as any).db, null);
+
+      db.prepare('SELECT COUNT(*) AS count FROM sessions').get();
+
+      assert.strictEqual((dbManager as any).db, null);
+    });
+
     it('re-resolves a file-symlinked database after the manager is closed', { skip: process.platform === 'win32' }, () => {
       dbManager.close();
       const memoryDir = path.join(tmpDir, 'memory');
@@ -412,6 +421,51 @@ describe('DatabaseManager', () => {
         recoveredDb.prepare("SELECT value FROM extension_metadata WHERE key = 'concurrent'").all(),
         [{ value: 'committed writer' }],
       );
+    });
+
+    it('blocks coordinated writers when SQLite locking is unavailable', () => {
+      dbManager.getDb();
+      dbManager.close();
+      const writerManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 0 });
+      const writer = writerManager.getDb().prepare(
+        "INSERT INTO extension_metadata (key, value) VALUES ('blocked', 'writer')",
+      );
+      dbManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 0 });
+      (dbManager as any).currentDatabaseIsHealthy = () => false;
+      (dbManager as any).acquireRecoveryWriteLock = () => null;
+      (dbManager as any).recoverDatabaseFileUnlocked = () => {
+        assert.throws(() => writer.run(), /database access.*timed out/i);
+        return { strategy: 'reused', backupPaths: [] };
+      };
+
+      try {
+        assert.doesNotThrow(() => dbManager.recoverFromCorruption(corruptSqliteError()));
+      } finally {
+        writerManager.close();
+      }
+    });
+
+    it('closes the SQLite write lock before moving the generation', () => {
+      dbManager.getDb();
+      dbManager.close();
+      let closed = false;
+      const writeLock = {
+        prepare: () => ({ run: () => {}, get: () => undefined, all: () => [] }),
+        exec: (sql: string) => { if (sql === 'ROLLBACK') closed = true; },
+        close: () => { closed = true; },
+      };
+      dbManager = new DatabaseManager(tmpDir);
+      (dbManager as any).currentDatabaseIsHealthy = () => false;
+      (dbManager as any).acquireRecoveryWriteLock = () => writeLock;
+      (dbManager as any).rebuildDatabaseFromReadableRows = () => {
+        throw new Error('injected rebuild failure');
+      };
+      (dbManager as any).moveDatabaseFilesToBackup = () => {
+        assert.strictEqual(closed, true, 'SQLite handle must close before moving files');
+        return [];
+      };
+
+      assert.doesNotThrow(() => dbManager.recoverFromCorruption(corruptSqliteError()));
     });
 
     it('takes over a stale recovery lock', () => {
@@ -1002,11 +1056,10 @@ describe('DatabaseManager', () => {
       });
     });
 
-    it('should truncate the WAL file on close so it is not retained across sessions', () => {
+    it('should not retain the WAL file across coordinated operations or close', () => {
       const db = dbManager.getDb();
       const walPath = `${dbManager.getPath()}-wal`;
 
-      // Generate enough WAL traffic to materialize a non-trivial WAL file.
       const insert = db.prepare(`
         INSERT INTO memories (project, target, content, created, last_referenced)
         VALUES (?, ?, ?, ?, ?)
@@ -1014,10 +1067,7 @@ describe('DatabaseManager', () => {
       for (let i = 0; i < 500; i++) {
         insert.run(null, 'memory', `entry ${i} ${'x'.repeat(200)}`, '2026-05-03', '2026-05-03');
       }
-      assert.ok(fs.existsSync(walPath), 'WAL file should exist after writes');
-      assert.ok(fs.statSync(walPath).size > 0, 'WAL should be non-empty before close');
 
-      // close() runs PRAGMA wal_checkpoint(TRUNCATE), which shrinks the WAL to 0.
       dbManager.close();
 
       const walSizeAfter = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;

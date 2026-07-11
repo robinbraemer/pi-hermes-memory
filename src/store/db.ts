@@ -2,7 +2,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import { SCHEMA_SQL } from './schema.js';
-import { AtomicLockCoordinator } from './atomic-lock-coordinator.js';
+import { AtomicLockCoordinator, type AtomicLockLease } from './atomic-lock-coordinator.js';
 import { canonicalStoragePathSync } from './canonical-storage-path.js';
 
 type StatementLike = {
@@ -144,6 +144,10 @@ const Database = loadDatabaseCtor();
 
 export class DatabaseManager {
   private db: DatabaseLike | null = null;
+  private dbFacade: DatabaseLike | null = null;
+  private dbIdentity: DatabaseFileIdentity | null = null;
+  private databaseAccessDepth = 0;
+  private databaseInitialized = false;
   private readonly displayDbPath: string;
   private canonicalDbPath: string | null = null;
   private readonly recoveryOptions: ResolvedDatabaseRecoveryOptions;
@@ -199,12 +203,107 @@ export class DatabaseManager {
    * Get the database instance. Creates/opens on first call.
    */
   getDb(): DatabaseLike {
+    this.withDatabaseAccess(() => this.ensureCurrentDb());
+    if (!this.dbFacade) this.dbFacade = this.createDatabaseFacade();
+    return this.dbFacade;
+  }
+
+  private ensureCurrentDb(): DatabaseLike {
+    if (this.db && this.dbIdentity && !this.hasDatabaseFileIdentity(this.dbPath, this.dbIdentity)) {
+      this.safeClose(this.db);
+      this.db = null;
+      this.dbIdentity = null;
+    }
     if (!this.db) {
       this.openGuard?.();
       this.refreshCanonicalDbPath();
-      this.db = this.open();
+      this.db = this.databaseInitialized && this.hasExistingMainDatabaseFile()
+        ? this.openOperationalConnection()
+        : this.open();
+      this.databaseInitialized = true;
+      const stat = fs.lstatSync(this.dbPath, { bigint: true });
+      this.dbIdentity = { dev: stat.dev, ino: stat.ino };
     }
     return this.db;
+  }
+
+  private openOperationalConnection(): DatabaseLike {
+    const db = new Database(this.dbPath);
+    let ok = false;
+    try {
+      this.configureConnection(db);
+      ok = true;
+      return db;
+    } finally {
+      if (!ok) this.safeClose(db);
+    }
+  }
+
+  private createDatabaseFacade(): DatabaseLike {
+    return {
+      prepare: (sql: string) => ({
+        run: (...args: any[]) => this.withDatabaseAccess(() =>
+          this.ensureCurrentDb().prepare(sql).run(...args)
+        ),
+        get: (...args: any[]) => this.withDatabaseAccess(() =>
+          this.ensureCurrentDb().prepare(sql).get(...args)
+        ),
+        all: (...args: any[]) => this.withDatabaseAccess(() =>
+          this.ensureCurrentDb().prepare(sql).all(...args)
+        ),
+        iterate: (...args: any[]) => this.withDatabaseAccess(() => {
+          const statement = this.ensureCurrentDb().prepare(sql);
+          return statement.iterate ? [...statement.iterate(...args)] : [];
+        }),
+      }),
+      exec: (sql: string) => this.withDatabaseAccess(() => this.ensureCurrentDb().exec(sql)),
+      close: () => this.close(),
+      pragma: (query: string, options?: any) => this.withDatabaseAccess(() =>
+        this.ensureCurrentDb().pragma?.(query, options)
+      ),
+      transaction: (fn: any) => (...args: any[]) => this.withDatabaseAccess(() => {
+        const db = this.ensureCurrentDb();
+        if (!db.transaction) return fn(...args);
+        return db.transaction(() => fn(...args))();
+      }),
+    };
+  }
+
+  private withDatabaseAccess<T>(operation: () => T): T {
+    if (this.databaseAccessDepth > 0) return operation();
+    const lease = this.acquireDatabaseAccessLease();
+    this.databaseAccessDepth++;
+    try {
+      return operation();
+    } finally {
+      this.databaseAccessDepth--;
+      this.closePhysicalConnection();
+      lease.release();
+    }
+  }
+
+  private closePhysicalConnection(): void {
+    if (this.db) this.safeClose(this.db);
+    this.db = null;
+    this.dbIdentity = null;
+  }
+
+  private acquireDatabaseAccessLease(): AtomicLockLease {
+    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(this.dbPath), '.pi-hermes-locks.sqlite'));
+    const lockKey = `database-access:${this.dbPath}`;
+    const waitMs = Math.max(0, this.recoveryOptions.recoveryLockWaitMs);
+    const deadline = Date.now() + waitMs;
+    while (true) {
+      const lease = coordinator.tryAcquire(lockKey, { staleMs: this.recoveryOptions.recoveryLockStaleMs });
+      if (lease) return lease;
+      if (Date.now() >= deadline) {
+        throw new Error(`SQLite database access timed out after ${waitMs}ms for ${this.displayDbPath}`);
+      }
+      DatabaseManager.sleepSync(Math.min(
+        this.recoveryOptions.recoveryLockPollMs,
+        Math.max(1, deadline - Date.now()),
+      ));
+    }
   }
 
   /**
@@ -390,41 +489,49 @@ export class DatabaseManager {
       }
 
       try {
-        if (this.currentDatabaseIsHealthy()) {
-          try {
-            verify();
-            this.clearRecoveryFailuresBestEffort();
-            return { strategy: 'reused', backupPaths: [] };
-          } catch (error) {
-            this.recordRecoveryFailure();
-            throw error;
-          }
-        }
-
-        this.assertRecoveryCircuitClosed();
-        try {
-          this.cleanupRecoveryArtifactsBestEffort();
-          const writeLock = this.acquireRecoveryWriteLock();
-          let result: DatabaseRecoveryResult;
-          try {
-            result = this.recoverDatabaseFileUnlocked(cause, writeLock);
-            verify();
-          } finally {
-            if (writeLock) {
-              try { writeLock.exec('ROLLBACK'); } catch {}
-              this.safeClose(writeLock);
-            }
-          }
-          this.cleanupRecoveryArtifactsBestEffort();
-          this.clearRecoveryFailuresBestEffort();
-          return result;
-        } catch (error) {
-          this.recordRecoveryFailure();
-          throw error;
-        }
+        return this.withDatabaseAccess(() => this.recoverDatabaseFileExclusively(cause, verify));
       } finally {
         lease.release();
       }
+    }
+  }
+
+  private recoverDatabaseFileExclusively(cause: unknown, verify: () => void): DatabaseRecoveryResult {
+    if (this.currentDatabaseIsHealthy()) {
+      try {
+        verify();
+        this.clearRecoveryFailuresBestEffort();
+        return { strategy: 'reused', backupPaths: [] };
+      } catch (error) {
+        this.recordRecoveryFailure();
+        throw error;
+      }
+    }
+
+    this.assertRecoveryCircuitClosed();
+    try {
+      this.cleanupRecoveryArtifactsBestEffort();
+      const writeLock = this.acquireRecoveryWriteLock();
+      let writeLockReleased = false;
+      const releaseWriteLock = () => {
+        if (writeLockReleased || !writeLock) return;
+        writeLockReleased = true;
+        try { writeLock.exec('ROLLBACK'); } catch {}
+        this.safeClose(writeLock);
+      };
+      let result: DatabaseRecoveryResult;
+      try {
+        result = this.recoverDatabaseFileUnlocked(cause, writeLock, releaseWriteLock);
+        verify();
+      } finally {
+        releaseWriteLock();
+      }
+      this.cleanupRecoveryArtifactsBestEffort();
+      this.clearRecoveryFailuresBestEffort();
+      return result;
+    } catch (error) {
+      this.recordRecoveryFailure();
+      throw error;
     }
   }
 
@@ -443,18 +550,23 @@ export class DatabaseManager {
     }
   }
 
-  private recoverDatabaseFileUnlocked(cause?: unknown, lockedSource: DatabaseLike | null = null): DatabaseRecoveryResult {
+  private recoverDatabaseFileUnlocked(
+    cause?: unknown,
+    lockedSource: DatabaseLike | null = null,
+    releaseWriteLock: () => void = () => {},
+  ): DatabaseRecoveryResult {
     const backupBase = this.corruptBackupBase();
     let rebuildError: unknown;
 
     if (this.databaseFileSetExists()) {
       try {
-        return this.rebuildDatabaseFromReadableRows(backupBase, lockedSource);
+        return this.rebuildDatabaseFromReadableRows(backupBase, lockedSource, releaseWriteLock);
       } catch (err) {
         rebuildError = err;
       }
     }
 
+    releaseWriteLock();
     const moved = this.moveDatabaseFilesToBackup(backupBase);
     return {
       strategy: 'recreated-empty',
@@ -572,6 +684,7 @@ export class DatabaseManager {
   private rebuildDatabaseFromReadableRows(
     backupBase: string,
     lockedSource: DatabaseLike | null = null,
+    releaseWriteLock: () => void = () => {},
   ): DatabaseRecoveryResult {
     const tempPath = this.rebuildTempPath();
     this.removeDatabaseFileSet(tempPath);
@@ -599,6 +712,7 @@ export class DatabaseManager {
       if (!rebuildOk) this.removeDatabaseFileSet(tempPath);
     }
 
+    releaseWriteLock();
     const moved = this.swapRebuiltDatabase(tempPath, backupBase);
     try { this.removeDatabaseFileSet(tempPath); } catch {}
 
@@ -1068,6 +1182,9 @@ export class DatabaseManager {
       try { this.db.close(); } catch { /* best effort — close may throw on a corrupt handle */ }
       this.db = null;
     }
+    this.dbFacade = null;
+    this.dbIdentity = null;
+    this.databaseInitialized = false;
   }
 
   /**
