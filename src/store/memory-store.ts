@@ -30,6 +30,7 @@ import { AGENT_ROOT } from "../paths.js";
 import { canonicalMarkdownIdentity, withMarkdownMutationLock } from "./markdown-mutation-lock.js";
 
 const MAX_EXTERNAL_WRITE_RETRIES = 2;
+const RECOVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 class ExternalMemoryWriteConflict extends Error {}
 
@@ -298,7 +299,7 @@ export class MemoryStore {
     const matches = entries.filter((e) => this.stripMetadata(e).includes(oldText));
 
     if (matches.length === 0) return { success: false, error: `No entry matched '${oldText}'.` };
-    if (matches.length > 1 && new Set(matches).size > 1) {
+    if (matches.length > 1 && !this.areDistinctScopedFailureCopies(target, matches)) {
       return {
         success: false,
         error: `Multiple entries matched '${oldText}'. Be more specific.`,
@@ -306,14 +307,12 @@ export class MemoryStore {
       };
     }
 
-    const idx = entries.indexOf(matches[0]);
-    // Preserve original created date, update last_referenced to today
-    const decoded = this.decodeEntry(matches[0]);
     const today = new Date().toISOString().split("T")[0];
-    const encoded = this.encodeEntry(newContent, decoded.created, today, decoded.project ?? undefined);
-
-    const testEntries = [...entries];
-    testEntries[idx] = encoded;
+    const replacements = new Map(matches.map((entry) => {
+      const decoded = this.decodeEntry(entry);
+      return [entry, this.encodeEntry(newContent, decoded.created, today, decoded.project ?? undefined)];
+    }));
+    const testEntries = entries.map((entry) => replacements.get(entry) ?? entry);
     const newTotal = testEntries.join(ENTRY_DELIMITER).length;
 
     if (newTotal > this.charLimit(target)) {
@@ -323,8 +322,7 @@ export class MemoryStore {
       };
     }
 
-    entries[idx] = encoded;
-    this.setEntries(target, entries);
+    this.setEntries(target, testEntries);
     await this.saveToDisk(target);
 
     return this.successResponse(target, "Entry replaced.");
@@ -343,7 +341,7 @@ export class MemoryStore {
     const matches = entries.filter((e) => this.stripMetadata(e).includes(oldText));
 
     if (matches.length === 0) return { success: false, error: `No entry matched '${oldText}'.` };
-    if (matches.length > 1 && new Set(matches).size > 1) {
+    if (matches.length > 1 && !this.areDistinctScopedFailureCopies(target, matches)) {
       return {
         success: false,
         error: `Multiple entries matched '${oldText}'. Be more specific.`,
@@ -351,9 +349,8 @@ export class MemoryStore {
       };
     }
 
-    const idx = entries.indexOf(matches[0]);
-    entries.splice(idx, 1);
-    this.setEntries(target, entries);
+    const matchedEntries = new Set(matches);
+    this.setEntries(target, entries.filter((entry) => !matchedEntries.has(entry)));
     await this.saveToDisk(target);
 
     return this.successResponse(target, "Entry removed.");
@@ -448,6 +445,16 @@ export class MemoryStore {
   /** Strip metadata comment from entry text for display. */
   private stripMetadata(text: string): string {
     return this.decodeEntry(text).text;
+  }
+
+  private areDistinctScopedFailureCopies(
+    target: "memory" | "user" | "failure",
+    entries: string[],
+  ): boolean {
+    if (target !== "failure") return false;
+    const visibleTexts = new Set(entries.map((entry) => this.stripMetadata(entry)));
+    const scopes = new Set(entries.map((entry) => this.decodeEntry(entry).project));
+    return visibleTexts.size === 1 && scopes.size === entries.length;
   }
 
   private buildFailureMemoryText(content: string, options: {
@@ -621,10 +628,10 @@ export class MemoryStore {
     // Use the memory directory for temp files so rename stays on the same device
     const tmpDir = await fs.mkdtemp(path.join(this.memoryDir, ".tmp-"));
     const tmpPath = path.join(tmpDir, "write.tmp");
-    const basePath = path.join(tmpDir, "base.md");
 
     try {
       await fs.writeFile(tmpPath, content, "utf-8");
+      await this.pruneRecoveryFiles(filePath);
       const currentState = await this.readFileState(filePath);
       if (currentState.fingerprint !== expectedFingerprint) {
         throw new ExternalMemoryWriteConflict();
@@ -640,39 +647,40 @@ export class MemoryStore {
           throw error;
         }
       } else {
+        const recoveryPath = this.recoveryPathFor(filePath);
         try {
-          await fs.rename(filePath, basePath);
+          await fs.rename(filePath, recoveryPath);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
             throw new ExternalMemoryWriteConflict();
           }
           throw error;
         }
-
-        const displacedState = await this.readFileState(basePath);
-        if (displacedState.fingerprint !== expectedFingerprint) {
-          await this.restoreDisplacedFile(basePath, filePath);
-          throw new ExternalMemoryWriteConflict();
-        }
-
+        let published = false;
         try {
+          const displacedState = await this.readFileState(recoveryPath);
+          if (displacedState.fingerprint !== expectedFingerprint) {
+            throw new ExternalMemoryWriteConflict();
+          }
+
           await fs.link(tmpPath, filePath);
+          published = true;
+
+          const verifiedDisplacedState = await this.readFileState(recoveryPath);
+          if (verifiedDisplacedState.fingerprint !== expectedFingerprint) {
+            throw new ExternalMemoryWriteConflict();
+          }
         } catch (error) {
-          await this.preserveConflictFile(basePath, filePath, "base");
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          if (published) {
+            await this.preserveConflictFile(filePath, filePath, "local");
+          }
+          await this.restoreDisplacedFile(recoveryPath, filePath);
+          if ((error as NodeJS.ErrnoException).code === "EEXIST"
+            || error instanceof ExternalMemoryWriteConflict) {
             throw new ExternalMemoryWriteConflict();
           }
           throw error;
         }
-
-        const verifiedDisplacedState = await this.readFileState(basePath);
-        if (verifiedDisplacedState.fingerprint !== expectedFingerprint) {
-          await this.preserveConflictFile(filePath, filePath, "local");
-          await this.restoreDisplacedFile(basePath, filePath);
-          throw new ExternalMemoryWriteConflict();
-        }
-
-        await fs.unlink(basePath);
       }
 
       await fs.unlink(tmpPath);
@@ -688,10 +696,36 @@ export class MemoryStore {
   private async restoreDisplacedFile(displacedPath: string, filePath: string): Promise<void> {
     try {
       await fs.link(displacedPath, filePath);
-      await fs.unlink(displacedPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      await this.preserveConflictFile(displacedPath, filePath, "base");
+    }
+  }
+
+  private recoveryPathFor(filePath: string): string {
+    return path.join(
+      path.dirname(filePath),
+      `.${path.basename(filePath)}.recovery-${Date.now()}-${randomUUID()}`,
+    );
+  }
+
+  private async pruneRecoveryFiles(filePath: string): Promise<void> {
+    const directory = path.dirname(filePath);
+    const prefix = `.${path.basename(filePath)}.recovery-`;
+    const cutoff = Date.now() - RECOVERY_RETENTION_MS;
+    try {
+      const names = await fs.readdir(directory);
+      await Promise.all(names.filter((name) => name.startsWith(prefix)).map(async (name) => {
+        const recoveryPath = path.join(directory, name);
+        try {
+          const before = await fs.stat(recoveryPath);
+          if (before.mtimeMs >= cutoff) return;
+          const after = await fs.stat(recoveryPath);
+          if (after.mtimeMs !== before.mtimeMs || after.size !== before.size || after.mtimeMs >= cutoff) return;
+          await fs.unlink(recoveryPath);
+        } catch {
+        }
+      }));
+    } catch {
     }
   }
 

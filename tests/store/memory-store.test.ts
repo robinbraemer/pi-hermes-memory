@@ -499,6 +499,31 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(!result.success);
       assert.equal(result.error, "new_content cannot be empty. Use 'remove' to delete entries.");
     });
+
+    it("replaces identical failure text across project scopes while preserving each scope", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.addFailure(`${TEST_MARKER} shared correction`, { category: "correction", project: "project-a" });
+      await store.addFailure(`${TEST_MARKER} shared correction`, { category: "correction", project: "project-b" });
+
+      const result = await store.replace(
+        "failure",
+        `[correction] ${TEST_MARKER} shared correction`,
+        `[correction] ${TEST_MARKER} replacement`,
+      );
+
+      assert.equal(result.success, true);
+      const entries = store.getRawEntriesForSync("failure");
+      assert.equal(entries.length, 2);
+      assert.ok(entries.every((entry) => entry.includes(`${TEST_MARKER} replacement`)));
+      assert.deepEqual(
+        entries.map((entry) => entry.match(/project64=([A-Za-z0-9_-]+)/)?.[1]).sort(),
+        [
+          Buffer.from("project-a", "utf-8").toString("base64url"),
+          Buffer.from("project-b", "utf-8").toString("base64url"),
+        ],
+      );
+    });
   });
 
   // ─── remove() tests ───
@@ -583,6 +608,19 @@ describe("MemoryStore", { concurrency: 1 }, () => {
 
       assert.ok(!result.success);
       assert.equal(result.error, "old_text cannot be empty.");
+    });
+
+    it("removes identical failure text across project scopes", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.addFailure(`${TEST_MARKER} shared correction`, { category: "correction", project: "project-a" });
+      await store.addFailure(`${TEST_MARKER} shared correction`, { category: "correction", project: "project-b" });
+
+      const result = await store.remove("failure", `[correction] ${TEST_MARKER} shared correction`);
+
+      assert.equal(result.success, true);
+      assert.deepEqual(store.getRawEntriesForSync("failure"), []);
+      assert.equal((await readRaw(failurePath)).trim(), "");
     });
   });
 
@@ -926,7 +964,7 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       const originalRead = (store as any).readFileState.bind(store);
       let injected = false;
       (store as any).readFileState = async (filePath: string) => {
-        if (!injected && filePath !== memoryPath && path.basename(filePath) === "base.md") {
+        if (!injected && path.basename(filePath).startsWith(`.${MEMORY_FILE}.recovery-`)) {
           injected = true;
           await handle.truncate(0);
           await handle.writeFile(`${TEST_MARKER} descriptor editor`, "utf-8");
@@ -948,6 +986,93 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.match(raw, /local add/);
     });
 
+    it("preserves a late write through a displaced open descriptor", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing`);
+      const handle = await fs.open(memoryPath, "r+");
+
+      const originalRead = (store as any).readFileState.bind(store);
+      let displacedReads = 0;
+      (store as any).readFileState = async (filePath: string) => {
+        const state = await originalRead(filePath);
+        if (path.basename(filePath).startsWith(`.${MEMORY_FILE}.recovery-`)) {
+          displacedReads++;
+          if (displacedReads === 2) {
+            await handle.truncate(0);
+            await handle.writeFile(`${TEST_MARKER} late descriptor editor`, "utf-8");
+            await handle.sync();
+          }
+        }
+        return state;
+      };
+
+      try {
+        const result = await store.add("memory", `${TEST_MARKER} local add`);
+        assert.equal(result.success, true);
+      } finally {
+        await handle.close();
+      }
+
+      const siblings = await fs.readdir(MEMORY_DIR);
+      const recoveryFiles = siblings.filter((name) => name.startsWith(`.${MEMORY_FILE}.recovery-`));
+      assert.ok(recoveryFiles.length > 0);
+      const recovered = await Promise.all(
+        recoveryFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+      );
+      assert.ok(recovered.some((content) => content.includes("late descriptor editor")));
+    });
+
+    it("keeps the displaced original when either verification stage fails", async () => {
+      for (const failureRead of [1, 2]) {
+        await cleanSlate();
+        const store = new MemoryStore(makeConfig());
+        await store.loadFromDisk();
+        await store.add("memory", `${TEST_MARKER} original before failure ${failureRead}`);
+
+        const originalRead = (store as any).readFileState.bind(store);
+        let displacedReads = 0;
+        (store as any).readFileState = async (filePath: string) => {
+          if (path.basename(filePath).startsWith(`.${MEMORY_FILE}.recovery-`)) {
+            displacedReads++;
+            if (displacedReads === failureRead) {
+              throw new Error(`injected displaced verification failure ${failureRead}`);
+            }
+          }
+          return originalRead(filePath);
+        };
+
+        await assert.rejects(
+          store.add("memory", `${TEST_MARKER} local add`),
+          new RegExp(`injected displaced verification failure ${failureRead}`),
+        );
+
+        const siblings = await fs.readdir(MEMORY_DIR);
+        const recoveryFiles = siblings.filter((name) => name.startsWith(`.${MEMORY_FILE}.recovery-`));
+        const recovered = await Promise.all(
+          recoveryFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+        );
+        assert.ok(recovered.some((content) => content.includes(`original before failure ${failureRead}`)));
+        assert.match(await readRaw(memoryPath), new RegExp(`original before failure ${failureRead}`));
+      }
+    });
+
+    it("prunes expired recovery files but retains recently active ones", async () => {
+      const expiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-expired`);
+      const activePath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-active`);
+      await writeRaw(expiredPath, `${TEST_MARKER} expired recovery`);
+      await writeRaw(activePath, `${TEST_MARKER} active recovery`);
+      const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+      await fs.utimes(expiredPath, expired, expired);
+
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} triggers recovery pruning`);
+
+      await assert.rejects(fs.stat(expiredPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+      assert.equal(await fs.readFile(activePath, "utf-8"), `${TEST_MARKER} active recovery`);
+    });
+
     it("replays when an editor recreates the path after displacement", async () => {
       const store = new MemoryStore(makeConfig());
       await store.loadFromDisk();
@@ -957,7 +1082,7 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       let injected = false;
       (store as any).readFileState = async (filePath: string) => {
         const state = await originalRead(filePath);
-        if (!injected && filePath !== memoryPath && path.basename(filePath) === "base.md") {
+        if (!injected && path.basename(filePath).startsWith(`.${MEMORY_FILE}.recovery-`)) {
           injected = true;
           await writeRaw(memoryPath, `${TEST_MARKER} recreated editor`);
         }
