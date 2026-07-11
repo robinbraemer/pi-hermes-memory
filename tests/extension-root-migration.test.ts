@@ -385,8 +385,19 @@ describe("migrateExtensionRoot", () => {
     const retiredDb = new Database(path.join(retirement, "sessions.db"));
     retiredDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('published generation')");
     retiredDb.close();
-    fs.linkSync(path.join(retirement, "sessions.db"), path.join(target, "sessions.db"));
-    fs.writeFileSync(path.join(target, ".sessions-db-migration-pending"), "interrupted", "utf-8");
+    const targetDb = path.join(target, "sessions.db");
+    fs.copyFileSync(path.join(retirement, "sessions.db"), targetDb);
+    const targetState = fs.lstatSync(targetDb);
+    fs.writeFileSync(path.join(target, ".sessions-db-migration-pending"), JSON.stringify({
+      version: 1,
+      state: "publishing",
+      retirementDirectory: path.basename(retirement),
+      retiredNames: ["sessions.db"],
+      publication: "snapshot",
+      targets: {
+        "sessions.db": { type: "file", dev: targetState.dev, ino: targetState.ino },
+      },
+    }), "utf-8");
 
     const result = await migrateExtensionRoot(legacy, target);
 
@@ -402,6 +413,127 @@ describe("migrateExtensionRoot", () => {
     } finally {
       migrated.close();
     }
+  });
+
+  it("preserves recovery artifacts when a completed destination is not owned by the pending migration", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    const retirement = path.join(legacy, ".sessions-db-retirement-unverified");
+    fs.mkdirSync(retirement, { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+    const retiredDb = new Database(path.join(retirement, "sessions.db"));
+    retiredDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('recoverable generation')");
+    retiredDb.close();
+    const unrelatedDb = new Database(path.join(target, "sessions.db"));
+    unrelatedDb.exec("CREATE TABLE unrelated (value TEXT); INSERT INTO unrelated VALUES ('replacement')");
+    unrelatedDb.close();
+    fs.writeFileSync(path.join(target, ".sessions-db-migration-pending"), "interrupted", "utf-8");
+
+    const result = await migrateExtensionRoot(legacy, target);
+
+    assert.deepStrictEqual(result.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+    assert.match(result.criticalFailures[0].message, /recovery artifacts/);
+    assert.equal(fs.existsSync(retirement), true);
+    assert.equal(fs.existsSync(path.join(target, ".sessions-db-migration-pending")), true);
+    const preserved = new Database(path.join(retirement, "sessions.db"), { readonly: true });
+    try {
+      assert.deepStrictEqual(
+        preserved.prepare("SELECT value FROM retained").all(),
+        [{ value: "recoverable generation" }],
+      );
+    } finally {
+      preserved.close();
+    }
+  });
+
+  it("preserves recovery artifacts when an owned snapshot symlink is dangling", { skip: process.platform === "win32" }, async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    const retirement = path.join(legacy, ".sessions-db-retirement-dangling");
+    fs.mkdirSync(retirement, { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+    const retiredDb = new Database(path.join(retirement, "sessions.db"));
+    retiredDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('recoverable generation')");
+    retiredDb.close();
+    const linkTarget = path.join(tmpDir, "missing.db");
+    fs.symlinkSync(linkTarget, path.join(target, "sessions.db"));
+    fs.writeFileSync(path.join(target, ".sessions-db-migration-pending"), JSON.stringify({
+      version: 1,
+      state: "publishing",
+      retirementDirectory: path.basename(retirement),
+      retiredNames: ["sessions.db"],
+      publication: "snapshot",
+      targets: {
+        "sessions.db": { type: "symlink", target: linkTarget },
+      },
+    }), "utf-8");
+
+    const result = await migrateExtensionRoot(legacy, target);
+
+    assert.deepStrictEqual(result.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+    assert.equal(fs.existsSync(retirement), true);
+    assert.equal(fs.existsSync(path.join(target, ".sessions-db-migration-pending")), true);
+  });
+
+  it("preserves a verified retirement directory containing an unexpected entry", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    const retirement = path.join(legacy, ".sessions-db-retirement-extra");
+    fs.mkdirSync(retirement, { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+    const retiredDb = new Database(path.join(retirement, "sessions.db"));
+    retiredDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('recoverable generation')");
+    retiredDb.close();
+    fs.writeFileSync(path.join(retirement, "unexpected.txt"), "preserve me", "utf-8");
+    const targetPath = path.join(target, "sessions.db");
+    fs.copyFileSync(path.join(retirement, "sessions.db"), targetPath);
+    const targetState = fs.lstatSync(targetPath);
+    fs.writeFileSync(path.join(target, ".sessions-db-migration-pending"), JSON.stringify({
+      version: 1,
+      state: "publishing",
+      retirementDirectory: path.basename(retirement),
+      retiredNames: ["sessions.db"],
+      publication: "snapshot",
+      targets: {
+        "sessions.db": { type: "file", dev: targetState.dev, ino: targetState.ino },
+      },
+    }), "utf-8");
+
+    const result = await migrateExtensionRoot(legacy, target);
+
+    assert.deepStrictEqual(result.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+    assert.equal(fs.readFileSync(path.join(retirement, "unexpected.txt"), "utf-8"), "preserve me");
+    assert.equal(fs.existsSync(path.join(target, ".sessions-db-migration-pending")), true);
+  });
+
+  it("finishes resume for an owned raw corrupt generation without integrity validation", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    const retirement = path.join(legacy, ".sessions-db-retirement-raw");
+    fs.mkdirSync(retirement, { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+    const retiredPath = path.join(retirement, "sessions.db");
+    const targetPath = path.join(target, "sessions.db");
+    fs.writeFileSync(retiredPath, "intentionally preserved corrupt SQLite bytes", "utf-8");
+    fs.linkSync(retiredPath, targetPath);
+    const targetState = fs.lstatSync(targetPath);
+    fs.writeFileSync(path.join(target, ".sessions-db-migration-pending"), JSON.stringify({
+      version: 1,
+      state: "publishing",
+      retirementDirectory: path.basename(retirement),
+      retiredNames: ["sessions.db"],
+      publication: "raw",
+      targets: {
+        "sessions.db": { type: "file", dev: targetState.dev, ino: targetState.ino },
+      },
+    }), "utf-8");
+
+    const result = await migrateExtensionRoot(legacy, target);
+
+    assert.deepStrictEqual(result.criticalFailures, []);
+    assert.equal(fs.existsSync(path.join(target, ".sessions-db-migration-pending")), false);
+    assert.equal(fs.existsSync(retirement), false);
+    assert.equal(fs.readFileSync(targetPath, "utf-8"), "intentionally preserved corrupt SQLite bytes");
   });
 
   it("never mixes legacy sidecars into an existing destination generation", async () => {

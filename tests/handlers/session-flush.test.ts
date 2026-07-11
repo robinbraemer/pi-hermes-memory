@@ -109,6 +109,13 @@ function flushMessage(call: { args: any[] }): string {
   return args[args.length - 1];
 }
 
+async function waitForExecCalls(mockPi: ReturnType<typeof createMockPi>, count: number, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (mockPi.execCalls.length < count && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 describe("setupSessionFlush", () => {
@@ -156,8 +163,7 @@ describe("setupSessionFlush", () => {
     const ctx = { sessionManager: { getBranch: () => mockBranch(8) } };
     await emit(mockPi.handlers, "session_shutdown", {}, ctx);
 
-    // Shutdown flush is fire-and-forget — wait for microtask queue to settle
-    await new Promise(r => setTimeout(r, 10));
+    await waitForExecCalls(mockPi, 1);
     assert.equal(mockPi.execCalls.length, 1, "exec should be called once");
   });
 

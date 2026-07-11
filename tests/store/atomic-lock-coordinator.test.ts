@@ -142,9 +142,10 @@ describe('AtomicLockCoordinator', () => {
     const prototype = AtomicLockCoordinator.prototype as any;
     const originalDeleteOwnedLock = prototype.deleteOwnedLock;
     let deleteAttempts = 0;
+    let releaseFailureEndsAt = 0;
     prototype.deleteOwnedLock = function (key: string, token: string): void {
       deleteAttempts++;
-      if (deleteAttempts <= 3) throw new Error('injected release failure');
+      if (Date.now() < releaseFailureEndsAt) throw new Error('injected release failure');
       return originalDeleteOwnedLock.call(this, key, token);
     };
 
@@ -152,8 +153,9 @@ describe('AtomicLockCoordinator', () => {
       const owner = new AtomicLockCoordinator(dbPath);
       const lease = owner.tryAcquire('shared', { staleMs: 60_000 });
       assert.ok(lease);
+      releaseFailureEndsAt = Date.now() + 150;
       lease.release();
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, 250));
 
       const moduleUrl = new URL('../../src/store/atomic-lock-coordinator.ts', import.meta.url).href;
       const child = spawnSync(process.execPath, [
@@ -169,7 +171,7 @@ describe('AtomicLockCoordinator', () => {
         dbPath,
       ], { encoding: 'utf-8' });
 
-      assert.equal(deleteAttempts, 4);
+      assert.ok(deleteAttempts > 3);
       assert.strictEqual(child.status, 0, child.stderr);
     } finally {
       prototype.deleteOwnedLock = originalDeleteOwnedLock;

@@ -127,8 +127,15 @@ function fireTurnEnd(branch: any[] = makeBranch(10), ctxOverrides: Record<string
 }
 
 // Allow async handlers to settle
-async function settle(ms = 50) {
+async function settle(ms = 200) {
   await new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitForExecCalls(count: number, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (execCalls.length < count && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 function logicalChildArgs(index = execCalls.length - 1): string[] {
@@ -147,7 +154,7 @@ function reviewPrompt(index = execCalls.length - 1): string {
 
 // ─── Tests ───
 
-describe("setupBackgroundReview", () => {
+describe("setupBackgroundReview", { concurrency: 1 }, () => {
   beforeEach(() => {
     handlers = {};
     execCalls = [];
@@ -303,7 +310,7 @@ describe("setupBackgroundReview", () => {
     for (let i = 0; i < 10; i++) {
       fireTurnEnd();
     }
-    await settle(50);
+    await waitForExecCalls(1);
 
     assert.strictEqual(execCalls.length, 1, "exec should be called once for first trigger");
 
@@ -311,7 +318,7 @@ describe("setupBackgroundReview", () => {
     for (let i = 0; i < 15; i++) {
       fireTurnEnd();
     }
-    await settle(50);
+    await settle(100);
 
     assert.strictEqual(execCalls.length, 1, "exec should still only be called once — reviewInProgress guard");
 

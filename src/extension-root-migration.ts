@@ -9,6 +9,27 @@ import { canonicalStoragePathSync } from "./store/canonical-storage-path.js";
 const DATABASE_FILES = ["sessions.db", "sessions.db-wal", "sessions.db-shm"] as const;
 const DATABASE_MIGRATION_PENDING_FILE = ".sessions-db-migration-pending";
 
+type DatabaseFileName = typeof DATABASE_FILES[number];
+
+type ExpectedDatabaseEntry =
+  | { type: "file"; dev: number; ino: number }
+  | { type: "symlink"; target: string };
+
+interface PreparingDatabaseMigrationMarker {
+  version: 1;
+  state: "preparing";
+  retirementDirectory: string;
+}
+
+interface PublishingDatabaseMigrationMarker {
+  version: 1;
+  state: "publishing";
+  retirementDirectory: string;
+  retiredNames: DatabaseFileName[];
+  publication: "snapshot" | "raw";
+  targets: Record<string, ExpectedDatabaseEntry>;
+}
+
 export interface ExtensionRootMigrationResult {
   moved: number;
   merged: number;
@@ -74,6 +95,151 @@ async function databaseRetirementArtifacts(legacyRoot: string): Promise<string[]
     if ((await databaseFilesAt(directory)).length > 0) directories.push(directory);
   }
   return directories;
+}
+
+function sameNames(left: string[], right: string[]): boolean {
+  return left.length === right.length
+    && [...left].sort().every((name, index) => name === [...right].sort()[index]);
+}
+
+async function expectedDatabaseEntry(filePath: string): Promise<ExpectedDatabaseEntry> {
+  const state = await fs.lstat(filePath);
+  if (state.isFile()) return { type: "file", dev: state.dev, ino: state.ino };
+  if (state.isSymbolicLink()) return { type: "symlink", target: await fs.readlink(filePath) };
+  throw new Error(`${filePath} is not a regular file or symlink`);
+}
+
+async function writeMigrationMarker(
+  markerPath: string,
+  marker: PreparingDatabaseMigrationMarker | PublishingDatabaseMigrationMarker,
+  exclusive = false,
+): Promise<void> {
+  const content = `${JSON.stringify(marker)}\n`;
+  if (exclusive) {
+    await fs.writeFile(markerPath, content, { encoding: "utf-8", flag: "wx", mode: 0o600 });
+    return;
+  }
+
+  const temporaryPath = `${markerPath}.${randomUUID()}.tmp`;
+  const handle = await fs.open(temporaryPath, "wx", 0o600);
+  try {
+    await handle.writeFile(content, "utf-8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await fs.rename(temporaryPath, markerPath);
+  } catch (error) {
+    try { await fs.unlink(temporaryPath); } catch {}
+    throw error;
+  }
+}
+
+async function publishingMarker(
+  retirementDir: string,
+  retiredNames: string[],
+  publication: "snapshot" | "raw",
+  sources: Record<string, string>,
+): Promise<PublishingDatabaseMigrationMarker> {
+  const targets: Record<string, ExpectedDatabaseEntry> = {};
+  for (const [name, source] of Object.entries(sources)) {
+    targets[name] = await expectedDatabaseEntry(source);
+  }
+  return {
+    version: 1,
+    state: "publishing",
+    retirementDirectory: path.basename(retirementDir),
+    retiredNames: retiredNames as DatabaseFileName[],
+    publication,
+    targets,
+  };
+}
+
+function parsePublishingMarker(content: string): PublishingDatabaseMigrationMarker | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const marker = value as Partial<PublishingDatabaseMigrationMarker>;
+  if (marker.version !== 1 || marker.state !== "publishing") return null;
+  if (typeof marker.retirementDirectory !== "string"
+    || path.basename(marker.retirementDirectory) !== marker.retirementDirectory
+    || !marker.retirementDirectory.startsWith(".sessions-db-retirement-")) return null;
+  if (!Array.isArray(marker.retiredNames)
+    || marker.retiredNames.length === 0
+    || !marker.retiredNames.includes("sessions.db")
+    || new Set(marker.retiredNames).size !== marker.retiredNames.length
+    || marker.retiredNames.some((name) => !DATABASE_FILES.includes(name as DatabaseFileName))) return null;
+  if (marker.publication !== "snapshot" && marker.publication !== "raw") return null;
+  if (!marker.targets || typeof marker.targets !== "object" || Array.isArray(marker.targets)) return null;
+  const targetNames = Object.keys(marker.targets);
+  const expectedTargetNames = marker.publication === "snapshot" ? ["sessions.db"] : marker.retiredNames;
+  if (!sameNames(targetNames, expectedTargetNames)) return null;
+  for (const target of Object.values(marker.targets)) {
+    if (!target || typeof target !== "object") return null;
+    if (target.type === "file") {
+      if (!Number.isSafeInteger(target.dev) || !Number.isSafeInteger(target.ino)) return null;
+    } else if (target.type === "symlink") {
+      if (typeof target.target !== "string") return null;
+    } else {
+      return null;
+    }
+  }
+  return marker as PublishingDatabaseMigrationMarker;
+}
+
+async function matchesExpectedDatabaseEntry(filePath: string, expected: ExpectedDatabaseEntry): Promise<boolean> {
+  try {
+    const state = await fs.lstat(filePath);
+    if (expected.type === "file") {
+      return state.isFile() && state.dev === expected.dev && state.ino === expected.ino;
+    }
+    return state.isSymbolicLink() && await fs.readlink(filePath) === expected.target;
+  } catch {
+    return false;
+  }
+}
+
+function hasValidSqliteIntegrity(filePath: string): boolean {
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(filePath, { readonly: true, fileMustExist: true });
+    return db.pragma("integrity_check", { simple: true }) === "ok";
+  } catch {
+    return false;
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
+async function isVerifiedCompletedMigration(
+  legacyRoot: string,
+  targetRoot: string,
+  pendingMarker: string,
+  retirementArtifacts: string[],
+  targetNames: string[],
+): Promise<boolean> {
+  let marker: PublishingDatabaseMigrationMarker | null;
+  try {
+    marker = parsePublishingMarker(await fs.readFile(pendingMarker, "utf-8"));
+  } catch {
+    return false;
+  }
+  if (!marker || retirementArtifacts.length !== 1) return false;
+  const retirementDir = path.join(legacyRoot, marker.retirementDirectory);
+  if (path.resolve(retirementArtifacts[0]) !== path.resolve(retirementDir)) return false;
+  if (!sameNames(await fs.readdir(retirementDir), marker.retiredNames)) return false;
+  if (!sameNames(targetNames, Object.keys(marker.targets))) return false;
+  for (const [name, expected] of Object.entries(marker.targets)) {
+    if (!await matchesExpectedDatabaseEntry(path.join(targetRoot, name), expected)) return false;
+  }
+  if (marker.publication === "snapshot"
+    && !hasValidSqliteIntegrity(path.join(targetRoot, "sessions.db"))) return false;
+  return true;
 }
 
 async function moveFileSafe(source: string, target: string): Promise<void> {
@@ -315,7 +481,16 @@ async function migrateDatabaseGeneration(
   const retirementArtifacts = hadPendingMarker
     ? await databaseRetirementArtifacts(legacyRoot)
     : [];
-  if (sourceNames.length === 0 && hadPendingMarker && targetNames.includes("sessions.db")) {
+  if (sourceNames.length === 0
+    && hadPendingMarker
+    && targetNames.includes("sessions.db")
+    && await isVerifiedCompletedMigration(
+      legacyRoot,
+      targetRoot,
+      pendingMarker,
+      retirementArtifacts,
+      targetNames,
+    )) {
     for (const retirementArtifact of retirementArtifacts) {
       await fs.rm(retirementArtifact, { recursive: true, force: true });
     }
@@ -391,7 +566,11 @@ async function migrateDatabaseGeneration(
   let corruptGeneration = false;
   let generationNames = sourceNames;
   try {
-    await fs.writeFile(pendingMarker, `${process.pid}:${randomUUID()}\n`, { mode: 0o600 });
+    await writeMigrationMarker(pendingMarker, {
+      version: 1,
+      state: "preparing",
+      retirementDirectory: path.basename(retirementDir),
+    }, true);
     await fs.mkdir(stagingDir, { mode: 0o700 });
     const source = path.join(legacyRoot, "sessions.db");
     const staged = path.join(stagingDir, "sessions.db");
@@ -433,6 +612,13 @@ async function migrateDatabaseGeneration(
           if (error instanceof DatabaseGenerationMoveError) retired = error.moved;
           throw error;
         }
+        const rawSources = Object.fromEntries(
+          retired.map((name) => [name, path.join(retirementDir, name)]),
+        );
+        await writeMigrationMarker(
+          pendingMarker,
+          await publishingMarker(retirementDir, retired, "raw", rawSources),
+        );
         for (const name of retired) {
           const target = path.join(targetRoot, name);
           await publish(path.join(retirementDir, name), target);
@@ -451,6 +637,10 @@ async function migrateDatabaseGeneration(
         throw error;
       }
       const target = path.join(targetRoot, "sessions.db");
+      await writeMigrationMarker(
+        pendingMarker,
+        await publishingMarker(retirementDir, retired, "snapshot", { "sessions.db": staged }),
+      );
       await publish(staged, target);
       published.set(target, await fileIdentity(target));
     }

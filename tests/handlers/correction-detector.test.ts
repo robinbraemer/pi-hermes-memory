@@ -221,7 +221,7 @@ describe("isCorrection", () => {
 
 // ─── Handler behavior tests ───
 
-describe("setupCorrectionDetector handler", () => {
+describe("setupCorrectionDetector handler", { concurrency: 1 }, () => {
   let handlers: Record<string, Function[]>;
   let execCalls: any[];
   let notifyCalls: any[];
@@ -302,7 +302,7 @@ describe("setupCorrectionDetector handler", () => {
     return ctx;
   }
 
-  async function settle(ms = 30) {
+  async function settle(ms = 200) {
     await new Promise((r) => setTimeout(r, ms));
   }
 

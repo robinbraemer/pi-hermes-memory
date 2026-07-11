@@ -142,7 +142,7 @@ export class MemoryStore {
   }
 
   async getStorageIdentity(target: "memory" | "user" | "failure"): Promise<string> {
-    return this.resolveStoragePath(target);
+    return this.refreshStoragePath(target);
   }
 
   private async resolveStoragePath(target: "memory" | "user" | "failure"): Promise<string> {
@@ -150,6 +150,17 @@ export class MemoryStore {
     if (cached) return cached;
     const resolved = await canonicalMarkdownIdentity(this.pathFor(target));
     this.storagePaths[target] = resolved;
+    return resolved;
+  }
+
+  private async refreshStoragePath(target: "memory" | "user" | "failure"): Promise<string> {
+    const previous = this.storagePaths[target];
+    const resolved = await canonicalMarkdownIdentity(this.pathFor(target));
+    if (previous !== resolved) {
+      if (previous) delete this.fileFingerprints[previous];
+      delete this.fileFingerprints[resolved];
+      this.storagePaths[target] = resolved;
+    }
     return resolved;
   }
 
@@ -184,7 +195,7 @@ export class MemoryStore {
   async loadFromDisk(): Promise<void> {
     await fs.mkdir(this.memoryDir, { recursive: true });
     for (const target of ["memory", "user", "failure"] as const) {
-      const filePath = await this.resolveStoragePath(target);
+      const filePath = await this.refreshStoragePath(target);
       await withMarkdownMutationLock(filePath, async () => {
         await recoverInterruptedMarkdownPublication(filePath);
         const state = await this.readFileState(filePath);
@@ -656,44 +667,48 @@ export class MemoryStore {
     target: "memory" | "user" | "failure",
     mutation: () => Promise<MemoryResult>,
   ): Promise<MemoryResult> {
-    const storagePath = await this.resolveStoragePath(target);
-    return withMarkdownMutationLock(storagePath, async () => {
-      for (let attempt = 0; ; attempt++) {
-        try {
-          const result = await mutation();
-          if (result.success && this.mutationObserver) {
+    while (true) {
+      const storagePath = await this.refreshStoragePath(target);
+      const outcome = await withMarkdownMutationLock(storagePath, async (): Promise<MemoryResult | null> => {
+        if (await this.refreshStoragePath(target) !== storagePath) return null;
+        for (let attempt = 0; ; attempt++) {
+          try {
+            const result = await mutation();
+            if (result.success && this.mutationObserver) {
+              const filePath = storagePath;
+              const state = await this.readFileState(filePath);
+              this.setEntries(target, [...new Set(state.entries)]);
+              this.fileFingerprints[filePath] = state.fingerprint;
+              const warning = await this.mutationObserver(target, [...state.entries]);
+              if (warning) {
+                const warnings = [...(result.warnings ?? []), warning];
+                return {
+                  ...result,
+                  message: result.message ? `${result.message} Warning: ${warning}` : warning,
+                  warning,
+                  warnings,
+                };
+              }
+            }
+            return result;
+          } catch (error) {
             const filePath = storagePath;
+            delete this.fileFingerprints[filePath];
             const state = await this.readFileState(filePath);
             this.setEntries(target, [...new Set(state.entries)]);
             this.fileFingerprints[filePath] = state.fingerprint;
-            const warning = await this.mutationObserver(target, [...state.entries]);
-            if (warning) {
-              const warnings = [...(result.warnings ?? []), warning];
+            if (!(error instanceof ExternalMemoryWriteConflict)) throw error;
+            if (attempt >= MAX_EXTERNAL_WRITE_RETRIES) {
               return {
-                ...result,
-                message: result.message ? `${result.message} Warning: ${warning}` : warning,
-                warning,
-                warnings,
+                success: false,
+                error: "Memory file changed repeatedly during this update. No external changes were overwritten.",
               };
             }
           }
-          return result;
-        } catch (error) {
-          const filePath = storagePath;
-          delete this.fileFingerprints[filePath];
-          const state = await this.readFileState(filePath);
-          this.setEntries(target, [...new Set(state.entries)]);
-          this.fileFingerprints[filePath] = state.fingerprint;
-          if (!(error instanceof ExternalMemoryWriteConflict)) throw error;
-          if (attempt >= MAX_EXTERNAL_WRITE_RETRIES) {
-            return {
-              success: false,
-              error: "Memory file changed repeatedly during this update. No external changes were overwritten.",
-            };
-          }
         }
-      }
-    });
+      });
+      if (outcome) return outcome;
+    }
   }
 
   /**

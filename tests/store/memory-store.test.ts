@@ -899,6 +899,48 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       }
     });
 
+    for (const [target, fileName] of [
+      ["memory", MEMORY_FILE],
+      ["user", USER_FILE],
+      ["failure", "failures.md"],
+    ] as const) {
+      it(`follows a retargeted ${fileName} symlink on the next mutation`, { skip: process.platform === "win32" }, async () => {
+        const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-retargeted-symlink-test-"));
+        const aliasDir = path.join(root, "alias");
+        const firstDir = path.join(root, "first");
+        const secondDir = path.join(root, "second");
+        await Promise.all([
+          fs.mkdir(aliasDir),
+          fs.mkdir(firstDir),
+          fs.mkdir(secondDir),
+        ]);
+        const aliasPath = path.join(aliasDir, fileName);
+        const firstPath = path.join(firstDir, fileName);
+        const secondPath = path.join(secondDir, fileName);
+        await fs.writeFile(firstPath, `${TEST_MARKER} first target`, "utf-8");
+        await fs.writeFile(secondPath, `${TEST_MARKER} second target`, "utf-8");
+        await fs.symlink(firstPath, aliasPath, "file");
+
+        try {
+          const store = new MemoryStore(makeConfig({ memoryDir: aliasDir }));
+          await store.loadFromDisk();
+          await fs.unlink(aliasPath);
+          await fs.symlink(secondPath, aliasPath, "file");
+
+          const result = await store.add(target, `${TEST_MARKER} retargeted write`);
+
+          assert.equal(result.success, true);
+          assert.equal(await fs.readFile(firstPath, "utf-8"), `${TEST_MARKER} first target`);
+          const second = await fs.readFile(secondPath, "utf-8");
+          assert.match(second, /second target/);
+          assert.match(second, /retargeted write/);
+          assert.doesNotMatch(second, /first target/);
+        } finally {
+          await fs.rm(root, { recursive: true, force: true });
+        }
+      });
+    }
+
     it("rejects Markdown symlink loops before mutation", { skip: process.platform === "win32" }, async () => {
       const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-symlink-loop-test-"));
       await fs.symlink(USER_FILE, path.join(root, MEMORY_FILE), "file");

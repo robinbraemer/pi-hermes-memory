@@ -85,12 +85,14 @@ function probeProcessIncarnation(pid: number): string | null {
 
 const currentProcessIncarnation = probeProcessIncarnation(process.pid);
 const RELEASE_ATTEMPTS = 3;
-const RELEASE_RETRY_ATTEMPTS = 3;
-const RELEASE_RETRY_DELAY_MS = 10;
+const RELEASE_RETRY_WINDOW_MS = 30_000;
+const RELEASE_RETRY_INITIAL_DELAY_MS = 10;
+const RELEASE_RETRY_MAX_DELAY_MS = 1_000;
 
 interface PendingRelease {
   attempt: () => boolean;
-  retriesRemaining: number;
+  deadline: number;
+  nextDelayMs: number;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -175,7 +177,8 @@ export class AtomicLockCoordinator {
     if (pendingReleases.has(pendingKey)) return;
     const pending: PendingRelease = {
       attempt: () => this.tryDeleteOwnedLock(key, token),
-      retriesRemaining: RELEASE_RETRY_ATTEMPTS,
+      deadline: Date.now() + RELEASE_RETRY_WINDOW_MS,
+      nextDelayMs: RELEASE_RETRY_INITIAL_DELAY_MS,
     };
     pendingReleases.set(pendingKey, pending);
     this.schedulePendingRelease(pendingKey, pending);
@@ -211,6 +214,12 @@ export class AtomicLockCoordinator {
   }
 
   private schedulePendingRelease(pendingKey: string, pending: PendingRelease): void {
+    const remainingMs = pending.deadline - Date.now();
+    if (remainingMs <= 0) {
+      this.clearPendingRelease(pendingKey, pending);
+      return;
+    }
+    const delayMs = Math.min(pending.nextDelayMs, remainingMs);
     pending.timer = setTimeout(() => {
       pending.timer = undefined;
       if (pendingReleases.get(pendingKey) !== pending) return;
@@ -218,9 +227,9 @@ export class AtomicLockCoordinator {
         this.clearPendingRelease(pendingKey, pending);
         return;
       }
-      pending.retriesRemaining--;
-      if (pending.retriesRemaining > 0) this.schedulePendingRelease(pendingKey, pending);
-    }, RELEASE_RETRY_DELAY_MS);
+      pending.nextDelayMs = Math.min(pending.nextDelayMs * 2, RELEASE_RETRY_MAX_DELAY_MS);
+      this.schedulePendingRelease(pendingKey, pending);
+    }, delayMs);
     pending.timer.unref?.();
   }
 
