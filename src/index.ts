@@ -53,6 +53,7 @@ import { detectProject, detectProjectSkills } from "./project.js";
 import { buildPromptContext } from "./prompt-context.js";
 import { migrateLegacyProjectMemoryDirs } from "./project-memory-migration.js";
 import { AGENT_ROOT } from "./paths.js";
+import { isDatabaseMigrationPending } from "./extension-root-migration.js";
 
 export function resolveProjectSkillDiscovery(
   skillStore: SkillStore,
@@ -110,8 +111,7 @@ export default function (pi: ExtensionAPI) {
   });
   const dbManager = new DatabaseManager(globalDir);
   let databaseMigrationPending = shouldMigrateExtensionRoot
-    && fs.existsSync(path.join(legacyGlobalDir, "sessions.db"))
-    && !fs.existsSync(path.join(globalDir, "sessions.db"));
+    && isDatabaseMigrationPending(legacyGlobalDir, globalDir);
   if (databaseMigrationPending) {
     dbManager.setOpenGuard(() => {
       if (databaseMigrationPending) {

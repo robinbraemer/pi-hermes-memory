@@ -4,7 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { migrateExtensionRoot } from "../src/extension-root-migration.js";
+import {
+  isDatabaseMigrationPending,
+  migrateExtensionRoot,
+} from "../src/extension-root-migration.js";
 
 let tmpDir = "";
 
@@ -213,6 +216,83 @@ describe("migrateExtensionRoot", () => {
     } finally {
       migrated.close();
     }
+  });
+
+  it("does not delete a destination created while source retirement fails", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    const sourceDb = new Database(path.join(legacy, "sessions.db"));
+    sourceDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('legacy')");
+    sourceDb.close();
+
+    const failed = await migrateExtensionRoot(legacy, target, {
+      retireDatabaseFile: async (source, destination) => {
+        await fs.promises.rename(source, destination);
+        const concurrent = new Database(path.join(target, "sessions.db"));
+        concurrent.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('concurrent')");
+        concurrent.close();
+        throw new Error("injected source retirement failure");
+      },
+    });
+
+    assert.deepStrictEqual(failed.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+    const concurrent = new Database(path.join(target, "sessions.db"), { readonly: true });
+    try {
+      assert.deepStrictEqual(concurrent.prepare("SELECT value FROM retained").all(), [{ value: "concurrent" }]);
+    } finally {
+      concurrent.close();
+    }
+    assert.equal(fs.existsSync(path.join(legacy, "sessions.db")), true);
+    assert.equal(isDatabaseMigrationPending(legacy, target), true);
+    const retried = await migrateExtensionRoot(legacy, target);
+    assert.deepStrictEqual(retried.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+  });
+
+  it("keeps corrupt generation publication behind the pending boundary", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    fs.writeFileSync(path.join(legacy, "sessions.db"), "not sqlite", "utf-8");
+    fs.writeFileSync(path.join(legacy, "sessions.db-wal"), "legacy wal", "utf-8");
+    const observations: boolean[] = [];
+
+    const result = await migrateExtensionRoot(legacy, target, {
+      publishDatabaseFile: async (source, destination) => {
+        observations.push(isDatabaseMigrationPending(legacy, target));
+        await fs.promises.link(source, destination);
+      },
+    });
+
+    assert.deepStrictEqual(result.criticalFailures, []);
+    assert.ok(observations.length >= 1);
+    assert.ok(observations.every(Boolean));
+    assert.equal(isDatabaseMigrationPending(legacy, target), false);
+    assert.equal(fs.readFileSync(path.join(target, "sessions.db"), "utf-8"), "not sqlite");
+  });
+
+  it("preserves the retirement directory when rollback restoration is incomplete", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    const sourceDb = new Database(path.join(legacy, "sessions.db"));
+    sourceDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('legacy')");
+    sourceDb.close();
+
+    const failed = await migrateExtensionRoot(legacy, target, {
+      retireDatabaseFile: async (source, destination) => {
+        await fs.promises.rename(source, destination);
+        fs.mkdirSync(source);
+        throw new Error("injected retirement failure after move");
+      },
+    });
+
+    assert.deepStrictEqual(failed.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+    const retirementDirs = fs.readdirSync(legacy).filter((name) => name.startsWith(".sessions-db-retirement-"));
+    assert.equal(retirementDirs.length, 1);
+    assert.equal(fs.existsSync(path.join(legacy, retirementDirs[0], "sessions.db")), true);
+    assert.match(failed.criticalFailures[0].message, /recovery artifacts preserved at/);
+    assert.equal(isDatabaseMigrationPending(legacy, target), true);
   });
 
   it("preserves the raw generation when backup detects corruption after locking", async () => {

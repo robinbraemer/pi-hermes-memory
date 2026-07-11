@@ -7,6 +7,7 @@ import { AtomicLockCoordinator, type AtomicLockLease } from "./store/atomic-lock
 import { canonicalStoragePathSync } from "./store/canonical-storage-path.js";
 
 const DATABASE_FILES = ["sessions.db", "sessions.db-wal", "sessions.db-shm"] as const;
+const DATABASE_MIGRATION_PENDING_FILE = ".sessions-db-migration-pending";
 
 export interface ExtensionRootMigrationResult {
   moved: number;
@@ -31,6 +32,11 @@ export interface ExtensionRootMigrationOptions {
 
 const MIGRATION_LOCK_WAIT_MS = 5000;
 const MIGRATION_LOCK_POLL_MS = 50;
+
+export function isDatabaseMigrationPending(legacyRoot: string, targetRoot: string): boolean {
+  return existsSync(path.join(targetRoot, DATABASE_MIGRATION_PENDING_FILE))
+    || (existsSync(path.join(legacyRoot, "sessions.db")) && !existsSync(path.join(targetRoot, "sessions.db")));
+}
 
 async function pathExists(filePath: string): Promise<boolean> {
   try {
@@ -130,6 +136,12 @@ async function acquireMigrationLease(legacyRoot: string, targetRoot: string): Pr
   }
 }
 
+class DatabaseGenerationMoveError extends Error {
+  constructor(message: string, readonly moved: string[], options: { cause: unknown }) {
+    super(message, options);
+  }
+}
+
 async function moveDatabaseGeneration(
   names: string[],
   sourceRoot: string,
@@ -147,23 +159,50 @@ async function moveDatabaseGeneration(
         await move(source, target);
         moved.push(name);
       } catch (error) {
-        if (!await pathEntryExists(source) && await pathEntryExists(target)) moved.push(name);
+        if (await pathEntryExists(target)) moved.push(name);
         throw error;
       }
     }
     return moved;
   } catch (error) {
-    for (const name of moved.reverse()) {
-      await fs.rename(path.join(holdingRoot, name), path.join(sourceRoot, name));
-    }
-    throw error;
+    throw new DatabaseGenerationMoveError(
+      error instanceof Error ? error.message : String(error),
+      moved,
+      { cause: error },
+    );
   }
 }
 
-async function restoreDatabaseGeneration(names: string[], holdingRoot: string, sourceRoot: string): Promise<void> {
+async function restoreDatabaseGeneration(names: string[], holdingRoot: string, sourceRoot: string): Promise<string[]> {
+  const failures: string[] = [];
   for (const name of [...names].reverse()) {
     const held = path.join(holdingRoot, name);
-    if (await pathEntryExists(held)) await fs.rename(held, path.join(sourceRoot, name));
+    if (!await pathEntryExists(held)) continue;
+    try {
+      await fs.rename(held, path.join(sourceRoot, name));
+    } catch (error) {
+      failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return failures;
+}
+
+interface FileIdentity {
+  dev: number;
+  ino: number;
+}
+
+async function fileIdentity(filePath: string): Promise<FileIdentity> {
+  const stat = await fs.lstat(filePath);
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+async function unlinkIfOwned(filePath: string, identity: FileIdentity): Promise<void> {
+  try {
+    const current = await fileIdentity(filePath);
+    if (current.dev === identity.dev && current.ino === identity.ino) await fs.unlink(filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 
@@ -257,11 +296,43 @@ async function migrateDatabaseGeneration(
   }
 
   try {
+  const pendingMarker = path.join(targetRoot, DATABASE_MIGRATION_PENDING_FILE);
+  const hadPendingMarker = await pathEntryExists(pendingMarker);
   const sourceNames = await databaseFilesAt(legacyRoot);
   const targetNames = await databaseFilesAt(targetRoot);
-  if (sourceNames.length === 0) return;
+  if (sourceNames.length === 0) {
+    if (!hadPendingMarker) return;
+    if (targetNames.includes("sessions.db")) {
+      await fs.unlink(pendingMarker);
+      return;
+    }
+    const retirementDirs = (await fs.readdir(legacyRoot))
+      .filter((name) => name.startsWith(".sessions-db-retirement-"));
+    const message = retirementDirs.length > 0
+      ? `an interrupted migration preserved recovery artifacts at ${retirementDirs.map((name) => path.join(legacyRoot, name)).join(", ")}`
+      : "an interrupted migration has no complete source or destination SQLite generation";
+    result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+    result.criticalFailures.push({
+      name: "sessions.db",
+      source: path.join(legacyRoot, "sessions.db"),
+      target: path.join(targetRoot, "sessions.db"),
+      message,
+    });
+    return;
+  }
 
   if (targetNames.includes("sessions.db")) {
+    if (hadPendingMarker) {
+      const message = "an incomplete migration left both legacy and destination SQLite generations; manual recovery is required";
+      result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+      result.criticalFailures.push({
+        name: "sessions.db",
+        source: path.join(legacyRoot, "sessions.db"),
+        target: path.join(targetRoot, "sessions.db"),
+        message,
+      });
+      return;
+    }
     result.skipped += sourceNames.length;
     return;
   }
@@ -283,8 +354,10 @@ async function migrateDatabaseGeneration(
   await fs.mkdir(targetRoot, { recursive: true });
   const stagingDir = path.join(targetRoot, `.sessions-db-migration-${randomUUID()}`);
   const retirementDir = path.join(legacyRoot, `.sessions-db-retirement-${randomUUID()}`);
-  const published: string[] = [];
+  const published = new Map<string, FileIdentity>();
   let retired: string[] = [];
+  let preserveRetirement = false;
+  let keepPendingMarker = false;
   let writeLock: {
     pragma: (query: string) => unknown;
     exec: (sql: string) => void;
@@ -293,6 +366,7 @@ async function migrateDatabaseGeneration(
   let corruptGeneration = false;
   let generationNames = sourceNames;
   try {
+    await fs.writeFile(pendingMarker, `${process.pid}:${randomUUID()}\n`, { mode: 0o600 });
     await fs.mkdir(stagingDir, { mode: 0o700 });
     const source = path.join(legacyRoot, "sessions.db");
     const staged = path.join(stagingDir, "sessions.db");
@@ -328,11 +402,16 @@ async function migrateDatabaseGeneration(
         }
       }
       if (corruptGeneration) {
-        retired = await moveDatabaseGeneration(generationNames, legacyRoot, retirementDir, retire);
+        try {
+          retired = await moveDatabaseGeneration(generationNames, legacyRoot, retirementDir, retire);
+        } catch (error) {
+          if (error instanceof DatabaseGenerationMoveError) retired = error.moved;
+          throw error;
+        }
         for (const name of retired) {
           const target = path.join(targetRoot, name);
           await publish(path.join(retirementDir, name), target);
-          published.push(target);
+          published.set(target, await fileIdentity(target));
         }
       }
     } else {
@@ -340,25 +419,41 @@ async function migrateDatabaseGeneration(
     }
 
     if (!corruptGeneration) {
+      try {
+        retired = await moveDatabaseGeneration(generationNames, legacyRoot, retirementDir, retire);
+      } catch (error) {
+        if (error instanceof DatabaseGenerationMoveError) retired = error.moved;
+        throw error;
+      }
       const target = path.join(targetRoot, "sessions.db");
       await publish(staged, target);
-      published.push(target);
-      retired = await moveDatabaseGeneration(generationNames, legacyRoot, retirementDir, retire);
+      published.set(target, await fileIdentity(target));
     }
 
     if (writeLock) writeLock.exec("COMMIT");
     result.moved += generationNames.length;
   } catch (error) {
-    for (const target of published.reverse()) {
-      try { await fs.unlink(target); } catch {}
+    for (const [target, identity] of [...published.entries()].reverse()) {
+      try { await unlinkIfOwned(target, identity); } catch {}
     }
+    let restoreFailures: string[] = [];
     if (retired.length > 0) {
-      try { await restoreDatabaseGeneration(retired, retirementDir, legacyRoot); } catch {}
+      restoreFailures = await restoreDatabaseGeneration(retired, retirementDir, legacyRoot);
+      preserveRetirement = restoreFailures.length > 0;
+      keepPendingMarker = preserveRetirement;
     }
+    const destinationPreserved = await pathEntryExists(path.join(targetRoot, "sessions.db"));
+    if (destinationPreserved) keepPendingMarker = true;
     if (writeLock) {
       try { writeLock.exec("ROLLBACK"); } catch {}
     }
-    const message = error instanceof Error ? error.message : String(error);
+    const baseMessage = error instanceof Error ? error.message : String(error);
+    let message = restoreFailures.length > 0
+      ? `${baseMessage}; recovery artifacts preserved at ${retirementDir} (${restoreFailures.join("; ")})`
+      : baseMessage;
+    if (destinationPreserved) {
+      message += `; an unowned destination generation was preserved at ${path.join(targetRoot, "sessions.db")}`;
+    }
     result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
     result.criticalFailures.push({
       name: "sessions.db",
@@ -371,7 +466,12 @@ async function migrateDatabaseGeneration(
       try { writeLock.close(); } catch {}
     }
     try { await fs.rm(stagingDir, { recursive: true, force: true }); } catch {}
-    try { await fs.rm(retirementDir, { recursive: true, force: true }); } catch {}
+    if (!preserveRetirement) {
+      try { await fs.rm(retirementDir, { recursive: true, force: true }); } catch {}
+    }
+    if (!keepPendingMarker) {
+      try { await fs.unlink(pendingMarker); } catch {}
+    }
   }
   } finally {
     lease.release();
