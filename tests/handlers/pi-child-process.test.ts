@@ -195,9 +195,11 @@ describe("execChildPrompt", () => {
   it("returns a successful child result when temporary cleanup fails", async () => {
     let cleanupCalls = 0;
     let promptDirectory = "";
+    let promptPath = "";
     const pi = {
       exec: async (_cmd: string, args: string[]) => {
-        promptDirectory = path.dirname(args.at(-1)!.slice(1));
+        promptPath = args.at(-1)!.slice(1);
+        promptDirectory = path.dirname(promptPath);
         return { code: 0, stdout: "completed", stderr: "" };
       },
     };
@@ -219,8 +221,27 @@ describe("execChildPrompt", () => {
       assert.equal(result.code, 0);
       assert.equal(result.stdout, "completed");
       assert.equal(cleanupCalls, 1);
+      await assert.rejects(fs.access(promptPath), { code: "ENOENT" });
+      await fs.access(promptDirectory);
     } finally {
       if (promptDirectory) await fs.rm(promptDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it("sweeps stale prompt directories before starting a child", async () => {
+    const staleDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "pi-hermes-prompt-"));
+    await fs.writeFile(path.join(staleDirectory, "prompt.md"), "stale private prompt", { mode: 0o600 });
+    const stale = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    await fs.utimes(staleDirectory, stale, stale);
+
+    try {
+      await execChildPrompt({
+        exec: async () => ({ code: 0, stdout: "ok", stderr: "" }),
+      } as any, "current prompt", {}, { timeoutMs: 30000 });
+
+      await assert.rejects(fs.access(staleDirectory), { code: "ENOENT" });
+    } finally {
+      await fs.rm(staleDirectory, { recursive: true, force: true });
     }
   });
 

@@ -652,6 +652,21 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.deepEqual(store.getUserEntries(), []);
     });
 
+    it("restores an interrupted publication before loading a missing memory file", async () => {
+      const recoveryName = `.${MEMORY_FILE}.recovery-${Date.now()}-00000000-0000-4000-8000-000000000000`;
+      const recoveryPath = path.join(MEMORY_DIR, recoveryName);
+      const pendingPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.publication-pending`);
+      await writeRaw(recoveryPath, `${TEST_MARKER} interrupted publication`);
+      await writeRaw(pendingPath, recoveryName);
+
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+
+      assert.deepEqual(store.getMemoryEntries(), [`${TEST_MARKER} interrupted publication`]);
+      assert.equal(await readRaw(memoryPath), `${TEST_MARKER} interrupted publication`);
+      await assert.rejects(fs.access(pendingPath), { code: "ENOENT" });
+    });
+
     it("deduplicates entries preserving order", async () => {
       const entry1 = `${TEST_MARKER} dup original`;
       const entry2 = `${TEST_MARKER} dup second`;

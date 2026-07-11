@@ -65,6 +65,17 @@ async function databaseFilesAt(root: string): Promise<string[]> {
   return names;
 }
 
+async function databaseRetirementArtifacts(legacyRoot: string): Promise<string[]> {
+  const entries = await fs.readdir(legacyRoot, { withFileTypes: true });
+  const directories: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith(".sessions-db-retirement-")) continue;
+    const directory = path.join(legacyRoot, entry.name);
+    if ((await databaseFilesAt(directory)).length > 0) directories.push(directory);
+  }
+  return directories;
+}
+
 async function moveFileSafe(source: string, target: string): Promise<void> {
   await fs.mkdir(path.dirname(target), { recursive: true });
 
@@ -301,17 +312,27 @@ async function migrateDatabaseGeneration(
   const hadPendingMarker = await pathEntryExists(pendingMarker);
   const sourceNames = await databaseFilesAt(legacyRoot);
   const targetNames = await databaseFilesAt(targetRoot);
+  const retirementArtifacts = hadPendingMarker
+    ? await databaseRetirementArtifacts(legacyRoot)
+    : [];
+  if (retirementArtifacts.length > 0) {
+    const message = `an interrupted migration preserved recovery artifacts at ${retirementArtifacts.join(", ")}`;
+    result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+    result.criticalFailures.push({
+      name: "sessions.db",
+      source: path.join(legacyRoot, "sessions.db"),
+      target: path.join(targetRoot, "sessions.db"),
+      message,
+    });
+    return;
+  }
   if (sourceNames.length === 0) {
     if (!hadPendingMarker) return;
     if (targetNames.includes("sessions.db")) {
       await fs.unlink(pendingMarker);
       return;
     }
-    const retirementDirs = (await fs.readdir(legacyRoot))
-      .filter((name) => name.startsWith(".sessions-db-retirement-"));
-    const message = retirementDirs.length > 0
-      ? `an interrupted migration preserved recovery artifacts at ${retirementDirs.map((name) => path.join(legacyRoot, name)).join(", ")}`
-      : "an interrupted migration has no complete source or destination SQLite generation";
+    const message = "an interrupted migration has no complete source or destination SQLite generation";
     result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
     result.criticalFailures.push({
       name: "sessions.db",

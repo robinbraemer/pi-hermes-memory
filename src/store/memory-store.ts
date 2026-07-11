@@ -38,8 +38,70 @@ const CONFLICT_ACTIVE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 const CONFLICT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const CONFLICT_MAX_COUNT = 32;
 const CONFLICT_MAX_BYTES = 64 * 1024 * 1024;
+const UUID_PATTERN = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
 
 class ExternalMemoryWriteConflict extends Error {}
+
+function publicationPendingPath(filePath: string): string {
+  return path.join(path.dirname(filePath), `.${path.basename(filePath)}.publication-pending`);
+}
+
+function recoveryFilePattern(filePath: string): RegExp {
+  const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^\\.${escapedName}\\.recovery-\\d+-${UUID_PATTERN}$`, "i");
+}
+
+async function writePublicationMarker(tmpDir: string, pendingPath: string, recoveryPath: string): Promise<void> {
+  const markerTempPath = path.join(tmpDir, "publication.pending");
+  const handle = await fs.open(markerTempPath, "wx", 0o600);
+  try {
+    await handle.writeFile(path.basename(recoveryPath), "utf-8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fs.link(markerTempPath, pendingPath);
+}
+
+export async function recoverInterruptedMarkdownPublication(filePath: string): Promise<boolean> {
+  const pendingPath = publicationPendingPath(filePath);
+  let pendingState: Awaited<ReturnType<typeof fs.lstat>>;
+  try {
+    pendingState = await fs.lstat(pendingPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  if (!pendingState.isFile()) {
+    throw new Error(`Invalid Markdown publication marker at ${pendingPath}`);
+  }
+
+  const recoveryName = (await fs.readFile(pendingPath, "utf-8")).trim();
+  if (path.basename(recoveryName) !== recoveryName || !recoveryFilePattern(filePath).test(recoveryName)) {
+    throw new Error(`Invalid Markdown recovery reference at ${pendingPath}`);
+  }
+
+  try {
+    await fs.lstat(filePath);
+    await fs.unlink(pendingPath);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  const recoveryPath = path.join(path.dirname(filePath), recoveryName);
+  const recoveryState = await fs.lstat(recoveryPath);
+  if (!recoveryState.isFile()) {
+    throw new Error(`Invalid Markdown recovery file at ${recoveryPath}`);
+  }
+  try {
+    await fs.link(recoveryPath, filePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  await fs.unlink(pendingPath);
+  return true;
+}
 
 export class MemoryStore {
   private memoryEntries: string[] = [];
@@ -123,9 +185,12 @@ export class MemoryStore {
     await fs.mkdir(this.memoryDir, { recursive: true });
     for (const target of ["memory", "user", "failure"] as const) {
       const filePath = await this.resolveStoragePath(target);
-      const state = await this.readFileState(filePath);
-      this.setEntries(target, [...new Set(state.entries)]);
-      this.fileFingerprints[filePath] = state.fingerprint;
+      await withMarkdownMutationLock(filePath, async () => {
+        await recoverInterruptedMarkdownPublication(filePath);
+        const state = await this.readFileState(filePath);
+        this.setEntries(target, [...new Set(state.entries)]);
+        this.fileFingerprints[filePath] = state.fingerprint;
+      });
     }
 
     // Deduplicate preserving order
@@ -666,10 +731,13 @@ export class MemoryStore {
         }
       } else {
         const recoveryPath = this.recoveryPathFor(filePath);
+        const pendingPath = publicationPendingPath(filePath);
         const publishedIdentity = await this.fileIdentity(tmpPath);
+        await writePublicationMarker(tmpDir, pendingPath, recoveryPath);
         try {
           await fs.rename(filePath, recoveryPath);
         } catch (error) {
+          try { await fs.unlink(pendingPath); } catch {}
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
             throw new ExternalMemoryWriteConflict();
           }
@@ -709,12 +777,14 @@ export class MemoryStore {
             }
           }
           if (rollbackError) throw rollbackError;
+          await fs.unlink(pendingPath);
           if ((error as NodeJS.ErrnoException).code === "EEXIST"
             || error instanceof ExternalMemoryWriteConflict) {
             throw new ExternalMemoryWriteConflict();
           }
           throw error;
         }
+        await fs.unlink(pendingPath);
       }
 
       try { await this.unlinkPublishedTempLink(tmpPath); } catch { /* ignore */ }
@@ -798,9 +868,8 @@ export class MemoryStore {
   private async pruneRecoveryFiles(filePath: string): Promise<void> {
     const directory = path.dirname(filePath);
     const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const uuidPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
-    const recoveryPattern = new RegExp(`^\\.${escapedName}\\.recovery-\\d+-${uuidPattern}$`, "i");
-    const retiredPattern = new RegExp(`^\\.${escapedName}\\.retired-\\d+-${uuidPattern}$`, "i");
+    const recoveryPattern = recoveryFilePattern(filePath);
+    const retiredPattern = new RegExp(`^\\.${escapedName}\\.retired-\\d+-${UUID_PATTERN}$`, "i");
     const conflictPattern = new RegExp(
       `^\\.${escapedName}\\.conflict-local-\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
       "i",

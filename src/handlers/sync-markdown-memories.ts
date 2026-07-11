@@ -18,6 +18,7 @@ import {
   type ExtensionRootMigrationOptions,
 } from '../extension-root-migration.js';
 import { withMarkdownMutationLock } from '../store/markdown-mutation-lock.js';
+import { recoverInterruptedMarkdownPublication } from '../store/memory-store.js';
 
 export interface BackfillCounters {
   filesScanned: number;
@@ -154,7 +155,8 @@ export async function syncMarkdownMemoriesToSqlite(
     target: 'memory' | 'user' | 'failure',
     project: string | null = null,
   ) => {
-    const reconcile = () => {
+    const reconcile = async () => {
+      if (filePath) await recoverInterruptedMarkdownPublication(filePath);
       if (filePath && fs.existsSync(filePath)) counters.filesScanned++;
       const entries = filePath ? readEntries(filePath) : [];
       counters.entriesScanned += entries.length;
@@ -172,7 +174,7 @@ export async function syncMarkdownMemoriesToSqlite(
       }
     };
     if (filePath) await withMarkdownMutationLock(filePath, reconcile);
-    else reconcile();
+    else await reconcile();
   };
 
   await reconcileFile(globalMemoryFile, 'memory');

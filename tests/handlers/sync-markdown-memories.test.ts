@@ -209,6 +209,23 @@ describe('memory sqlite sync + markdown backfill', () => {
     );
   });
 
+  it('restores an interrupted Markdown publication before reconciling SQLite', async () => {
+    const memoryFile = path.join(globalDir, 'MEMORY.md');
+    const recoveryName = `.MEMORY.md.recovery-${Date.now()}-00000000-0000-4000-8000-000000000000`;
+    fs.writeFileSync(path.join(globalDir, recoveryName), 'authoritative recovered memory', 'utf-8');
+    fs.writeFileSync(path.join(globalDir, '.MEMORY.md.publication-pending'), recoveryName, 'utf-8');
+    addMemory(dbManager, 'authoritative recovered memory');
+
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(fs.readFileSync(memoryFile, 'utf-8'), 'authoritative recovered memory');
+    assert.strictEqual(counters.removed, 0);
+    assert.deepStrictEqual(
+      getMemories(dbManager, { target: 'memory', project: null }).map((entry) => entry.content),
+      ['authoritative recovered memory'],
+    );
+  });
+
   it('waits for the canonical Markdown mutation before reading and reconciling', async () => {
     const memoryFile = path.join(globalDir, 'MEMORY.md');
     fs.writeFileSync(memoryFile, 'stale memory', 'utf-8');

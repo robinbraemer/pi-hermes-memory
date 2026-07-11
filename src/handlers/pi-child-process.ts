@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, type Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -30,6 +30,9 @@ const DEFAULT_EXEC_CHILD_PROMPT_DEPENDENCIES: ExecChildPromptDependencies = {
     await fs.rm(dir, { recursive: true, force: true });
   },
 };
+
+const PROMPT_DIRECTORY_PREFIX = "pi-hermes-prompt-";
+const STALE_PROMPT_DIRECTORY_AGE_MS = 24 * 60 * 60 * 1000;
 
 export interface ChildPiInvocation {
   command: string;
@@ -221,7 +224,7 @@ function shouldRetryWithoutOverridesForError(error: unknown): boolean {
 }
 
 async function writePromptToTemporaryFile(prompt: string): Promise<{ dir: string; filePath: string }> {
-  const dir = await fs.mkdtemp(join(os.tmpdir(), "pi-hermes-prompt-"));
+  const dir = await fs.mkdtemp(join(os.tmpdir(), PROMPT_DIRECTORY_PREFIX));
   const filePath = join(dir, "prompt.md");
   try {
     await fs.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
@@ -232,6 +235,28 @@ async function writePromptToTemporaryFile(prompt: string): Promise<{ dir: string
   }
 }
 
+export async function sweepStalePromptDirectories(
+  tempRoot = os.tmpdir(),
+  staleBefore = Date.now() - STALE_PROMPT_DIRECTORY_AGE_MS,
+): Promise<void> {
+  let entries: Dirent<string>[];
+  try {
+    entries = await fs.readdir(tempRoot, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  await Promise.all(entries.map(async (entry) => {
+    if (!entry.isDirectory() || !entry.name.startsWith(PROMPT_DIRECTORY_PREFIX)) return;
+    const directory = join(tempRoot, entry.name);
+    try {
+      const state = await fs.lstat(directory);
+      if (!state.isDirectory() || state.mtimeMs >= staleBefore) return;
+      await fs.rm(directory, { recursive: true, force: true });
+    } catch {
+    }
+  }));
+}
+
 export async function execChildPrompt(
   pi: Pick<ExtensionAPI, "exec">,
   prompt: string,
@@ -239,6 +264,7 @@ export async function execChildPrompt(
   options: ExecChildPromptOptions,
   dependencies: ExecChildPromptDependencies = DEFAULT_EXEC_CHILD_PROMPT_DEPENDENCIES,
 ): Promise<PiExecResult> {
+  await sweepStalePromptDirectories();
   const execOptions = {
     signal: options.signal,
     timeout: options.timeoutMs,
@@ -271,6 +297,10 @@ export async function execChildPrompt(
     const retryInvocation = resolveChildPiInvocation(basePromptArgs(promptReference, config));
     return await pi.exec(retryInvocation.command, retryInvocation.args, execOptions) as PiExecResult;
   } finally {
-    try { await dependencies.removeTemporaryDirectory(temporaryPrompt.dir); } catch {}
+    try {
+      await dependencies.removeTemporaryDirectory(temporaryPrompt.dir);
+    } catch {
+      try { await fs.unlink(temporaryPrompt.filePath); } catch {}
+    }
   }
 }

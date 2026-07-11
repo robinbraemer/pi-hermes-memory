@@ -54,6 +54,7 @@ import { buildPromptContext } from "./prompt-context.js";
 import { migrateLegacyProjectMemoryDirs } from "./project-memory-migration.js";
 import { AGENT_ROOT } from "./paths.js";
 import { isDatabaseMigrationPending } from "./extension-root-migration.js";
+import { sweepStalePromptDirectories } from "./handlers/pi-child-process.js";
 
 export function resolveProjectSkillDiscovery(
   skillStore: SkillStore,
@@ -80,6 +81,7 @@ export function registerProjectSkillDiscoveryHandler(
 }
 
 export default function (pi: ExtensionAPI) {
+  void sweepStalePromptDirectories();
   const config = loadConfig();
 
   const agentRoot = AGENT_ROOT;
