@@ -82,6 +82,29 @@ const DEFAULT_RECOVERY_OPTIONS: ResolvedDatabaseRecoveryOptions = {
   recoveryBackupRetention: 3,
 };
 
+function canonicalStorageIdentity(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  const suffixes = [path.basename(resolved)];
+  let ancestor = path.dirname(resolved);
+  while (true) {
+    try {
+      return path.join(fs.realpathSync.native(ancestor), ...suffixes.reverse());
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) return resolved;
+    suffixes.push(path.basename(ancestor));
+    ancestor = parent;
+  }
+}
+
 function quoteIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
@@ -138,11 +161,13 @@ const Database = loadDatabaseCtor();
 export class DatabaseManager {
   private db: DatabaseLike | null = null;
   private readonly dbPath: string;
+  private readonly recoveryIdentity: string;
   private readonly recoveryOptions: ResolvedDatabaseRecoveryOptions;
   private lastRecovery: DatabaseRecoveryResult | null = null;
 
   constructor(memoryDir: string, recoveryOptions: DatabaseRecoveryOptions = {}) {
     this.dbPath = path.join(memoryDir, 'sessions.db');
+    this.recoveryIdentity = canonicalStorageIdentity(this.dbPath);
     this.recoveryOptions = { ...DEFAULT_RECOVERY_OPTIONS, ...recoveryOptions };
   }
 
@@ -335,8 +360,8 @@ export class DatabaseManager {
   }
 
   private recoverDatabaseFile(cause: unknown, verify: () => void): DatabaseRecoveryResult {
-    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(this.dbPath), '.pi-hermes-locks.sqlite'));
-    const lockKey = `recovery:${this.dbPath}`;
+    const coordinator = new AtomicLockCoordinator(path.join(path.dirname(this.recoveryIdentity), '.pi-hermes-locks.sqlite'));
+    const lockKey = `recovery:${this.recoveryIdentity}`;
     const deadline = Date.now() + Math.max(0, this.recoveryOptions.recoveryLockWaitMs);
 
     while (true) {

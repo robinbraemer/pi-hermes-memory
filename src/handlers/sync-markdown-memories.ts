@@ -8,6 +8,7 @@ import path from 'node:path';
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DatabaseManager } from '../store/db.js';
 import {
+  reconcileMarkdownFailureScopes,
   reconcileMarkdownMemoryScope,
 } from '../store/sqlite-memory-store.js';
 import { ENTRY_DELIMITER, MEMORY_FILE, USER_FILE } from '../constants.js';
@@ -94,7 +95,9 @@ export function syncMarkdownMemoriesToSqlite(
     const entries = readEntries(filePath);
     counters.entriesScanned += entries.length;
     try {
-      const result = reconcileMarkdownMemoryScope(dbManager, entries, target, project);
+      const result = target === 'failure'
+        ? reconcileMarkdownFailureScopes(dbManager, entries)
+        : reconcileMarkdownMemoryScope(dbManager, entries, target, project);
       counters.imported += result.inserted;
       counters.skipped += result.existing;
       counters.removed += result.removed;

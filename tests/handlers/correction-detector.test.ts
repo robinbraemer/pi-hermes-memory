@@ -10,6 +10,8 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseManager } from "../../src/store/db.js";
 import { getMemories } from "../../src/store/sqlite-memory-store.js";
+import { MemoryStore } from "../../src/store/memory-store.js";
+import { registerMemoryTool } from "../../src/tools/memory-tool.js";
 import { isCorrection, setupCorrectionDetector } from "../../src/handlers/correction-detector.js";
 import { resolveChildPiInvocation } from "../../src/handlers/pi-child-process.js";
 
@@ -389,10 +391,9 @@ describe("setupCorrectionDetector handler", () => {
 
   it("syncs direct correction saves into SQLite", async () => {
     const pi = createMockPi();
-    const correctionStore = {
-      ...mockStore,
-      addFailure: async () => ({ success: true, target: 'failure', entry_count: 1, message: 'Failure memory saved: correction' }),
-    } as any;
+    const correctionStore = new MemoryStore({ ...config, memoryDir: tmpDir } as any);
+    await correctionStore.loadFromDisk();
+    registerMemoryTool(pi, correctionStore, null, dbManager);
 
     setupCorrectionDetector(pi, correctionStore, null, config, dbManager);
 
@@ -409,17 +410,17 @@ describe("setupCorrectionDetector handler", () => {
     assert.strictEqual(failures.length, 1);
     assert.match(failures[0].content, /use pnpm instead/);
     assert.strictEqual(failures[0].category, 'correction');
+    assert.strictEqual(failures[0].project, null);
   });
 
   it("syncs project correction saves into SQLite with project scope", async () => {
     const pi = createMockPi();
-    const correctionStore = {
-      ...mockStore,
-      addFailure: async () => ({ success: true, target: 'failure', entry_count: 1, message: 'Failure memory saved: correction' }),
-    } as any;
+    const correctionStore = new MemoryStore({ ...config, memoryDir: tmpDir } as any);
+    await correctionStore.loadFromDisk();
     const projectStore = {
       getMemoryEntries: () => [],
     } as any;
+    registerMemoryTool(pi, correctionStore, projectStore, dbManager, 'project-a');
 
     setupCorrectionDetector(pi, correctionStore, projectStore, config, dbManager, 'project-a');
 
@@ -437,18 +438,13 @@ describe("setupCorrectionDetector handler", () => {
     assert.match(projectFailures[0].content, /use pnpm in this repo/);
     assert.match(projectFailures[0].content, /Project: project-a/);
     assert.strictEqual(projectFailures[0].category, 'correction');
+    assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
   });
 
   it("does not break correction handling when SQLite sync fails", async () => {
     const pi = createMockPi();
-    let addFailureCalls = 0;
-    const correctionStore = {
-      ...mockStore,
-      addFailure: async () => {
-        addFailureCalls++;
-        return { success: true, target: 'failure', entry_count: 1, message: 'Failure memory saved: correction' };
-      },
-    } as any;
+    const correctionStore = new MemoryStore({ ...config, memoryDir: tmpDir } as any);
+    await correctionStore.loadFromDisk();
 
     const failingDbManager = {
       getDb: () => {
@@ -456,6 +452,7 @@ describe("setupCorrectionDetector handler", () => {
       },
     } as unknown as DatabaseManager;
 
+    registerMemoryTool(pi, correctionStore, null, failingDbManager);
     setupCorrectionDetector(pi, correctionStore, null, config, failingDbManager);
 
     const branch = [
@@ -468,7 +465,7 @@ describe("setupCorrectionDetector handler", () => {
     await settle();
 
     assert.ok(execCalls.length >= 1, 'correction review should still run');
-    assert.strictEqual(addFailureCalls, 1, 'Markdown correction save should still happen');
+    assert.strictEqual(correctionStore.getFailureEntries().length, 1, 'Markdown correction save should still happen');
   });
 
   it("does not register handlers when correctionDetection is false", () => {

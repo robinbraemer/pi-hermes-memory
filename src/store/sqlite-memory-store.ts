@@ -460,6 +460,55 @@ export function reconcileMarkdownMemoryScope(
   return transactional ? transactional() : reconcile();
 }
 
+function failureProject(rawEntry: string): string | null {
+  const { text } = parseMetadataComment(rawEntry);
+  for (const segment of text.split(' — ').slice(1)) {
+    if (segment.startsWith('Project: ')) {
+      return normalizeNullable(segment.slice('Project: '.length));
+    }
+  }
+  return null;
+}
+
+export function reconcileMarkdownFailureScopes(
+  dbManager: DatabaseManager,
+  rawEntries: string[],
+): MarkdownMemoryReconcileResult {
+  const entriesByProject = new Map<string | null, string[]>();
+  for (const rawEntry of rawEntries) {
+    const project = failureProject(rawEntry);
+    const entries = entriesByProject.get(project) ?? [];
+    entries.push(rawEntry);
+    entriesByProject.set(project, entries);
+  }
+
+  const mirroredProjects = dbManager.getDb().prepare(`
+    SELECT DISTINCT project
+    FROM memories
+    WHERE target = 'failure'
+  `).all() as Array<{ project: string | null }>;
+  const projects = new Set<string | null>([
+    null,
+    ...entriesByProject.keys(),
+    ...mirroredProjects.map(({ project }) => normalizeNullable(project)),
+  ]);
+  const total: MarkdownMemoryReconcileResult = { inserted: 0, existing: 0, removed: 0 };
+
+  for (const project of projects) {
+    const result = reconcileMarkdownMemoryScope(
+      dbManager,
+      entriesByProject.get(project) ?? [],
+      'failure',
+      project,
+    );
+    total.inserted += result.inserted;
+    total.existing += result.existing;
+    total.removed += result.removed;
+  }
+
+  return total;
+}
+
 /**
  * Best-effort substring replacement for SQLite-backed memory sync.
  * Updates all matches in the scoped slice to recover from prior duplicate rows.

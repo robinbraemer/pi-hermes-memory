@@ -11,6 +11,7 @@ import { MemoryStore } from "../store/memory-store.js";
 import { DatabaseManager } from "../store/db.js";
 import {
   formatFailureMemoryContent,
+  reconcileMarkdownFailureScopes,
   reconcileMarkdownMemoryScope,
   removeExactSyncedMemories,
   removeSyncedMemories,
@@ -194,6 +195,10 @@ async function reconcileStoreScope(
 ): Promise<string | null | undefined> {
   if (!dbManager) return undefined;
   try {
+    if (rawTarget === "failure") {
+      reconcileMarkdownFailureScopes(dbManager, entries);
+      return null;
+    }
     const target = sqliteTargetFor(rawTarget);
     reconcileMarkdownMemoryScope(
       dbManager,

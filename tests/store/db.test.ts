@@ -300,8 +300,9 @@ describe('DatabaseManager', () => {
     it('waits for a recovery owner and reuses the healthy database it leaves behind', () => {
       dbManager.getDb();
       dbManager.close();
-      const lockDbPath = path.join(tmpDir, '.pi-hermes-locks.sqlite');
-      const lockKey = `recovery:${path.join(tmpDir, 'sessions.db')}`;
+      const canonicalDbPath = fs.realpathSync(path.join(tmpDir, 'sessions.db'));
+      const lockDbPath = path.join(path.dirname(canonicalDbPath), '.pi-hermes-locks.sqlite');
+      const lockKey = `recovery:${canonicalDbPath}`;
       const coordinator = new AtomicLockCoordinator(lockDbPath);
       const lease = coordinator.tryAcquire(lockKey, { staleMs: 1 });
       assert.ok(lease);
@@ -330,20 +331,50 @@ describe('DatabaseManager', () => {
     it('takes over a stale recovery lock', () => {
       dbManager.close();
       fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'not a sqlite database');
-      const lockDbPath = path.join(tmpDir, '.pi-hermes-locks.sqlite');
+      const canonicalDbPath = fs.realpathSync(path.join(tmpDir, 'sessions.db'));
+      const lockDbPath = path.join(path.dirname(canonicalDbPath), '.pi-hermes-locks.sqlite');
       const coordinator = new AtomicLockCoordinator(lockDbPath);
       coordinator.tryAcquire('schema-init', { staleMs: 50 })!.release();
       const lockDb = new Database(lockDbPath);
       lockDb.prepare(`
         INSERT INTO locks (lock_key, token, pid, acquired_at)
         VALUES (?, 'dead-owner', 999999, ?)
-      `).run(`recovery:${path.join(tmpDir, 'sessions.db')}`, Date.now() - 10_000);
+      `).run(`recovery:${canonicalDbPath}`, Date.now() - 10_000);
       lockDb.close();
 
       dbManager = new DatabaseManager(tmpDir, { recoveryLockStaleMs: 50 });
       const db = dbManager.getDb();
 
       assertQuickCheckOk(db as InstanceType<typeof Database>);
+    });
+
+    it('serializes recovery through symlinked database aliases', { skip: process.platform === 'win32' }, () => {
+      dbManager.close();
+      const realDir = path.join(tmpDir, 'real');
+      const aliasDir = path.join(tmpDir, 'alias');
+      fs.mkdirSync(realDir);
+      fs.symlinkSync(realDir, aliasDir, 'dir');
+      fs.writeFileSync(path.join(realDir, 'sessions.db'), 'not a sqlite database');
+
+      const canonicalDbPath = fs.realpathSync(path.join(realDir, 'sessions.db'));
+      const coordinator = new AtomicLockCoordinator(path.join(path.dirname(canonicalDbPath), '.pi-hermes-locks.sqlite'));
+      const lease = coordinator.tryAcquire(`recovery:${canonicalDbPath}`, { staleMs: 60_000 });
+      assert.ok(lease);
+
+      const aliasManager = new DatabaseManager(aliasDir, {
+        recoveryLockWaitMs: 25,
+        recoveryLockPollMs: 5,
+        recoveryLockStaleMs: 60_000,
+      });
+      try {
+        assert.throws(
+          () => aliasManager.getDb(),
+          /SQLite recovery already in progress/,
+        );
+      } finally {
+        aliasManager.close();
+        lease.release();
+      }
     });
 
     it('cleans abandoned rebuild files and caps corrupt backup sets', () => {

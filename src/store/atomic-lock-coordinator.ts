@@ -2,10 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 
 type StatementLike = {
   run: (...args: unknown[]) => unknown;
   get: (...args: unknown[]) => unknown;
+  all: (...args: unknown[]) => unknown[];
 };
 
 type DatabaseLike = {
@@ -23,6 +25,12 @@ export interface AtomicLockOptions {
 export interface AtomicLockLease {
   token: string;
   release: () => void;
+}
+
+export interface AtomicLockCoordinatorOptions {
+  pid?: number;
+  incarnation?: string;
+  probeIncarnation?: (pid: number) => string | null;
 }
 
 function loadDatabaseCtor(): DatabaseCtor {
@@ -46,8 +54,50 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+function probeProcessIncarnation(pid: number): string | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  if (process.platform === 'linux') {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+      const end = stat.lastIndexOf(')');
+      const fields = stat.slice(end + 2).split(' ');
+      return fields[19] || null;
+    } catch {
+      return null;
+    }
+  }
+
+  if (process.platform !== 'win32') {
+    const result = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf-8',
+      timeout: 250,
+    });
+    return result.status === 0 ? result.stdout.trim() || null : null;
+  }
+
+  const result = spawnSync(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid} -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().Ticks`],
+    { encoding: 'utf-8', timeout: 500 },
+  );
+  return result.status === 0 ? result.stdout.trim() || null : null;
+}
+
+const currentProcessIncarnation = probeProcessIncarnation(process.pid) ?? `pid-${process.pid}`;
+
 export class AtomicLockCoordinator {
-  constructor(private readonly dbPath: string) {}
+  private readonly pid: number;
+  private readonly incarnation: string;
+  private readonly probeIncarnation: (pid: number) => string | null;
+
+  constructor(private readonly dbPath: string, options: AtomicLockCoordinatorOptions = {}) {
+    this.pid = options.pid ?? process.pid;
+    this.probeIncarnation = options.probeIncarnation
+      ?? ((pid) => pid === process.pid ? currentProcessIncarnation : probeProcessIncarnation(pid));
+    this.incarnation = options.incarnation
+      ?? (this.pid === process.pid ? currentProcessIncarnation : this.probeIncarnation(this.pid))
+      ?? `pid-${this.pid}`;
+  }
 
   tryAcquire(key: string, options: AtomicLockOptions): AtomicLockLease | null {
     const token = randomUUID();
@@ -59,24 +109,31 @@ export class AtomicLockCoordinator {
       db.exec('BEGIN IMMEDIATE');
       try {
         const owner = db.prepare(`
-          SELECT token, pid, acquired_at
+          SELECT token, pid, incarnation, acquired_at
           FROM locks
           WHERE lock_key = ?
-        `).get(key) as { token: string; pid: number; acquired_at: number } | undefined;
+        `).get(key) as { token: string; pid: number; incarnation: string | null; acquired_at: number } | undefined;
 
         if (!owner) {
           db.prepare(`
-            INSERT INTO locks (lock_key, token, pid, acquired_at)
-            VALUES (?, ?, ?, ?)
-          `).run(key, token, process.pid, now);
+            INSERT INTO locks (lock_key, token, pid, incarnation, acquired_at)
+            VALUES (?, ?, ?, ?, ?)
+          `).run(key, token, this.pid, this.incarnation, now);
           acquired = true;
-        } else if (!processIsAlive(owner.pid) || now - owner.acquired_at > Math.max(0, options.staleMs)) {
-          if (!processIsAlive(owner.pid)) {
+        } else {
+          const observedIncarnation = this.probeIncarnation(owner.pid);
+          const alive = observedIncarnation !== null || processIsAlive(owner.pid);
+          const sameIncarnation = alive
+            && owner.incarnation !== null
+            && observedIncarnation !== null
+            && owner.incarnation === observedIncarnation;
+          const unknownIncarnation = alive && (owner.incarnation === null || observedIncarnation === null);
+          if (!sameIncarnation && !unknownIncarnation) {
             db.prepare(`
               UPDATE locks
-              SET token = ?, pid = ?, acquired_at = ?
+              SET token = ?, pid = ?, incarnation = ?, acquired_at = ?
               WHERE lock_key = ? AND token = ?
-            `).run(token, process.pid, now, key, owner.token);
+            `).run(token, this.pid, this.incarnation, now, key, owner.token);
             acquired = true;
           }
         }
@@ -118,9 +175,19 @@ export class AtomicLockCoordinator {
           lock_key TEXT PRIMARY KEY,
           token TEXT NOT NULL,
           pid INTEGER NOT NULL,
+          incarnation TEXT,
           acquired_at INTEGER NOT NULL
         );
       `);
+      const columns = db.prepare('PRAGMA table_info(locks)').all() as Array<{ name: string }>;
+      if (!columns.some(({ name }) => name === 'incarnation')) {
+        try {
+          db.exec('ALTER TABLE locks ADD COLUMN incarnation TEXT');
+        } catch (error) {
+          const refreshed = db.prepare('PRAGMA table_info(locks)').all() as Array<{ name: string }>;
+          if (!refreshed.some(({ name }) => name === 'incarnation')) throw error;
+        }
+      }
       if (!existed) fs.chmodSync(this.dbPath, 0o600);
       return db;
     } catch (error) {

@@ -57,4 +57,30 @@ describe('AtomicLockCoordinator', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('takes over a reused PID without taking over the original incarnation', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    try {
+      const dbPath = path.join(tmpDir, 'locks.sqlite');
+      let observedIncarnation = 'owner-start';
+      const owner = new AtomicLockCoordinator(dbPath, {
+        pid: 4242,
+        incarnation: 'owner-start',
+        probeIncarnation: () => observedIncarnation,
+      });
+      assert.ok(owner.tryAcquire('shared', { staleMs: 0 }));
+
+      const contender = new AtomicLockCoordinator(dbPath, {
+        pid: 4242,
+        incarnation: 'successor-start',
+        probeIncarnation: () => observedIncarnation,
+      });
+      assert.strictEqual(contender.tryAcquire('shared', { staleMs: 0 }), null);
+
+      observedIncarnation = 'successor-start';
+      assert.ok(contender.tryAcquire('shared', { staleMs: 0 }));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
