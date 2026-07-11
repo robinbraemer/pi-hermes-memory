@@ -374,6 +374,46 @@ describe('DatabaseManager', () => {
       assert.strictEqual(fs.readdirSync(tmpDir).filter((name) => name.startsWith('sessions.db.corrupt-')).length, 0);
     });
 
+    it('waits for an active SQLite writer before snapshot and publication', async () => {
+      const db = dbManager.getDb();
+      db.prepare("INSERT INTO extension_metadata (key, value) VALUES ('seed', 'before writer')").run();
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const readyPath = path.join(tmpDir, 'writer-ready');
+      const writer = spawn(process.execPath, [
+        '-e',
+        `const fs = require('fs');
+         const Database = require('better-sqlite3');
+         const db = new Database(process.argv[1]);
+         db.pragma('busy_timeout = 2000');
+         db.exec('BEGIN IMMEDIATE');
+         db.prepare("INSERT INTO extension_metadata (key, value) VALUES ('concurrent', 'committed writer')").run();
+         fs.writeFileSync(process.argv[2], 'ready');
+         setTimeout(() => { db.exec('COMMIT'); db.close(); }, 200);`,
+        dbPath,
+        readyPath,
+      ], { stdio: 'ignore' });
+      const deadline = Date.now() + 2_000;
+      const signal = new Int32Array(new SharedArrayBuffer(4));
+      while (!fs.existsSync(readyPath) && Date.now() < deadline) {
+        Atomics.wait(signal, 0, 0, 10);
+      }
+      assert.strictEqual(fs.existsSync(readyPath), true, 'writer did not acquire its transaction');
+
+      dbManager = new DatabaseManager(tmpDir, { recoveryLockWaitMs: 1_000 });
+      (dbManager as any).currentDatabaseIsHealthy = () => false;
+      const result = dbManager.recoverFromCorruption(corruptSqliteError());
+      const writerExit = await new Promise<number | null>((resolve) => writer.once('exit', resolve));
+      const recoveredDb = dbManager.getDb();
+
+      assert.strictEqual(writerExit, 0);
+      assert.strictEqual(result.strategy, 'rebuilt');
+      assert.deepStrictEqual(
+        recoveredDb.prepare("SELECT value FROM extension_metadata WHERE key = 'concurrent'").all(),
+        [{ value: 'committed writer' }],
+      );
+    });
+
     it('takes over a stale recovery lock', () => {
       dbManager.close();
       fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'not a sqlite database');

@@ -404,8 +404,17 @@ export class DatabaseManager {
         this.assertRecoveryCircuitClosed();
         try {
           this.cleanupRecoveryArtifactsBestEffort();
-          const result = this.recoverDatabaseFileUnlocked(cause);
-          verify();
+          const writeLock = this.acquireRecoveryWriteLock();
+          let result: DatabaseRecoveryResult;
+          try {
+            result = this.recoverDatabaseFileUnlocked(cause, writeLock);
+            verify();
+          } finally {
+            if (writeLock) {
+              try { writeLock.exec('ROLLBACK'); } catch {}
+              this.safeClose(writeLock);
+            }
+          }
           this.cleanupRecoveryArtifactsBestEffort();
           this.clearRecoveryFailuresBestEffort();
           return result;
@@ -419,13 +428,28 @@ export class DatabaseManager {
     }
   }
 
-  private recoverDatabaseFileUnlocked(cause?: unknown): DatabaseRecoveryResult {
+  private acquireRecoveryWriteLock(): DatabaseLike | null {
+    if (!this.hasExistingMainDatabaseFile()) return null;
+    let db: DatabaseLike | null = null;
+    try {
+      db = new Database(this.dbPath);
+      db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(this.recoveryOptions.recoveryLockWaitMs))}`);
+      db.exec('BEGIN IMMEDIATE');
+      return db;
+    } catch (error) {
+      if (db) this.safeClose(db);
+      if (DatabaseManager.isCorruptionError(error)) return null;
+      throw error;
+    }
+  }
+
+  private recoverDatabaseFileUnlocked(cause?: unknown, lockedSource: DatabaseLike | null = null): DatabaseRecoveryResult {
     const backupBase = this.corruptBackupBase();
     let rebuildError: unknown;
 
     if (this.databaseFileSetExists()) {
       try {
-        return this.rebuildDatabaseFromReadableRows(backupBase);
+        return this.rebuildDatabaseFromReadableRows(backupBase, lockedSource);
       } catch (err) {
         rebuildError = err;
       }
@@ -545,17 +569,20 @@ export class DatabaseManager {
     Atomics.wait(signal, 0, 0, milliseconds);
   }
 
-  private rebuildDatabaseFromReadableRows(backupBase: string): DatabaseRecoveryResult {
+  private rebuildDatabaseFromReadableRows(
+    backupBase: string,
+    lockedSource: DatabaseLike | null = null,
+  ): DatabaseRecoveryResult {
     const tempPath = this.rebuildTempPath();
     this.removeDatabaseFileSet(tempPath);
 
-    let source: DatabaseLike | null = null;
+    let source: DatabaseLike | null = lockedSource;
     let target: DatabaseLike | null = null;
     let recoveredRows: Record<string, number> | undefined;
     let rebuildOk = false;
 
     try {
-      source = new Database(this.dbPath);
+      if (!source) source = new Database(this.dbPath);
       target = new Database(tempPath);
       target.exec('PRAGMA journal_mode = DELETE');
       target.exec('PRAGMA foreign_keys = OFF');
@@ -567,7 +594,7 @@ export class DatabaseManager {
       this.assertIntegrityOk(target, 'quick_check', 'after corruption rebuild');
       rebuildOk = true;
     } finally {
-      if (source) this.safeClose(source);
+      if (source && source !== lockedSource) this.safeClose(source);
       if (target) this.safeClose(target);
       if (!rebuildOk) this.removeDatabaseFileSet(tempPath);
     }
