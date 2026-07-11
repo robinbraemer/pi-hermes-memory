@@ -344,8 +344,9 @@ export class DatabaseManager {
         fs.mkdirSync(lockDir);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        if (this.recoveryLockIsStaleOrGone(lockDir)) {
-          this.removeRecoveryLockIfOwned(lockDir);
+        const staleOwner = this.recoveryLockIsStaleOrGone(lockDir);
+        if (staleOwner) {
+          this.removeRecoveryLockIfOwned(lockDir, staleOwner);
           continue;
         }
         if (Date.now() >= deadline) {
@@ -433,38 +434,60 @@ export class DatabaseManager {
     }
   }
 
-  private recoveryLockIsStaleOrGone(lockDir: string): boolean {
+  private recoveryLockIsStaleOrGone(lockDir: string): { token?: string; rawOwner?: string; mtimeMs: number } | null {
     try {
+      const stat = fs.statSync(lockDir);
+      let rawOwner: string | undefined;
       try {
-        const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')) as { pid?: unknown };
+        rawOwner = fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8');
+        const owner = JSON.parse(rawOwner) as { pid?: unknown; token?: unknown };
+        let ownerIsDead = false;
         if (typeof owner.pid === 'number' && owner.pid > 0) {
           try {
             process.kill(owner.pid, 0);
-            return false;
+            return null;
           } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
-            return false;
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return null;
+            ownerIsDead = true;
           }
         }
+        if (ownerIsDead && typeof owner.token === 'string') {
+          return { token: owner.token, rawOwner, mtimeMs: stat.mtimeMs };
+        }
       } catch {
-        // Missing or malformed owner metadata falls back to lock age.
       }
-      return Date.now() - fs.statSync(lockDir).mtimeMs > Math.max(0, this.recoveryOptions.recoveryLockStaleMs);
+      return Date.now() - stat.mtimeMs > Math.max(0, this.recoveryOptions.recoveryLockStaleMs)
+        ? { rawOwner, mtimeMs: stat.mtimeMs }
+        : null;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { mtimeMs: -1 };
       throw error;
     }
   }
 
-  private removeRecoveryLockIfOwned(lockDir: string): void {
-    let token: string | undefined;
+  private removeRecoveryLockIfOwned(
+    lockDir: string,
+    observation: { token?: string; rawOwner?: string; mtimeMs: number } | string,
+  ): void {
+    const expected: { token?: string; rawOwner?: string; mtimeMs?: number } = typeof observation === 'string'
+      ? { token: observation }
+      : observation;
+    if (expected.mtimeMs === -1) return;
     try {
-      const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')) as { token?: unknown };
-      if (typeof owner.token === 'string') token = owner.token;
-    } catch {
+      const stat = fs.statSync(lockDir);
+      const rawOwner = fs.existsSync(path.join(lockDir, 'owner.json'))
+        ? fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8')
+        : undefined;
+      if (expected.token) {
+        const owner = rawOwner ? JSON.parse(rawOwner) as { token?: unknown } : null;
+        if (owner?.token !== expected.token) return;
+      } else if (stat.mtimeMs !== expected.mtimeMs || rawOwner !== expected.rawOwner) {
+        return;
+      }
+      fs.rmSync(lockDir, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    if (token) this.releaseRecoveryLock(lockDir, token);
-    else fs.rmSync(lockDir, { recursive: true, force: true });
   }
 
   private releaseRecoveryLock(lockDir: string, token: string): void {

@@ -12,6 +12,7 @@ import {
 } from '../store/sqlite-memory-store.js';
 import { ENTRY_DELIMITER, MEMORY_FILE, USER_FILE } from '../constants.js';
 import { AGENT_ROOT } from '../paths.js';
+import { migrateExtensionRoot } from '../extension-root-migration.js';
 
 export interface BackfillCounters {
   filesScanned: number;
@@ -114,6 +115,19 @@ export function syncMarkdownMemoriesToSqlite(
   }
 
   return { ...counters, projectCount: projects.length };
+}
+
+export async function migrateThenSyncMarkdownMemories(
+  dbManager: DatabaseManager,
+  legacyGlobalDir: string | null,
+  globalDir: string,
+  projectsMemoryDir?: string,
+  agentRoot = AGENT_ROOT,
+): Promise<BackfillCounters & { projectCount: number }> {
+  if (legacyGlobalDir) {
+    await migrateExtensionRoot(legacyGlobalDir, globalDir);
+  }
+  return syncMarkdownMemoriesToSqlite(dbManager, globalDir, projectsMemoryDir, agentRoot);
 }
 
 export function registerSyncMarkdownMemoriesCommand(

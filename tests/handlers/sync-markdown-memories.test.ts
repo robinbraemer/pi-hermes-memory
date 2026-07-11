@@ -7,6 +7,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { DatabaseManager } from '../../src/store/db.js';
 import { registerMemoryTool } from '../../src/tools/memory-tool.js';
 import {
+  migrateThenSyncMarkdownMemories,
   registerSyncMarkdownMemoriesCommand,
   syncMarkdownMemoriesToSqlite,
 } from '../../src/handlers/sync-markdown-memories.js';
@@ -232,6 +233,29 @@ describe('memory sqlite sync + markdown backfill', () => {
       assert.strictEqual(results[0].content, 'custom root project entry');
     } finally {
       customDbManager.close();
+    }
+  });
+
+  it('migrates a populated legacy database before startup reconciliation', async () => {
+    dbManager.close();
+    const legacyDir = path.join(agentRoot, 'memory');
+    const targetDir = path.join(agentRoot, 'pi-hermes-memory');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    const legacyManager = new DatabaseManager(legacyDir);
+    legacyManager.getDb().prepare(`
+      INSERT INTO sessions (id, project, cwd, started_at, ended_at, message_count)
+      VALUES ('legacy-session', 'legacy-project', '/legacy/project', '2026-07-01', NULL, 1)
+    `).run();
+    legacyManager.close();
+
+    const targetManager = new DatabaseManager(targetDir);
+    try {
+      await migrateThenSyncMarkdownMemories(targetManager, legacyDir, targetDir, undefined, agentRoot);
+
+      const sessions = targetManager.getDb().prepare('SELECT id FROM sessions').all() as Array<{ id: string }>;
+      assert.deepStrictEqual(sessions.map((session) => session.id), ['legacy-session']);
+    } finally {
+      targetManager.close();
     }
   });
 });

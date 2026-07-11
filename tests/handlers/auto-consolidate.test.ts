@@ -199,6 +199,26 @@ describe("triggerConsolidation", () => {
     assert.strictEqual(execCalls.length, 1);
   });
 
+  it("does not release a successor consolidation lock", async () => {
+    const storageHash = createHash("sha256").update(path.join("mock-store", "memory")).digest("hex");
+    const lockPath = path.join(LOCK_DIR, `memory-memory-${storageHash}.lock`);
+    const ownerPath = path.join(lockPath, "owner.json");
+    await fs.rm(lockPath, { recursive: true, force: true });
+
+    const pi = createMockPi();
+    pi.exec = async (...args: any[]) => {
+      execCalls.push(captureExecArgs(args));
+      await fs.writeFile(ownerPath, JSON.stringify({ pid: process.pid, token: "successor" }), "utf-8");
+      return { code: 0, stdout: "Done", stderr: "" };
+    };
+
+    const result = await triggerConsolidation(pi, mockStore, "memory");
+
+    assert.strictEqual(result.consolidated, true);
+    assert.strictEqual(JSON.parse(await fs.readFile(ownerPath, "utf-8")).token, "successor");
+    await fs.rm(lockPath, { recursive: true, force: true });
+  });
+
   it("returns { consolidated: false } on failure (non-zero exit code)", async () => {
     const pi = createMockPi({ code: 1, stdout: "", stderr: "some error" });
     const result = await triggerConsolidation(pi, mockStore, "memory");

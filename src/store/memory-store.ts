@@ -573,8 +573,9 @@ export class MemoryStore {
         await fs.mkdir(lockDir);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        if (await this.mutationLockIsStale(lockDir)) {
-          await this.removeMutationLockIfOwned(lockDir);
+        const staleOwner = await this.mutationLockIsStale(lockDir);
+        if (staleOwner) {
+          await this.removeMutationLockIfOwned(lockDir, staleOwner);
           continue;
         }
         if (Date.now() >= deadline) {
@@ -620,37 +621,61 @@ export class MemoryStore {
     }
   }
 
-  private async mutationLockIsStale(lockDir: string): Promise<boolean> {
+  private async mutationLockIsStale(lockDir: string): Promise<{ token?: string; rawOwner?: string; mtimeMs: number } | null> {
     try {
+      const stat = await fs.stat(lockDir);
+      let rawOwner: string | undefined;
       try {
-        const owner = JSON.parse(await fs.readFile(path.join(lockDir, "owner.json"), "utf-8")) as { pid?: unknown };
+        rawOwner = await fs.readFile(path.join(lockDir, "owner.json"), "utf-8");
+        const owner = JSON.parse(rawOwner) as { pid?: unknown; token?: unknown };
+        let ownerIsDead = false;
         if (typeof owner.pid === "number" && owner.pid > 0) {
           try {
             process.kill(owner.pid, 0);
-            return false;
+            return null;
           } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
-            return false;
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") return null;
+            ownerIsDead = true;
           }
+        }
+        if (ownerIsDead && typeof owner.token === "string") {
+          return { token: owner.token, rawOwner, mtimeMs: stat.mtimeMs };
         }
       } catch {
       }
-      return Date.now() - (await fs.stat(lockDir)).mtimeMs > 300000;
+      return Date.now() - stat.mtimeMs > 300000
+        ? { rawOwner, mtimeMs: stat.mtimeMs }
+        : null;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { mtimeMs: -1 };
       throw error;
     }
   }
 
-  private async removeMutationLockIfOwned(lockDir: string): Promise<void> {
-    let token: string | undefined;
+  private async removeMutationLockIfOwned(
+    lockDir: string,
+    observation: { token?: string; rawOwner?: string; mtimeMs: number } | string,
+  ): Promise<void> {
+    const expected: { token?: string; rawOwner?: string; mtimeMs?: number } = typeof observation === "string"
+      ? { token: observation }
+      : observation;
+    if (expected.mtimeMs === -1) return;
     try {
-      const owner = JSON.parse(await fs.readFile(path.join(lockDir, "owner.json"), "utf-8")) as { token?: unknown };
-      if (typeof owner.token === "string") token = owner.token;
-    } catch {
+      const stat = await fs.stat(lockDir);
+      const rawOwner = await fs.readFile(path.join(lockDir, "owner.json"), "utf-8").catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw error;
+      });
+      if (expected.token) {
+        const owner = rawOwner ? JSON.parse(rawOwner) as { token?: unknown } : null;
+        if (owner?.token !== expected.token) return;
+      } else if (stat.mtimeMs !== expected.mtimeMs || rawOwner !== expected.rawOwner) {
+        return;
+      }
+      await fs.rm(lockDir, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
-    if (token) await this.releaseMutationLock(lockDir, token);
-    else await fs.rm(lockDir, { recursive: true, force: true });
   }
 
   private async releaseMutationLock(lockDir: string, token: string): Promise<void> {

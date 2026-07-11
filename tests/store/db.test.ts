@@ -343,6 +343,19 @@ describe('DatabaseManager', () => {
       fs.rmSync(lockDir, { recursive: true, force: true });
     });
 
+    it('does not remove a successor observed after stale recovery inspection', () => {
+      const lockDir = path.join(tmpDir, 'sessions.db.recovery-lock');
+      fs.mkdirSync(lockDir);
+      fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: 999999, token: 'successor' }));
+
+      (dbManager as any).removeRecoveryLockIfOwned(lockDir, 'stale-owner');
+
+      assert.strictEqual(fs.existsSync(lockDir), true);
+      const owner = JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf-8'));
+      assert.strictEqual(owner.token, 'successor');
+      fs.rmSync(lockDir, { recursive: true, force: true });
+    });
+
     it('takes over a stale recovery lock', () => {
       dbManager.close();
       fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'not a sqlite database');
