@@ -226,7 +226,7 @@ describe('AtomicLockCoordinator', () => {
     }
   });
 
-  it('retains an expired shared release for recovery acquisition cleanup', () => {
+  it('continues an expired shared release so another process can recover', async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
     const prototype = AtomicLockCoordinator.prototype as any;
     const originalTryDeleteOwnedReadLock = prototype.tryDeleteOwnedReadLock;
@@ -246,10 +246,22 @@ describe('AtomicLockCoordinator', () => {
       reader.release();
       Date.now = originalDateNow;
       deletionBlocked = false;
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
 
-      const exclusive = coordinator.tryAcquireExclusive('database-access', { staleMs: 60_000 });
-      assert.ok(exclusive);
-      exclusive.release();
+      const moduleUrl = new URL('../../src/store/atomic-lock-coordinator.ts', import.meta.url).href;
+      const child = spawnSync(process.execPath, [
+        '--import',
+        'tsx',
+        '--input-type=module',
+        '-e',
+        `import { AtomicLockCoordinator } from ${JSON.stringify(moduleUrl)};
+         const coordinator = new AtomicLockCoordinator(process.argv[1]);
+         const lease = coordinator.tryAcquireExclusive('database-access', { staleMs: 60_000 });
+         if (!lease) process.exit(2);
+         lease.release();`,
+        path.join(tmpDir, 'locks.sqlite'),
+      ], { encoding: 'utf-8' });
+      assert.strictEqual(child.status, 0, child.stderr);
     } finally {
       Date.now = originalDateNow;
       prototype.tryDeleteOwnedReadLock = originalTryDeleteOwnedReadLock;

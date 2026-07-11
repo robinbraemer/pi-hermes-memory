@@ -343,10 +343,9 @@ export class AtomicLockCoordinator {
 
   private schedulePendingRelease(pendingKey: string, pending: PendingRelease): void {
     const remainingMs = pending.deadline - Date.now();
-    if (remainingMs <= 0) {
-      return;
-    }
-    const delayMs = Math.min(pending.nextDelayMs, remainingMs);
+    const delayMs = remainingMs > 0
+      ? Math.min(pending.nextDelayMs, remainingMs)
+      : RELEASE_RETRY_MAX_DELAY_MS;
     pending.timer = setTimeout(() => {
       pending.timer = undefined;
       if (pendingReleases.get(pendingKey) !== pending) return;
