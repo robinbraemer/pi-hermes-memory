@@ -376,6 +376,34 @@ describe("migrateExtensionRoot", () => {
     assert.equal(fs.readFileSync(path.join(retirement, "sessions.db-wal"), "utf-8"), "retired wal");
   });
 
+  it("finishes resume after the complete SQLite generation was published and retired", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    const retirement = path.join(legacy, ".sessions-db-retirement-complete");
+    fs.mkdirSync(retirement, { recursive: true });
+    fs.mkdirSync(target, { recursive: true });
+    const retiredDb = new Database(path.join(retirement, "sessions.db"));
+    retiredDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('published generation')");
+    retiredDb.close();
+    fs.linkSync(path.join(retirement, "sessions.db"), path.join(target, "sessions.db"));
+    fs.writeFileSync(path.join(target, ".sessions-db-migration-pending"), "interrupted", "utf-8");
+
+    const result = await migrateExtensionRoot(legacy, target);
+
+    assert.deepStrictEqual(result.criticalFailures, []);
+    assert.equal(fs.existsSync(path.join(target, ".sessions-db-migration-pending")), false);
+    assert.equal(fs.existsSync(retirement), false);
+    const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
+    try {
+      assert.deepStrictEqual(
+        migrated.prepare("SELECT value FROM retained").all(),
+        [{ value: "published generation" }],
+      );
+    } finally {
+      migrated.close();
+    }
+  });
+
   it("never mixes legacy sidecars into an existing destination generation", async () => {
     const legacy = path.join(tmpDir, "memory");
     const target = path.join(tmpDir, "pi-hermes-memory");

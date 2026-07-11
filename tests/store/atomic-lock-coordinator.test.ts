@@ -135,4 +135,45 @@ describe('AtomicLockCoordinator', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('retries a failed owner release independently so another process can acquire', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    const dbPath = path.join(tmpDir, 'locks.sqlite');
+    const prototype = AtomicLockCoordinator.prototype as any;
+    const originalDeleteOwnedLock = prototype.deleteOwnedLock;
+    let deleteAttempts = 0;
+    prototype.deleteOwnedLock = function (key: string, token: string): void {
+      deleteAttempts++;
+      if (deleteAttempts <= 3) throw new Error('injected release failure');
+      return originalDeleteOwnedLock.call(this, key, token);
+    };
+
+    try {
+      const owner = new AtomicLockCoordinator(dbPath);
+      const lease = owner.tryAcquire('shared', { staleMs: 60_000 });
+      assert.ok(lease);
+      lease.release();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const moduleUrl = new URL('../../src/store/atomic-lock-coordinator.ts', import.meta.url).href;
+      const child = spawnSync(process.execPath, [
+        '--import',
+        'tsx',
+        '--input-type=module',
+        '-e',
+        `import { AtomicLockCoordinator } from ${JSON.stringify(moduleUrl)};
+         const coordinator = new AtomicLockCoordinator(process.argv[1]);
+         const lease = coordinator.tryAcquire('shared', { staleMs: 60_000 });
+         if (!lease) process.exit(2);
+         lease.release();`,
+        dbPath,
+      ], { encoding: 'utf-8' });
+
+      assert.equal(deleteAttempts, 4);
+      assert.strictEqual(child.status, 0, child.stderr);
+    } finally {
+      prototype.deleteOwnedLock = originalDeleteOwnedLock;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

@@ -85,7 +85,16 @@ function probeProcessIncarnation(pid: number): string | null {
 
 const currentProcessIncarnation = probeProcessIncarnation(process.pid);
 const RELEASE_ATTEMPTS = 3;
-const pendingReleases = new Map<string, () => void>();
+const RELEASE_RETRY_ATTEMPTS = 3;
+const RELEASE_RETRY_DELAY_MS = 10;
+
+interface PendingRelease {
+  attempt: () => boolean;
+  retriesRemaining: number;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+const pendingReleases = new Map<string, PendingRelease>();
 
 export class AtomicLockCoordinator {
   private readonly pid: number;
@@ -159,15 +168,28 @@ export class AtomicLockCoordinator {
 
   release(key: string, token: string): void {
     const pendingKey = this.pendingReleaseKey(key, token);
+    if (this.tryDeleteOwnedLock(key, token)) {
+      this.clearPendingRelease(pendingKey);
+      return;
+    }
+    if (pendingReleases.has(pendingKey)) return;
+    const pending: PendingRelease = {
+      attempt: () => this.tryDeleteOwnedLock(key, token),
+      retriesRemaining: RELEASE_RETRY_ATTEMPTS,
+    };
+    pendingReleases.set(pendingKey, pending);
+    this.schedulePendingRelease(pendingKey, pending);
+  }
+
+  private tryDeleteOwnedLock(key: string, token: string): boolean {
     for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt++) {
       try {
         this.deleteOwnedLock(key, token);
-        pendingReleases.delete(pendingKey);
-        return;
+        return true;
       } catch {
       }
     }
-    pendingReleases.set(pendingKey, () => this.release(key, token));
+    return false;
   }
 
   private deleteOwnedLock(key: string, token: string): void {
@@ -181,9 +203,32 @@ export class AtomicLockCoordinator {
 
   private retryPendingReleases(key: string): void {
     const prefix = `${path.resolve(this.dbPath)}\0${key}\0`;
-    for (const [pendingKey, release] of [...pendingReleases.entries()]) {
-      if (pendingKey.startsWith(prefix)) release();
+    for (const [pendingKey, pending] of [...pendingReleases.entries()]) {
+      if (pendingKey.startsWith(prefix) && pending.attempt()) {
+        this.clearPendingRelease(pendingKey, pending);
+      }
     }
+  }
+
+  private schedulePendingRelease(pendingKey: string, pending: PendingRelease): void {
+    pending.timer = setTimeout(() => {
+      pending.timer = undefined;
+      if (pendingReleases.get(pendingKey) !== pending) return;
+      if (pending.attempt()) {
+        this.clearPendingRelease(pendingKey, pending);
+        return;
+      }
+      pending.retriesRemaining--;
+      if (pending.retriesRemaining > 0) this.schedulePendingRelease(pendingKey, pending);
+    }, RELEASE_RETRY_DELAY_MS);
+    pending.timer.unref?.();
+  }
+
+  private clearPendingRelease(pendingKey: string, expected?: PendingRelease): void {
+    const pending = pendingReleases.get(pendingKey);
+    if (!pending || (expected && pending !== expected)) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    pendingReleases.delete(pendingKey);
   }
 
   private pendingReleaseKey(key: string, token: string): string {

@@ -315,6 +315,13 @@ async function migrateDatabaseGeneration(
   const retirementArtifacts = hadPendingMarker
     ? await databaseRetirementArtifacts(legacyRoot)
     : [];
+  if (sourceNames.length === 0 && hadPendingMarker && targetNames.includes("sessions.db")) {
+    for (const retirementArtifact of retirementArtifacts) {
+      await fs.rm(retirementArtifact, { recursive: true, force: true });
+    }
+    await fs.unlink(pendingMarker);
+    return;
+  }
   if (retirementArtifacts.length > 0) {
     const message = `an interrupted migration preserved recovery artifacts at ${retirementArtifacts.join(", ")}`;
     result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
@@ -328,10 +335,6 @@ async function migrateDatabaseGeneration(
   }
   if (sourceNames.length === 0) {
     if (!hadPendingMarker) return;
-    if (targetNames.includes("sessions.db")) {
-      await fs.unlink(pendingMarker);
-      return;
-    }
     const message = "an interrupted migration has no complete source or destination SQLite generation";
     result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
     result.criticalFailures.push({
