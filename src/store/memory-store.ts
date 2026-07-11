@@ -998,7 +998,14 @@ export class MemoryStore {
         const retiredPath = path.join(directory, name);
         try {
           const state = await fs.lstat(retiredPath);
-          return state.isFile() ? { name, path: retiredPath, state } : null;
+          const generationTimestamp = Number(name.match(retiredPattern)?.[1]);
+          const retentionTimestamp = Math.max(
+            Number.isSafeInteger(generationTimestamp) ? generationTimestamp : 0,
+            state.mtimeMs,
+          );
+          return state.isFile()
+            ? { name, path: retiredPath, state, generationTimestamp, retentionTimestamp }
+            : null;
         } catch {
           return null;
         }
@@ -1007,18 +1014,17 @@ export class MemoryStore {
       const candidates = retired
         .filter((item): item is NonNullable<typeof item> => item !== null)
         .sort((left, right) => {
-          const leftTimestamp = Number(left.name.match(retiredPattern)?.[1]);
-          const rightTimestamp = Number(right.name.match(retiredPattern)?.[1]);
-          const leftProtected = leftTimestamp >= activeCutoff && leftTimestamp <= now;
-          const rightProtected = rightTimestamp >= activeCutoff && rightTimestamp <= now;
-          return Number(rightProtected) - Number(leftProtected) || right.state.mtimeMs - left.state.mtimeMs;
+          const leftProtected = left.generationTimestamp >= activeCutoff && left.generationTimestamp <= now;
+          const rightProtected = right.generationTimestamp >= activeCutoff && right.generationTimestamp <= now;
+          return Number(rightProtected) - Number(leftProtected)
+            || right.retentionTimestamp - left.retentionTimestamp;
         });
       let retainedCount = 0;
       let retainedBytes = 0;
       for (const item of candidates) {
-        const generationTimestamp = Number(item.name.match(retiredPattern)?.[1]);
-        const withinRecoveryGrace = generationTimestamp >= activeCutoff && generationTimestamp <= now;
-        const withinAge = item.state.mtimeMs >= maxAgeCutoff;
+        const withinRecoveryGrace = item.generationTimestamp >= activeCutoff
+          && item.generationTimestamp <= now;
+        const withinAge = item.retentionTimestamp >= maxAgeCutoff;
         const withinCount = retainedCount < RETIRED_RECOVERY_MAX_COUNT;
         const withinBytes = retainedBytes + item.state.size <= RETIRED_RECOVERY_MAX_BYTES;
         if (withinRecoveryGrace || (withinAge && withinCount && withinBytes)) {

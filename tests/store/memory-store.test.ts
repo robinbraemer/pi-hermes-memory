@@ -1691,6 +1691,23 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(retiredStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
     });
 
+    it("retains old content for 30 days after displacement", async () => {
+      const pathStore = new MemoryStore(makeConfig());
+      const cappedPath = path.join(MEMORY_DIR, "retired-displacement-age.md");
+      const displacedAt = Date.now() - 8 * 24 * 60 * 60 * 1000;
+      const retiredPath = (pathStore as any).retiredRecoveryPathFor(cappedPath, displacedAt) as string;
+      await writeRaw(retiredPath, `${TEST_MARKER} old content recently displaced`);
+      const oldContentTime = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+      await fs.utimes(retiredPath, oldContentTime, oldContentTime);
+
+      await (pathStore as any).pruneRecoveryFiles(cappedPath);
+
+      assert.equal(
+        await fs.readFile(retiredPath, "utf-8"),
+        `${TEST_MARKER} old content recently displaced`,
+      );
+    });
+
     it("prunes generated retired temp snapshots during startup load", async () => {
       const pathStore = new MemoryStore(makeConfig());
       const cappedPath = path.join(MEMORY_DIR, "retired-temp-cap.md");
