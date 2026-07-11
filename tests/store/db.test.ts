@@ -710,6 +710,37 @@ describe('DatabaseManager', () => {
       assert.ok(fs.readdirSync(tmpDir).some((name) => name.startsWith('sessions.db.corrupt-')), 'corrupt DB should be quarantined');
     });
 
+    it('keeps a published rebuild when temporary-link cleanup fails', () => {
+      const db = dbManager.getDb();
+      db.prepare(`
+        INSERT INTO sessions (id, project, cwd, started_at)
+        VALUES (?, ?, ?, ?)
+      `).run('cleanup-session', 'cleanup-project', '/work/cleanup', '2026-05-03T00:00:00Z');
+      const insertMessage = db.prepare(`
+        INSERT INTO messages (id, session_id, role, content, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (let i = 0; i < 50; i++) {
+        insertMessage.run(`cleanup-msg-${i}`, 'cleanup-session', 'assistant', `message ${i}`, `2026-05-03T00:${String(i).padStart(2, '0')}:00Z`);
+      }
+      dbManager.close();
+      corruptRecoverableIndexPage(path.join(tmpDir, 'sessions.db'), 'idx_messages_timestamp');
+
+      dbManager = new DatabaseManager(tmpDir);
+      const removeDatabaseFileSet = (dbManager as any).removeDatabaseFileSet.bind(dbManager);
+      let removeCalls = 0;
+      (dbManager as any).removeDatabaseFileSet = (basePath: string) => {
+        removeCalls++;
+        if (removeCalls === 2) throw new Error('injected post-publication cleanup failure');
+        removeDatabaseFileSet(basePath);
+      };
+      const repairedDb = dbManager.getDb();
+
+      assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'rebuilt');
+      assert.deepStrictEqual(dbManager.getStats(), { sessions: 1, messages: 50, memories: 0 });
+      assertQuickCheckOk(repairedDb as InstanceType<typeof Database>);
+    });
+
     it('skips orphan child rows while preserving readable recovery data', () => {
       const db = dbManager.getDb();
       db.prepare(`
@@ -828,6 +859,49 @@ describe('DatabaseManager', () => {
       assert.strictEqual(fs.readFileSync(walPath, 'utf-8'), 'wal generation');
       assert.strictEqual(fs.readFileSync(backupBase, 'utf-8'), 'main generation');
       assert.strictEqual(fs.readFileSync(path.join(`${backupBase}-wal`, 'retained'), 'utf-8'), 'block replacement');
+    });
+
+    it('restores none of a generation when a sidecar successor exists', () => {
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const walPath = `${dbPath}-wal`;
+      const backupBase = `${dbPath}.corrupt-test`;
+      fs.writeFileSync(dbPath, 'main generation');
+      fs.writeFileSync(walPath, 'wal generation');
+      const moved = (dbManager as any).moveDatabaseFilesToBackup(backupBase);
+      fs.writeFileSync(walPath, 'successor wal');
+
+      (dbManager as any).restoreMovedDatabaseFiles(moved);
+
+      assert.strictEqual(fs.existsSync(dbPath), false);
+      assert.strictEqual(fs.readFileSync(walPath, 'utf-8'), 'successor wal');
+      assert.strictEqual(fs.readFileSync(backupBase, 'utf-8'), 'main generation');
+      assert.strictEqual(fs.readFileSync(`${backupBase}-wal`, 'utf-8'), 'wal generation');
+    });
+
+    it('preserves backups when an owned destination changes after preflight', () => {
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const backupBase = `${dbPath}.corrupt-test`;
+      fs.writeFileSync(dbPath, 'main generation');
+      const moved = (dbManager as any).moveDatabaseFilesToBackup(backupBase);
+      fs.linkSync(backupBase, dbPath);
+      const canonicalDbPath = moved[0].original;
+      const hasDatabaseFileIdentity = (dbManager as any).hasDatabaseFileIdentity.bind(dbManager);
+      let originalChecks = 0;
+      (dbManager as any).hasDatabaseFileIdentity = (filePath: string, identity: unknown) => {
+        const owned = hasDatabaseFileIdentity(filePath, identity);
+        if (filePath === canonicalDbPath && originalChecks++ === 0) {
+          fs.rmSync(canonicalDbPath);
+          fs.writeFileSync(canonicalDbPath, 'successor generation');
+        }
+        return owned;
+      };
+
+      (dbManager as any).restoreMovedDatabaseFiles(moved);
+
+      assert.strictEqual(fs.readFileSync(backupBase, 'utf-8'), 'main generation');
+      assert.strictEqual(fs.readFileSync(dbPath, 'utf-8'), 'successor generation');
     });
 
     it('does not publish a rebuilt database over a successor generation', () => {

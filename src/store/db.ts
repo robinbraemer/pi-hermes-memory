@@ -573,7 +573,7 @@ export class DatabaseManager {
     }
 
     const moved = this.swapRebuiltDatabase(tempPath, backupBase);
-    this.removeDatabaseFileSet(tempPath);
+    try { this.removeDatabaseFileSet(tempPath); } catch {}
 
     return {
       strategy: 'rebuilt',
@@ -814,18 +814,42 @@ export class DatabaseManager {
 
   private restoreMovedDatabaseFiles(moved: MovedDatabaseFile[]): void {
     for (const file of moved) {
-      try {
-        if (!this.hasDatabaseFileIdentity(file.backup, file.identity)) break;
-        if (fs.existsSync(file.original)) {
-          if (!this.hasDatabaseFileIdentity(file.original, file.identity)) break;
-          fs.rmSync(file.backup, { force: true });
-          continue;
+      const originalExists = fs.existsSync(file.original);
+      if (originalExists && !this.hasDatabaseFileIdentity(file.original, file.identity)) return;
+      if (!originalExists && !this.hasDatabaseFileIdentity(file.backup, file.identity)) return;
+    }
+
+    const linked: MovedDatabaseFile[] = [];
+    const rollbackLinked = () => {
+      for (const reservation of [...linked].reverse()) {
+        if (this.hasDatabaseFileIdentity(reservation.original, reservation.identity)) {
+          try { fs.rmSync(reservation.original, { force: true }); } catch {}
         }
-        fs.linkSync(file.backup, file.original);
-        fs.rmSync(file.backup, { force: true });
-      } catch {
-        break;
       }
+    };
+    const restoreOrder = [...moved].sort((left, right) =>
+      Number(left.original === this.dbPath) - Number(right.original === this.dbPath)
+    );
+    for (const file of restoreOrder) {
+      if (fs.existsSync(file.original)) {
+        if (!this.hasDatabaseFileIdentity(file.original, file.identity)) {
+          rollbackLinked();
+          return;
+        }
+        continue;
+      }
+      try {
+        fs.linkSync(file.backup, file.original);
+        linked.push(file);
+      } catch {
+        rollbackLinked();
+        return;
+      }
+    }
+
+    for (const file of moved) {
+      if (!this.hasDatabaseFileIdentity(file.backup, file.identity)) continue;
+      try { fs.rmSync(file.backup, { force: true }); } catch {}
     }
   }
 
