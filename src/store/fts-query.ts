@@ -6,7 +6,7 @@ export function hasExplicitFts5Operator(query: string): boolean {
   return FTS5_OPERATOR_PATTERN.test(query.trim());
 }
 
-function collectNaturalLanguageTerms(query: string): string[] {
+export function collectNaturalLanguageTerms(query: string): string[] {
   const terms: string[] = [];
 
   for (const match of query.matchAll(FTS5_TOKEN_PATTERN)) {
