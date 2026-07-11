@@ -822,11 +822,6 @@ async function migrateDatabaseGeneration(
       throw new Error("sessions.db is not a regular file or symlink");
     }
 
-    if (writeLock) {
-      writeLock.exec("COMMIT");
-      writeLock.close();
-      writeLock = null;
-    }
     generationNames = await databaseFilesAt(legacyRoot);
     if (!generationNames.includes("sessions.db")) {
       throw new Error("legacy SQLite generation changed before retirement");
@@ -854,9 +849,6 @@ async function migrateDatabaseGeneration(
     if (!corruptGeneration && sourceState.isFile()) {
       const retiredSource = path.join(retirementDir, "sessions.db");
       try {
-        writeLock = new Database(retiredSource, { fileMustExist: true, timeout: 0 });
-        writeLock.pragma("busy_timeout = 0");
-        writeLock.exec("BEGIN IMMEDIATE");
         await backup(retiredSource, staged, onBackupProgress);
       } catch (error) {
         if (!isDatabaseCorruption(error)) throw error;
@@ -905,7 +897,6 @@ async function migrateDatabaseGeneration(
       throw new Error(`legacy SQLite generation changed during publication: ${publicationSuccessors.join(", ")}`);
     }
 
-    if (writeLock) writeLock.exec("COMMIT");
     result.moved += generationNames.length;
   } catch (error) {
     for (const [target, identity] of [...published.entries()].reverse()) {
@@ -947,9 +938,6 @@ async function migrateDatabaseGeneration(
       message,
     });
   } finally {
-    if (writeLock) {
-      try { writeLock.close(); } catch {}
-    }
     const cleanupFailures: string[] = [];
     const stagingFailure = await removeAndConfirm(stagingDir);
     if (stagingFailure) cleanupFailures.push(stagingFailure);
@@ -964,6 +952,16 @@ async function migrateDatabaseGeneration(
       } catch (error) {
         cleanupFailures.push(`${source}: ${error instanceof Error ? error.message : String(error)}`);
       }
+    }
+    if (writeLock) {
+      try {
+        writeLock.exec("COMMIT");
+      } catch (error) {
+        cleanupFailures.push(`${source}: ${error instanceof Error ? error.message : String(error)}`);
+        try { writeLock.exec("ROLLBACK"); } catch {}
+      }
+      try { writeLock.close(); } catch {}
+      writeLock = null;
     }
     if (cleanupFailures.length > 0) keepPendingMarker = true;
     if (!keepPendingMarker) {

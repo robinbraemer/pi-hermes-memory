@@ -189,7 +189,7 @@ describe("migrateExtensionRoot", () => {
     }
   });
 
-  it("closes the source database before retirement and snapshots the retired generation", async () => {
+  it("keeps pre-opened writers excluded while retiring the source generation", async () => {
     const legacy = path.join(tmpDir, "memory");
     const target = path.join(tmpDir, "pi-hermes-memory");
     fs.mkdirSync(legacy, { recursive: true });
@@ -197,34 +197,37 @@ describe("migrateExtensionRoot", () => {
     const sourceDb = new Database(sourcePath);
     sourceDb.exec("CREATE TABLE memories (content TEXT); INSERT INTO memories VALUES ('before migration')");
     sourceDb.close();
-    let retirementWriteCompleted = false;
+    const writer = new Database(sourcePath, { fileMustExist: true, timeout: 0 });
+    writer.pragma("busy_timeout = 0");
+    let retirementWriteCode = "";
 
-    const result = await migrateExtensionRoot(legacy, target, {
-      retireDatabaseFile: async (source, destination) => {
-        if (path.basename(source) === "sessions.db") {
-          const writer = new Database(source, { fileMustExist: true, timeout: 0 });
-          try {
-            writer.pragma("busy_timeout = 0");
-            writer.prepare("INSERT INTO memories VALUES (?)").run("during retirement");
-            retirementWriteCompleted = true;
-          } finally {
-            writer.close();
-          }
-        }
-        await fs.promises.rename(source, destination);
-      },
-    });
-
-    assert.equal(retirementWriteCompleted, true);
-    assert.deepStrictEqual(result.criticalFailures, []);
-    const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
     try {
-      assert.deepStrictEqual(
-        migrated.prepare("SELECT content FROM memories ORDER BY rowid").all(),
-        [{ content: "before migration" }, { content: "during retirement" }],
-      );
+      const result = await migrateExtensionRoot(legacy, target, {
+        retireDatabaseFile: async (source, destination) => {
+          if (path.basename(source) === "sessions.db") {
+            try {
+              writer.prepare("INSERT INTO memories VALUES (?)").run("during retirement");
+            } catch (error) {
+              retirementWriteCode = (error as { code?: string }).code ?? "unknown";
+            }
+          }
+          await fs.promises.rename(source, destination);
+        },
+      });
+
+      assert.equal(retirementWriteCode, "SQLITE_BUSY");
+      assert.deepStrictEqual(result.criticalFailures, []);
+      const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
+      try {
+        assert.deepStrictEqual(
+          migrated.prepare("SELECT content FROM memories ORDER BY rowid").all(),
+          [{ content: "before migration" }],
+        );
+      } finally {
+        migrated.close();
+      }
     } finally {
-      migrated.close();
+      writer.close();
     }
   });
 

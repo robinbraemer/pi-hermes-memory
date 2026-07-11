@@ -779,6 +779,11 @@ export class MemoryStore {
           await fs.link(tmpPath, filePath);
           published = true;
           await this.requireStoragePath(target, filePath);
+          await this.verifyPublishedFile(
+            filePath,
+            publishedIdentity,
+            this.fingerprint(content),
+          );
         } catch (error) {
           if (published) {
             await this.unlinkOwnedPublishedFile(filePath, publishedIdentity, this.fingerprint(content));
@@ -817,6 +822,11 @@ export class MemoryStore {
             throw new ExternalMemoryWriteConflict();
           }
           await this.requireStoragePath(target, filePath);
+          await this.verifyPublishedFile(
+            filePath,
+            publishedIdentity,
+            this.fingerprint(content),
+          );
         } catch (error) {
           let rollbackError: unknown;
           if (published) {
@@ -868,6 +878,29 @@ export class MemoryStore {
   private async fileIdentity(filePath: string): Promise<{ dev: number; ino: number }> {
     const state = await fs.lstat(filePath);
     return { dev: state.dev, ino: state.ino };
+  }
+
+  private async verifyPublishedFile(
+    filePath: string,
+    publishedIdentity: { dev: number; ino: number },
+    publishedFingerprint: string,
+  ): Promise<void> {
+    const handle = await fs.open(filePath, "r");
+    try {
+      const state = await handle.stat();
+      if (!this.sameFileIdentity({ dev: state.dev, ino: state.ino }, publishedIdentity)) {
+        throw new ExternalMemoryWriteConflict();
+      }
+      if (this.fingerprint(await handle.readFile()) !== publishedFingerprint) {
+        throw new ExternalMemoryWriteConflict();
+      }
+    } finally {
+      await handle.close();
+    }
+    const currentIdentity = await this.fileIdentity(filePath);
+    if (!this.sameFileIdentity(currentIdentity, publishedIdentity)) {
+      throw new ExternalMemoryWriteConflict();
+    }
   }
 
   private async unlinkOwnedPublishedFile(
@@ -1027,7 +1060,7 @@ export class MemoryStore {
         const withinAge = item.retentionTimestamp >= maxAgeCutoff;
         const withinCount = retainedCount < RETIRED_RECOVERY_MAX_COUNT;
         const withinBytes = retainedBytes + item.state.size <= RETIRED_RECOVERY_MAX_BYTES;
-        if (withinRecoveryGrace || (withinAge && withinCount && withinBytes)) {
+        if ((withinRecoveryGrace || withinAge) && withinCount && withinBytes) {
           retainedCount++;
           retainedBytes += item.state.size;
           continue;

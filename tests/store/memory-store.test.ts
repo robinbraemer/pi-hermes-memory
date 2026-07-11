@@ -1232,6 +1232,33 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.match(raw, /local add/);
     });
 
+    it("reapplies an add when the published pathname is atomically replaced", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing`);
+
+      const mutableStore = store as any;
+      const originalRequireStoragePath = mutableStore.requireStoragePath.bind(store);
+      let storagePathChecks = 0;
+      mutableStore.requireStoragePath = async (target: string, expectedPath: string) => {
+        await originalRequireStoragePath(target, expectedPath);
+        if (target !== "memory" || ++storagePathChecks !== 3) return;
+        const successorPath = path.join(MEMORY_DIR, `successor-${randomUUID()}.md`);
+        await writeRaw(
+          successorPath,
+          `${TEST_MARKER} existing${ENTRY_DELIMITER}${TEST_MARKER} atomic successor`,
+        );
+        await fs.rename(successorPath, expectedPath);
+      };
+
+      const result = await store.add("memory", `${TEST_MARKER} local add`);
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /atomic successor/);
+      assert.match(raw, /local add/);
+    });
+
     it("recovers a write through an open descriptor after displacement", async () => {
       const store = new MemoryStore(makeConfig());
       await store.loadFromDisk();
@@ -1603,7 +1630,7 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(activeStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
     });
 
-    it("keeps cap-retired recovery inodes reachable for late writes", async () => {
+    it("keeps cap-retired recovery inodes reachable for late writes within caps", async () => {
       const pathStore = new MemoryStore(makeConfig());
       const cappedPath = path.join(MEMORY_DIR, "cap-retirement.md");
       const displacedPath = (pathStore as any).recoveryPathFor(cappedPath) as string;
@@ -1613,7 +1640,7 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       const handle = await fs.open(displacedPath, "r+");
 
       try {
-        for (let index = 0; index < 32; index++) {
+        for (let index = 0; index < 30; index++) {
           const retiredPath = (pathStore as any).retiredRecoveryPathFor(cappedPath) as string;
           await writeRaw(retiredPath, `${TEST_MARKER} existing retired recovery ${index}`);
         }
@@ -1687,6 +1714,37 @@ describe("MemoryStore", { concurrency: 1 }, () => {
         retiredFiles.map((name) => fs.stat(path.join(MEMORY_DIR, name))),
       );
       assert.ok(!retiredFiles.includes(path.basename(staleRetiredPath)));
+      assert.ok(retiredFiles.length <= 32);
+      assert.ok(retiredStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
+    });
+
+    it("applies retired recovery caps during the recovery grace window", async () => {
+      const pathStore = new MemoryStore(makeConfig());
+      const cappedPath = path.join(MEMORY_DIR, "retired-grace-cap.md");
+      const newestTimestamp = Date.now();
+      const newestPath = (pathStore as any).retiredRecoveryPathFor(cappedPath, newestTimestamp) as string;
+      await writeRaw(newestPath, `${TEST_MARKER} newest retired snapshot`);
+      await fs.truncate(newestPath, 2 * 1024 * 1024);
+      await fs.utimes(newestPath, new Date(newestTimestamp), new Date(newestTimestamp));
+      for (let index = 1; index < 40; index++) {
+        const generationTimestamp = newestTimestamp - index * 1_000;
+        const retiredPath = (pathStore as any).retiredRecoveryPathFor(
+          cappedPath,
+          generationTimestamp,
+        ) as string;
+        await writeRaw(retiredPath, `${TEST_MARKER} recent retired ${index}`);
+        await fs.truncate(retiredPath, 2 * 1024 * 1024);
+        await fs.utimes(retiredPath, new Date(generationTimestamp), new Date(generationTimestamp));
+      }
+
+      await (pathStore as any).pruneRecoveryFiles(cappedPath);
+
+      const retiredFiles = (await fs.readdir(MEMORY_DIR))
+        .filter((name) => name.startsWith(`.${path.basename(cappedPath)}.retired-`));
+      const retiredStats = await Promise.all(
+        retiredFiles.map((name) => fs.stat(path.join(MEMORY_DIR, name))),
+      );
+      assert.ok(retiredFiles.includes(path.basename(newestPath)));
       assert.ok(retiredFiles.length <= 32);
       assert.ok(retiredStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
     });
