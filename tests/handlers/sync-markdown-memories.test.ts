@@ -271,6 +271,25 @@ describe('memory sqlite sync + markdown backfill', () => {
     );
   });
 
+  it('treats a missing canonical project file as empty despite a retained legacy backup', async () => {
+    const projectName = 'canonical-deleted-project';
+    const canonicalProjectDir = path.join(agentRoot, 'projects-memory', projectName);
+    const legacyProjectDir = path.join(agentRoot, projectName);
+    fs.mkdirSync(canonicalProjectDir, { recursive: true });
+    fs.mkdirSync(legacyProjectDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyProjectDir, 'MEMORY.md'), 'retained legacy backup', 'utf-8');
+    addMemory(dbManager, 'stale canonical row', 'memory', projectName);
+
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(counters.removed, 1);
+    assert.deepStrictEqual(getMemories(dbManager, { project: projectName, target: 'memory' }), []);
+    assert.strictEqual(
+      fs.readFileSync(path.join(legacyProjectDir, 'MEMORY.md'), 'utf-8'),
+      'retained legacy backup',
+    );
+  });
+
   it('reconciles unsafe SQLite project scopes empty without reading outside projects-memory', async () => {
     const outsideDir = path.join(agentRoot, 'outside');
     fs.mkdirSync(outsideDir, { recursive: true });
@@ -406,6 +425,29 @@ describe('memory sqlite sync + markdown backfill', () => {
       assert.equal(fs.existsSync(path.join(targetDir, 'sessions.db')), false);
       assert.equal(fs.existsSync(path.join(legacyDir, 'sessions.db')), true);
       assert.equal(migrationSucceeded, false);
+    } finally {
+      targetManager.close();
+    }
+  });
+
+  it('hands a corrupt legacy database to bounded destination recovery', async () => {
+    dbManager.close();
+    const legacyDir = path.join(agentRoot, 'memory');
+    const targetDir = path.join(agentRoot, 'pi-hermes-memory');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'sessions.db'), 'not a sqlite database', 'utf-8');
+    const targetManager = new DatabaseManager(targetDir);
+
+    try {
+      await migrateThenSyncMarkdownMemories(targetManager, legacyDir, targetDir, undefined, agentRoot);
+
+      assert.equal(fs.existsSync(path.join(legacyDir, 'sessions.db')), false);
+      assert.deepStrictEqual(targetManager.getDb().pragma?.('quick_check'), [{ quick_check: 'ok' }]);
+      assert.equal(targetManager.getLastRecovery()?.strategy, 'recreated-empty');
+      assert.ok(
+        fs.readdirSync(targetDir).some((name) => name.startsWith('sessions.db.corrupt-')),
+        'the corrupt generation should be quarantined by DatabaseManager',
+      );
     } finally {
       targetManager.close();
     }

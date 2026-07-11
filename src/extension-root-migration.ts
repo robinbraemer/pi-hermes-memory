@@ -3,6 +3,8 @@ import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { AtomicLockCoordinator, type AtomicLockLease } from "./store/atomic-lock-coordinator.js";
+import { canonicalStoragePathSync } from "./store/canonical-storage-path.js";
 
 const DATABASE_FILES = ["sessions.db", "sessions.db-wal", "sessions.db-shm"] as const;
 
@@ -22,8 +24,13 @@ export interface ExtensionRootMigrationResult {
 export interface ExtensionRootMigrationOptions {
   moveFile?: (source: string, target: string) => Promise<void>;
   publishDatabaseFile?: (source: string, target: string) => Promise<void>;
+  retireDatabaseFile?: (source: string, target: string) => Promise<void>;
+  backupDatabase?: (source: string, staged: string, onProgress?: () => void) => Promise<void>;
   onDatabaseBackupProgress?: () => void;
 }
+
+const MIGRATION_LOCK_WAIT_MS = 5000;
+const MIGRATION_LOCK_POLL_MS = 50;
 
 async function pathExists(filePath: string): Promise<boolean> {
   try {
@@ -42,6 +49,14 @@ async function pathEntryExists(filePath: string): Promise<boolean> {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
+}
+
+async function databaseFilesAt(root: string): Promise<string[]> {
+  const names: string[] = [];
+  for (const name of DATABASE_FILES) {
+    if (await pathEntryExists(path.join(root, name))) names.push(name);
+  }
+  return names;
 }
 
 async function moveFileSafe(source: string, target: string): Promise<void> {
@@ -82,6 +97,73 @@ async function stageDatabaseSnapshot(
     if (check !== "ok") throw new Error(`staged SQLite snapshot failed integrity_check: ${String(check)}`);
   } finally {
     stagedDb.close();
+  }
+}
+
+function isDatabaseCorruption(error: unknown): boolean {
+  const code = typeof error === "object" && error && "code" in error
+    ? String((error as { code?: unknown }).code)
+    : "";
+  if (code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB") return true;
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return message.includes("database disk image is malformed")
+    || message.includes("file is not a database")
+    || message.includes("database schema is corrupt")
+    || message.includes("malformed database schema")
+    || message.includes("failed integrity_check");
+}
+
+async function acquireMigrationLease(legacyRoot: string, targetRoot: string): Promise<AtomicLockLease> {
+  const coordinator = new AtomicLockCoordinator(path.join(targetRoot, ".pi-hermes-locks.sqlite"));
+  const sourceIdentity = canonicalStoragePathSync(path.join(legacyRoot, "sessions.db"));
+  const targetIdentity = canonicalStoragePathSync(path.join(targetRoot, "sessions.db"));
+  const key = `extension-root-migration:${sourceIdentity}:${targetIdentity}`;
+  const deadline = Date.now() + MIGRATION_LOCK_WAIT_MS;
+
+  while (true) {
+    const lease = coordinator.tryAcquire(key, { staleMs: 300_000 });
+    if (lease) return lease;
+    if (Date.now() >= deadline) {
+      throw new Error(`SQLite extension-root migration already in progress for ${targetIdentity}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, MIGRATION_LOCK_POLL_MS));
+  }
+}
+
+async function moveDatabaseGeneration(
+  names: string[],
+  sourceRoot: string,
+  holdingRoot: string,
+  move: (source: string, target: string) => Promise<void>,
+): Promise<string[]> {
+  const moved: string[] = [];
+  await fs.mkdir(holdingRoot, { mode: 0o700 });
+  const orderedNames = [...names].sort((left, right) => Number(left === "sessions.db") - Number(right === "sessions.db"));
+  try {
+    for (const name of orderedNames) {
+      const source = path.join(sourceRoot, name);
+      const target = path.join(holdingRoot, name);
+      try {
+        await move(source, target);
+        moved.push(name);
+      } catch (error) {
+        if (!await pathEntryExists(source) && await pathEntryExists(target)) moved.push(name);
+        throw error;
+      }
+    }
+    return moved;
+  } catch (error) {
+    for (const name of moved.reverse()) {
+      await fs.rename(path.join(holdingRoot, name), path.join(sourceRoot, name));
+    }
+    throw error;
+  }
+}
+
+async function restoreDatabaseGeneration(names: string[], holdingRoot: string, sourceRoot: string): Promise<void> {
+  for (const name of [...names].reverse()) {
+    const held = path.join(holdingRoot, name);
+    if (await pathEntryExists(held)) await fs.rename(held, path.join(sourceRoot, name));
   }
 }
 
@@ -155,14 +237,28 @@ async function migrateDatabaseGeneration(
   targetRoot: string,
   result: ExtensionRootMigrationResult,
   publish: (source: string, target: string) => Promise<void>,
+  retire: (source: string, target: string) => Promise<void>,
+  backup: (source: string, staged: string, onProgress?: () => void) => Promise<void>,
   onBackupProgress?: () => void,
 ): Promise<void> {
-  const sourceNames: string[] = [];
-  const targetNames: string[] = [];
-  for (const name of DATABASE_FILES) {
-    if (await pathEntryExists(path.join(legacyRoot, name))) sourceNames.push(name);
-    if (await pathEntryExists(path.join(targetRoot, name))) targetNames.push(name);
+  let lease: AtomicLockLease | null = null;
+  try {
+    lease = await acquireMigrationLease(legacyRoot, targetRoot);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+    result.criticalFailures.push({
+      name: "sessions.db",
+      source: path.join(legacyRoot, "sessions.db"),
+      target: path.join(targetRoot, "sessions.db"),
+      message,
+    });
+    return;
   }
+
+  try {
+  const sourceNames = await databaseFilesAt(legacyRoot);
+  const targetNames = await databaseFilesAt(targetRoot);
   if (sourceNames.length === 0) return;
 
   if (targetNames.includes("sessions.db")) {
@@ -186,34 +282,81 @@ async function migrateDatabaseGeneration(
 
   await fs.mkdir(targetRoot, { recursive: true });
   const stagingDir = path.join(targetRoot, `.sessions-db-migration-${randomUUID()}`);
+  const retirementDir = path.join(legacyRoot, `.sessions-db-retirement-${randomUUID()}`);
   const published: string[] = [];
+  let retired: string[] = [];
+  let writeLock: {
+    pragma: (query: string) => unknown;
+    exec: (sql: string) => void;
+    close: () => void;
+  } | null = null;
+  let corruptGeneration = false;
+  let generationNames = sourceNames;
   try {
     await fs.mkdir(stagingDir, { mode: 0o700 });
     const source = path.join(legacyRoot, "sessions.db");
     const staged = path.join(stagingDir, "sessions.db");
     const sourceState = await fs.lstat(source);
+    try {
+      writeLock = new Database(source, { fileMustExist: true, timeout: 0 });
+      writeLock.pragma("busy_timeout = 0");
+      writeLock.exec("BEGIN IMMEDIATE");
+    } catch (error) {
+      if (!isDatabaseCorruption(error)) throw error;
+      if (writeLock) {
+        try { writeLock.close(); } catch {}
+        writeLock = null;
+      }
+      corruptGeneration = true;
+    }
+    generationNames = await databaseFilesAt(legacyRoot);
+
     if (sourceState.isSymbolicLink()) {
       if (sourceNames.length !== 1) {
         throw new Error("symlinked sessions.db cannot be combined with legacy SQLite sidecars");
       }
       await stageDatabaseSymlink(source, staged);
+      corruptGeneration = false;
     } else if (sourceState.isFile()) {
-      await stageDatabaseSnapshot(source, staged, onBackupProgress);
+      if (!corruptGeneration) {
+        try {
+          await backup(source, staged, onBackupProgress);
+        } catch (error) {
+          if (!isDatabaseCorruption(error)) throw error;
+          corruptGeneration = true;
+          try { await fs.unlink(staged); } catch {}
+        }
+      }
+      if (corruptGeneration) {
+        retired = await moveDatabaseGeneration(generationNames, legacyRoot, retirementDir, retire);
+        for (const name of retired) {
+          const target = path.join(targetRoot, name);
+          await publish(path.join(retirementDir, name), target);
+          published.push(target);
+        }
+      }
     } else {
       throw new Error("sessions.db is not a regular file or symlink");
     }
 
-    const target = path.join(targetRoot, "sessions.db");
-    await publish(staged, target);
-    published.push(target);
-
-    for (const name of sourceNames) {
-      try { await fs.unlink(path.join(legacyRoot, name)); } catch {}
+    if (!corruptGeneration) {
+      const target = path.join(targetRoot, "sessions.db");
+      await publish(staged, target);
+      published.push(target);
+      retired = await moveDatabaseGeneration(generationNames, legacyRoot, retirementDir, retire);
     }
-    result.moved += sourceNames.length;
+
+    if (writeLock) writeLock.exec("COMMIT");
+    result.moved += generationNames.length;
   } catch (error) {
     for (const target of published.reverse()) {
       try { await fs.unlink(target); } catch {}
+    }
+    if (retired.length > 0) {
+      try { await restoreDatabaseGeneration(retired, retirementDir, legacyRoot); } catch {}
+    }
+    if (writeLock) {
+      try { writeLock.exec("ROLLBACK"); } catch {}
     }
     const message = error instanceof Error ? error.message : String(error);
     result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
@@ -224,7 +367,14 @@ async function migrateDatabaseGeneration(
       message,
     });
   } finally {
+    if (writeLock) {
+      try { writeLock.close(); } catch {}
+    }
     try { await fs.rm(stagingDir, { recursive: true, force: true }); } catch {}
+    try { await fs.rm(retirementDir, { recursive: true, force: true }); } catch {}
+  }
+  } finally {
+    lease.release();
   }
 }
 
@@ -254,6 +404,8 @@ export async function migrateExtensionRoot(
     targetRoot,
     result,
     options.publishDatabaseFile ?? options.moveFile ?? publishDatabaseFile,
+    options.retireDatabaseFile ?? moveFileSafe,
+    options.backupDatabase ?? stageDatabaseSnapshot,
     options.onDatabaseBackupProgress,
   );
   if (result.criticalFailures.some((failure) => failure.name === "sessions.db")) return result;

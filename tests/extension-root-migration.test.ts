@@ -111,6 +111,7 @@ describe("migrateExtensionRoot", () => {
     try {
       sourceDb.pragma("journal_mode = WAL");
       sourceDb.pragma("wal_autocheckpoint = 0");
+      sourceDb.pragma("busy_timeout = 0");
       sourceDb.exec("CREATE TABLE memories (content TEXT)");
       sourceDb.pragma("wal_checkpoint(TRUNCATE)");
       const insert = sourceDb.prepare("INSERT INTO memories VALUES (?)");
@@ -143,6 +144,101 @@ describe("migrateExtensionRoot", () => {
       }
     } finally {
       sourceDb.close();
+    }
+  });
+
+  it("holds a write exclusion through snapshot publication and source retirement", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    const sourceDb = new Database(path.join(legacy, "sessions.db"));
+    let concurrentWriteCode = "";
+    try {
+      sourceDb.pragma("journal_mode = WAL");
+      sourceDb.pragma("busy_timeout = 0");
+      sourceDb.exec("CREATE TABLE memories (content TEXT); INSERT INTO memories VALUES ('before migration')");
+
+      const result = await migrateExtensionRoot(legacy, target, {
+        onDatabaseBackupProgress: () => {
+          if (concurrentWriteCode) return;
+          try {
+            sourceDb.prepare("INSERT INTO memories VALUES (?)").run("raced migration");
+          } catch (error) {
+            concurrentWriteCode = (error as { code?: string }).code ?? "unknown";
+          }
+        },
+      });
+
+      assert.equal(concurrentWriteCode, "SQLITE_BUSY");
+      assert.deepStrictEqual(result.criticalFailures, []);
+      const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
+      try {
+        assert.deepStrictEqual(
+          migrated.prepare("SELECT content FROM memories ORDER BY rowid").all(),
+          [{ content: "before migration" }],
+        );
+      } finally {
+        migrated.close();
+      }
+      assert.equal(fs.existsSync(path.join(legacy, "sessions.db")), false);
+    } finally {
+      sourceDb.close();
+    }
+  });
+
+  it("rolls back a failed source retirement so migration can retry", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    const sourceDb = new Database(path.join(legacy, "sessions.db"));
+    sourceDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('legacy')");
+    sourceDb.close();
+
+    const failed = await migrateExtensionRoot(legacy, target, {
+      retireDatabaseFile: async (source, destination) => {
+        await fs.promises.rename(source, destination);
+        throw new Error("injected source retirement failure");
+      },
+    });
+
+    assert.deepStrictEqual(failed.criticalFailures.map(({ name }) => name), ["sessions.db"]);
+    assert.equal(fs.existsSync(path.join(legacy, "sessions.db")), true);
+    assert.equal(fs.existsSync(path.join(target, "sessions.db")), false);
+
+    const retried = await migrateExtensionRoot(legacy, target);
+    assert.deepStrictEqual(retried.criticalFailures, []);
+    const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
+    try {
+      assert.deepStrictEqual(migrated.prepare("SELECT value FROM retained").all(), [{ value: "legacy" }]);
+    } finally {
+      migrated.close();
+    }
+  });
+
+  it("preserves the raw generation when backup detects corruption after locking", async () => {
+    const legacy = path.join(tmpDir, "memory");
+    const target = path.join(tmpDir, "pi-hermes-memory");
+    fs.mkdirSync(legacy, { recursive: true });
+    const sourceDb = new Database(path.join(legacy, "sessions.db"));
+    sourceDb.exec("CREATE TABLE retained (value TEXT); INSERT INTO retained VALUES ('raw generation')");
+    sourceDb.close();
+    let backupAttempted = false;
+
+    const result = await migrateExtensionRoot(legacy, target, {
+      backupDatabase: async () => {
+        backupAttempted = true;
+        throw Object.assign(new Error("database disk image is malformed"), { code: "SQLITE_CORRUPT" });
+      },
+    });
+
+    assert.equal(backupAttempted, true);
+    assert.deepStrictEqual(result.criticalFailures, []);
+    assert.equal(fs.existsSync(path.join(legacy, "sessions.db")), false);
+    const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
+    try {
+      assert.deepStrictEqual(migrated.prepare("SELECT value FROM retained").all(), [{ value: "raw generation" }]);
+    } finally {
+      migrated.close();
     }
   });
 
