@@ -67,6 +67,10 @@ export class PersistenceReconciliationRetrier {
   }
 
   async start(): Promise<void> {
+    if (this.state === 'exhausted') {
+      this.state = 'idle';
+      this.attempts = 0;
+    }
     if (this.state !== 'idle') return;
     await this.runAttempt();
   }

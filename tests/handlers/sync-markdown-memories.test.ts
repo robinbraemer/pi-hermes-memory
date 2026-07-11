@@ -105,6 +105,34 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.match(failures.at(-1) ?? '', /failed after 3 attempts/);
   });
 
+  it('starts a new bounded retry cycle after a later session start', async () => {
+    const scheduled: Array<() => void> = [];
+    let attempts = 0;
+    let available = false;
+    const retrier = new PersistenceReconciliationRetrier(
+      async () => {
+        attempts++;
+        if (!available) throw new Error('temporarily unavailable');
+        return { failedScopes: [] };
+      },
+      () => {},
+      () => {},
+      { maxAttempts: 2, setTimeoutFn: (callback) => scheduled.push(callback), retryDelayMs: 1 },
+    );
+
+    await retrier.start();
+    scheduled.shift()!();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(attempts, 2);
+    assert.equal(retrier.isInitialized(), false);
+
+    available = true;
+    await retrier.start();
+
+    assert.equal(attempts, 3);
+    assert.equal(retrier.isInitialized(), true);
+  });
+
   it('cancels a scheduled startup retry', async () => {
     let scheduled: (() => void) | null = null;
     const timer = {};

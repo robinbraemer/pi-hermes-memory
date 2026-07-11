@@ -724,6 +724,27 @@ describe('DatabaseManager', () => {
       assert.ok(fs.readdirSync(tmpDir).some((name) => name.startsWith('sessions.db.corrupt-')), 'unrecoverable DB should be quarantined');
     });
 
+    it('restores database files when quarantining a generation fails partway', () => {
+      dbManager.close();
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const walPath = `${dbPath}-wal`;
+      const backupBase = `${dbPath}.corrupt-test`;
+      fs.writeFileSync(dbPath, 'main generation');
+      fs.writeFileSync(walPath, 'wal generation');
+      fs.mkdirSync(`${backupBase}-wal`);
+      fs.writeFileSync(path.join(`${backupBase}-wal`, 'retained'), 'block replacement');
+
+      assert.throws(
+        () => (dbManager as any).moveDatabaseFilesToBackup(backupBase),
+        /directory|operation not permitted|EISDIR|EPERM/i,
+      );
+
+      assert.strictEqual(fs.readFileSync(dbPath, 'utf-8'), 'main generation');
+      assert.strictEqual(fs.readFileSync(walPath, 'utf-8'), 'wal generation');
+      assert.strictEqual(fs.existsSync(backupBase), false);
+      assert.strictEqual(fs.readFileSync(path.join(`${backupBase}-wal`, 'retained'), 'utf-8'), 'block replacement');
+    });
+
     it('retries a corrupt operation once after self-healing', () => {
       dbManager.getDb();
       let attempts = 0;

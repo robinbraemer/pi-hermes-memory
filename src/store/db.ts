@@ -778,16 +778,21 @@ export class DatabaseManager {
 
   private moveDatabaseFilesToBackup(backupBase: string): MovedDatabaseFile[] {
     const moved: MovedDatabaseFile[] = [];
-    for (const suffix of DATABASE_FILE_SUFFIXES) {
-      const original = `${this.dbPath}${suffix}`;
-      if (!fs.existsSync(original)) continue;
+    try {
+      for (const suffix of DATABASE_FILE_SUFFIXES) {
+        const original = `${this.dbPath}${suffix}`;
+        if (!fs.existsSync(original)) continue;
 
-      const backup = `${backupBase}${suffix}`;
-      fs.rmSync(backup, { force: true });
-      fs.renameSync(original, backup);
-      moved.push({ original, backup });
+        const backup = `${backupBase}${suffix}`;
+        fs.rmSync(backup, { force: true });
+        fs.renameSync(original, backup);
+        moved.push({ original, backup });
+      }
+      return moved;
+    } catch (error) {
+      this.restoreMovedDatabaseFiles(moved);
+      throw error;
     }
-    return moved;
   }
 
   private restoreMovedDatabaseFiles(moved: MovedDatabaseFile[]): void {
