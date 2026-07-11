@@ -31,6 +31,7 @@ describe("registerSessionSearchTool", () => {
     const schema = JSON.stringify(captured.parameters);
     assert.strictEqual(captured.name, "session_search");
     assert.match(schema, /query/);
+    assert.match(schema, /sessionId/);
     assert.doesNotMatch(schema, /markdown/);
     assert.match(schema, /"minimum":1/);
     assert.match(schema, /"maximum":20/);
@@ -45,19 +46,21 @@ describe("registerSessionSearchTool", () => {
     const dbManager = new DatabaseManager(memoryDir);
 
     try {
-      indexSession(dbManager, {
-        id: "bounded-limit-session",
-        project: "bounded-project",
-        cwd: "/work/bounded",
-        startedAt: "2026-07-11T00:00:00.000Z",
-        endedAt: null,
-        messages: Array.from({ length: 25 }, (_, index) => ({
-          id: `bounded-limit-message-${index}`,
-          role: "assistant",
-          content: `bounded-limit-needle ${index}`,
-          timestamp: `2026-07-11T00:${String(index).padStart(2, "0")}:00.000Z`,
-        })),
-      });
+      for (let index = 0; index < 25; index++) {
+        indexSession(dbManager, {
+          id: `bounded-limit-session-${index}`,
+          project: "bounded-project",
+          cwd: "/synthetic/bounded",
+          startedAt: "2026-07-11T00:00:00.000Z",
+          endedAt: null,
+          messages: [{
+            id: `bounded-limit-message-${index}`,
+            role: "assistant",
+            content: `bounded-limit-needle ${index}`,
+            timestamp: `2026-07-11T00:${String(index).padStart(2, "0")}:00.000Z`,
+          }],
+        });
+      }
       registerSessionSearchTool(mockPi, dbManager);
 
       const negative = await captured.execute("tc-negative-limit", {
@@ -107,8 +110,8 @@ describe("registerSessionSearchTool", () => {
       const output = result.content[0].text as string;
 
       assert.ok(output.length <= 50 * 1024, `expected <= 50 KiB, got ${output.length}`);
-      assert.match(output, /truncated/);
-      assert.match(output, /6000007 chars total/);
+      assert.match(output, /needle/);
+      assert.doesNotMatch(output, /6000007 chars total/);
       assert.strictEqual(result.details.truncatedCount, 1);
       assert.strictEqual(result.details.outputChars, output.length);
       assert.strictEqual(result.details.output, undefined);
@@ -150,7 +153,8 @@ describe("registerSessionSearchTool", () => {
 
       assert.strictEqual(result.details.snippetChars, 2_000);
       assert.strictEqual(result.details.truncatedCount, 1);
-      assert.match(result.content[0].text, /10007 chars total/);
+      assert.match(result.content[0].text, /needle/);
+      assert.doesNotMatch(result.content[0].text, /10007 chars total/);
       assert.ok(result.content[0].text.length < 3_000);
     } finally {
       dbManager.close();
@@ -166,19 +170,21 @@ describe("registerSessionSearchTool", () => {
     const dbManager = new DatabaseManager(memoryDir);
 
     try {
-      indexSession(dbManager, {
-        id: "aggregate-ceiling-session",
-        project: "aggregate-project",
-        cwd: "/work/aggregate",
-        startedAt: "2026-07-11T00:00:00.000Z",
-        endedAt: null,
-        messages: Array.from({ length: 20 }, (_, index) => ({
-          id: `aggregate-message-${index}`,
-          role: "assistant",
-          content: `needle-${index} ${"z".repeat(10_000)}`,
-          timestamp: `2026-07-11T00:${String(index).padStart(2, "0")}:00.000Z`,
-        })),
-      });
+      for (let index = 0; index < 20; index++) {
+        indexSession(dbManager, {
+          id: `aggregate-ceiling-session-${index}`,
+          project: `aggregate-project-${index}`,
+          cwd: "/synthetic/aggregate",
+          startedAt: "2026-07-11T00:00:00.000Z",
+          endedAt: null,
+          messages: [{
+            id: `aggregate-message-${index}`,
+            role: "assistant",
+            content: `needle-${index} ${"z".repeat(10_000)}`,
+            timestamp: `2026-07-11T00:${String(index).padStart(2, "0")}:00.000Z`,
+          }],
+        });
+      }
       registerSessionSearchTool(mockPi, dbManager);
 
       const result = await captured.execute("tc-aggregate-ceiling", {
@@ -234,6 +240,98 @@ describe("registerSessionSearchTool", () => {
     }
   });
 
+  it("renders term-local compact refs, context, and ids-only details", async () => {
+    let captured: any;
+    const mockPi = { registerTool: (def: any) => { captured = def; } } as any;
+    const memoryDir = makeSessionsDir();
+    const dbManager = new DatabaseManager(memoryDir);
+
+    try {
+      indexSession(dbManager, {
+        id: "synthetic-render-session",
+        project: "synthetic-render-project",
+        cwd: "/synthetic/private-cwd",
+        startedAt: "2026-07-11T00:00:00.000Z",
+        endedAt: null,
+        messages: [
+          { id: "synthetic-render-open", role: "user", content: "synthetic opener prose", timestamp: "2026-07-11T00:00:00.000Z" },
+          { id: "synthetic-render-before", role: "user", content: "synthetic previous prose", timestamp: "2026-07-11T00:01:00.000Z" },
+          { id: "synthetic-render-anchor", role: "assistant", content: `synthetic-private-payload ${"x".repeat(3_000)} tail-needle`, timestamp: "2026-07-11T00:02:00.000Z" },
+          { id: "synthetic-render-after", role: "user", content: "synthetic next prose", timestamp: "2026-07-11T00:03:00.000Z" },
+          { id: "synthetic-render-close", role: "assistant", content: "synthetic closer prose", timestamp: "2026-07-11T00:04:00.000Z" },
+        ],
+      });
+      registerSessionSearchTool(mockPi, dbManager);
+
+      const result = await captured.execute("tc-render", { query: "tail-needle" });
+      const output = result.content[0].text as string;
+      const serializedDetails = JSON.stringify(result.details);
+
+      assert.match(output, /tail-needle/);
+      assert.match(output, /ref: session:synthetic-render-session\/message:synthetic-render-anchor/);
+      assert.match(output, /root:synthetic-render-session source:interactive match:exact terms:1\/1/);
+      assert.match(output, /context: 1 before, 1 after; 1 earlier, 1 later/);
+      assert.ok(output.length <= 50 * 1024);
+      assert.deepStrictEqual(result.details.refs, [{
+        sessionId: "synthetic-render-session",
+        rootSessionId: "synthetic-render-session",
+        messageId: "synthetic-render-anchor",
+      }]);
+      assert.strictEqual(result.details.candidateCount, 1);
+      assert.strictEqual(result.details.sourceCount, 1);
+      assert.strictEqual(result.details.omittedCount, 0);
+      assert.strictEqual(serializedDetails.includes("synthetic-private-payload"), false);
+      assert.strictEqual(serializedDetails.includes("private-cwd"), false);
+    } finally {
+      dbManager.close();
+    }
+  });
+
+  it("supports a bounded repeat query by session id", async () => {
+    let captured: any;
+    const mockPi = { registerTool: (def: any) => { captured = def; } } as any;
+    const memoryDir = makeSessionsDir();
+    const dbManager = new DatabaseManager(memoryDir);
+
+    try {
+      for (const suffix of ["a", "b"]) {
+        indexSession(dbManager, {
+          id: `synthetic-repeat-${suffix}`,
+          project: "synthetic-repeat-project",
+          cwd: "/synthetic/repeat",
+          startedAt: "2026-07-11T00:00:00.000Z",
+          endedAt: null,
+          messages: [{
+            id: `synthetic-repeat-message-${suffix}`,
+            role: "assistant",
+            content: `synthetic repeat needle ${suffix} ${"q".repeat(5_000)}`,
+            timestamp: `2026-07-11T00:0${suffix === "a" ? 1 : 2}:00.000Z`,
+          }],
+        });
+      }
+      registerSessionSearchTool(mockPi, dbManager);
+
+      const result = await captured.execute("tc-repeat", {
+        query: "synthetic repeat needle",
+        sessionId: "synthetic-repeat-a",
+        limit: 1,
+        snippetChars: 4_000,
+      });
+
+      assert.strictEqual(result.details.count, 1);
+      assert.strictEqual(result.details.snippetChars, 4_000);
+      assert.deepStrictEqual(result.details.refs, [{
+        sessionId: "synthetic-repeat-a",
+        rootSessionId: "synthetic-repeat-a",
+        messageId: "synthetic-repeat-message-a",
+      }]);
+      assert.doesNotMatch(result.content[0].text, /synthetic-repeat-message-b/);
+      assert.ok(result.content[0].text.length <= 50 * 1024);
+    } finally {
+      dbManager.close();
+    }
+  });
+
   it("registers and executes the anchor markdown-only schema when configured", async () => {
     let captured: any;
     const mockPi = {
@@ -282,5 +380,40 @@ describe("registerSessionSearchTool", () => {
     assert.doesNotMatch(result.content[0].text, /"ranges"/);
     assert.doesNotMatch(result.content[0].text, /"startLine"/);
     assert.doesNotMatch(result.content[0].text, /"sessionId"/);
+
+    const sanitizedSnapshot = {
+      parameters: JSON.parse(JSON.stringify(captured.parameters)),
+      content: result.content,
+      details: {
+        success: result.details.success,
+        count: result.details.count,
+        output: result.details.output,
+        ranges: result.details.ranges.map((range: any) => ({
+          path: range.path,
+          startLine: range.startLine,
+          endLine: range.endLine,
+          reason: range.reason,
+        })),
+      },
+    };
+    assert.deepStrictEqual(sanitizedSnapshot, {
+      parameters: {
+        type: "object",
+        required: ["markdown"],
+        properties: {
+          markdown: {
+            type: "string",
+            description: "Markdown request with optional from/to/cwd/limit fields and all/any/exclude lists.",
+          },
+        },
+      },
+      content: [{ type: "text", text: `count: 1\nanchors:\n- ${filePath}:1-1 — matched any: needle` }],
+      details: {
+        success: true,
+        count: 1,
+        output: `count: 1\nanchors:\n- ${filePath}:1-1 — matched any: needle`,
+        ranges: [{ path: filePath, startLine: 1, endLine: 1, reason: "matched any: needle" }],
+      },
+    });
   });
 });

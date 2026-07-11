@@ -237,6 +237,7 @@ describe('session-search', () => {
 
       assert.match(result.snippet, /context needle/);
       assert.ok(result.snippet.length <= 120);
+      assert.strictEqual(result.snippetTruncated, true);
       assert.deepStrictEqual(result.window.map((message) => message.id), [
         'synthetic-context-4',
         'synthetic-context-5',

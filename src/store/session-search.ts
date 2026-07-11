@@ -30,6 +30,7 @@ export interface SessionSearchResult {
   content: string;
   timestamp: string;
   snippet: string;
+  snippetTruncated: boolean;
   messageId: string;
   rootSessionId: string;
   source: string;
@@ -181,7 +182,7 @@ function loadContext(
   query: string,
   snippetChars: number,
   roleFilter?: string,
-): Pick<SessionSearchResult, 'snippet' | 'window' | 'bookendStart' | 'bookendEnd' | 'messagesBefore' | 'messagesAfter'> {
+): Pick<SessionSearchResult, 'snippet' | 'snippetTruncated' | 'window' | 'bookendStart' | 'bookendEnd' | 'messagesBefore' | 'messagesAfter'> {
   const rows = db.prepare(`
     SELECT id, role, content, timestamp
     FROM messages
@@ -195,15 +196,16 @@ function loadContext(
     return !roleFilter || message.role === roleFilter;
   });
   const anchorIndex = eligible.findIndex((message) => message.id === candidate.message_id);
-  const anchorSnippet = termLocalSnippet(candidate.content, query, snippetChars).text;
+  const anchorSnippet = termLocalSnippet(candidate.content, query, snippetChars);
   if (anchorIndex < 0) {
     return {
-      snippet: anchorSnippet,
+      snippet: anchorSnippet.text,
+      snippetTruncated: anchorSnippet.truncated,
       window: [{
         id: candidate.message_id,
         role: candidate.role,
         timestamp: candidate.timestamp,
-        snippet: anchorSnippet,
+        snippet: anchorSnippet.text,
         anchor: true,
       }],
       bookendStart: [],
@@ -221,7 +223,7 @@ function loadContext(
       id: message.id,
       role: message.role,
       timestamp: message.timestamp,
-      snippet: anchor ? anchorSnippet : termLocalSnippet(message.content, query, CONTEXT_SNIPPET_CHARS).text,
+      snippet: anchor ? anchorSnippet.text : termLocalSnippet(message.content, query, CONTEXT_SNIPPET_CHARS).text,
       anchor,
     };
   };
@@ -243,7 +245,8 @@ function loadContext(
   }
 
   return {
-    snippet: anchorSnippet,
+    snippet: anchorSnippet.text,
+    snippetTruncated: anchorSnippet.truncated,
     window,
     bookendStart,
     bookendEnd,
@@ -369,6 +372,7 @@ export function searchSessions(
       content: candidate.content,
       timestamp: candidate.timestamp,
       snippet: context.snippet,
+      snippetTruncated: context.snippetTruncated,
       messageId: candidate.message_id,
       rootSessionId: candidate.rootSessionId,
       source: candidate.source,

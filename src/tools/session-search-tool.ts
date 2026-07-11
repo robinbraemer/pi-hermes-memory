@@ -18,6 +18,10 @@ interface SearchResult {
   outputTruncated?: boolean;
   snippetChars?: number;
   truncatedCount?: number;
+  candidateCount?: number;
+  sourceCount?: number;
+  omittedCount?: number;
+  refs?: Array<{ sessionId: string; rootSessionId: string; messageId: string }>;
   ranges?: SessionAnchorRange[];
 }
 
@@ -160,6 +164,7 @@ Returns bounded conversation snippets with session dates and project context. La
     parameters: Type.Object({
       query: Type.String({ description: 'Search query. Use natural language or specific terms.' }),
       project: Type.Optional(Type.String({ description: 'Filter by project name (optional).' })),
+      sessionId: Type.Optional(Type.String({ description: 'Filter by an opaque session ref from a prior result (optional).' })),
       role: Type.Optional(StringEnum(['user', 'assistant'] as const, { description: 'Filter by message role (optional).' })),
       limit: Type.Optional(Type.Number({
         description: 'Maximum results to return (default: 10, min: 1, max: 20).',
@@ -172,9 +177,10 @@ Returns bounded conversation snippets with session dates and project context. La
         maximum: MAX_LEGACY_SNIPPET_CHARS,
       })),
     }),
-    execute: async (_id: string, args: { query: string; project?: string; role?: string; limit?: number; snippetChars?: number }) => {
+    execute: async (_id: string, args: { query: string; project?: string; sessionId?: string; role?: string; limit?: number; snippetChars?: number }) => {
       const query = args.query;
       const project = args.project;
+      const sessionId = args.sessionId;
       const role = args.role;
       const requestedLimit = Number.isFinite(args.limit) ? Math.floor(args.limit!) : 10;
       const limit = Math.min(Math.max(requestedLimit, 1), 20);
@@ -194,7 +200,7 @@ Returns bounded conversation snippets with session dates and project context. La
         return { content: [{ type: 'text' as const, text: result.message! }], details: result };
       }
 
-      const results = searchSessions(dbManager, query, { project, role, limit });
+      const results = searchSessions(dbManager, query, { project, sessionId, role, limit, snippetChars });
 
       if (results.length === 0) {
         const output = capLegacyOutput('No results found. Try a different search term or broader query.');
@@ -219,11 +225,27 @@ Returns bounded conversation snippets with session dates and project context. La
         });
 
         const snippet = truncateLegacySnippet(r.snippet, snippetChars);
-        if (snippet.truncated) truncatedCount += 1;
+        if (r.snippetTruncated || snippet.truncated) truncatedCount += 1;
+        const anchorIndex = r.window.findIndex((message) => message.anchor);
+        const before = anchorIndex < 0 ? 0 : anchorIndex;
+        const after = anchorIndex < 0 ? 0 : r.window.length - anchorIndex - 1;
+        const contextLines = [
+          `ref: session:${r.sessionId}/message:${r.messageId} root:${r.rootSessionId} source:${r.source} match:${r.matchMode} terms:${r.matchedTerms}/${r.totalTerms}`,
+          `context: ${before} before, ${after} after; ${r.messagesBefore} earlier, ${r.messagesAfter} later`,
+        ];
+        for (const message of r.bookendStart) {
+          contextLines.push(`bookend-start [${message.role}]: ${message.snippet}`);
+        }
+        for (const message of r.window) {
+          contextLines.push(`${message.anchor ? 'match' : 'window'} [${message.role}]: ${message.anchor ? snippet.text : message.snippet}`);
+        }
+        for (const message of r.bookendEnd) {
+          contextLines.push(`bookend-end [${message.role}]: ${message.snippet}`);
+        }
         blocks.push([
           '---',
           `📅 ${date} | 📁 ${r.project} | ${r.role === 'user' ? '👤 User' : '🤖 Assistant'}`,
-          snippet.text,
+          ...contextLines,
         ].join('\n'));
       }
 
@@ -231,10 +253,18 @@ Returns bounded conversation snippets with session dates and project context. La
       const finalResult: SearchResult = {
         success: true,
         count: results.length,
+        candidateCount: results.length,
+        sourceCount: new Set(results.map((result) => `${result.project}\u0000${result.source}`)).size,
+        omittedCount: 0,
         truncatedCount,
         snippetChars,
         outputChars: output.text.length,
         outputTruncated: output.truncated,
+        refs: results.map((result) => ({
+          sessionId: result.sessionId,
+          rootSessionId: result.rootSessionId,
+          messageId: result.messageId,
+        })),
       };
       return { content: [{ type: 'text' as const, text: output.text }], details: finalResult };
     },
