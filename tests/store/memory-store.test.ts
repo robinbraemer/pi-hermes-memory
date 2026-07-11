@@ -1126,6 +1126,34 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.doesNotMatch(raw, /failed local add/);
     });
 
+    it("does not delete an editor file recreated during rollback", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} original before rollback race`);
+
+      const originalRead = (store as any).readFileState.bind(store);
+      let displacedReads = 0;
+      (store as any).readFileState = async (filePath: string) => {
+        if (path.basename(filePath).startsWith(`.${MEMORY_FILE}.recovery-`)) {
+          displacedReads++;
+          if (displacedReads === 2) throw new Error("injected post-publish failure");
+        }
+        return originalRead(filePath);
+      };
+      (store as any).preserveConflictFile = async () => {
+        await fs.rename(memoryPath, `${memoryPath}.owned-local`);
+        await writeRaw(memoryPath, `${TEST_MARKER} editor successor`);
+        return `${memoryPath}.owned-local`;
+      };
+
+      await assert.rejects(
+        store.add("memory", `${TEST_MARKER} failed local add`),
+        /injected post-publish failure/,
+      );
+
+      assert.equal(await readRaw(memoryPath), `${TEST_MARKER} editor successor`);
+    });
+
     it("does not commit a failed add during a later mutation", async () => {
       const store = new MemoryStore(makeConfig());
       await store.loadFromDisk();
@@ -1210,8 +1238,9 @@ describe("MemoryStore", { concurrency: 1 }, () => {
     });
 
     it("prunes expired recovery files but retains recently active ones", async () => {
-      const expiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-expired`);
-      const activePath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-active`);
+      const pathStore = new MemoryStore(makeConfig());
+      const expiredPath = (pathStore as any).recoveryPathFor(memoryPath) as string;
+      const activePath = (pathStore as any).recoveryPathFor(memoryPath) as string;
       await writeRaw(expiredPath, `${TEST_MARKER} expired recovery`);
       await writeRaw(activePath, `${TEST_MARKER} active recovery`);
       const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
@@ -1232,7 +1261,8 @@ describe("MemoryStore", { concurrency: 1 }, () => {
     });
 
     it("keeps the active recovery pathname stable for late writes within the grace period", async () => {
-      const activePath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-late-writer`);
+      const pathStore = new MemoryStore(makeConfig());
+      const activePath = (pathStore as any).recoveryPathFor(memoryPath) as string;
       await writeRaw(activePath, `${TEST_MARKER} displaced original`);
       const handle = await fs.open(activePath, "r+");
 
@@ -1250,14 +1280,41 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.match(await fs.readFile(activePath, "utf-8"), /late active descriptor write/);
     });
 
+    it("ignores generated-looking recovery symlinks during pruning", async (t) => {
+      if (process.platform === "win32") {
+        t.skip("symlink creation requires platform privileges");
+        return;
+      }
+      const outsidePath = path.join(path.dirname(MEMORY_DIR), "outside-sensitive.md");
+      const pathStore = new MemoryStore(makeConfig());
+      const symlinkPath = (pathStore as any).recoveryPathFor(memoryPath) as string;
+      await writeRaw(outsidePath, `${TEST_MARKER} outside sensitive content`);
+      await fs.symlink(outsidePath, symlinkPath);
+      const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+      await fs.utimes(outsidePath, expired, expired);
+
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} triggers symlink-safe pruning`);
+
+      assert.equal((await fs.lstat(symlinkPath)).isSymbolicLink(), true);
+      const retiredFiles = (await fs.readdir(MEMORY_DIR))
+        .filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
+      const retiredContents = await Promise.all(
+        retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+      );
+      assert.equal(retiredContents.some((content) => content.includes("outside sensitive content")), false);
+    });
+
     it("bounds retired recovery snapshots by age, count, and bytes", async () => {
-      const staleRetiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.retired-stale`);
+      const pathStore = new MemoryStore(makeConfig());
+      const staleRetiredPath = (pathStore as any).retiredRecoveryPathFor(memoryPath) as string;
       await writeRaw(staleRetiredPath, `${TEST_MARKER} stale retired snapshot`);
       const stale = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
       await fs.utimes(staleRetiredPath, stale, stale);
 
       for (let index = 0; index < 40; index++) {
-        const retiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.retired-${String(index).padStart(2, "0")}`);
+        const retiredPath = (pathStore as any).retiredRecoveryPathFor(memoryPath) as string;
         await writeRaw(retiredPath, `${TEST_MARKER} retired ${index}`);
         await fs.truncate(retiredPath, 2 * 1024 * 1024);
       }

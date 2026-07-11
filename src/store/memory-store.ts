@@ -692,13 +692,13 @@ export class MemoryStore {
           let rollbackError: unknown;
           if (published) {
             try {
-              await this.preserveConflictFile(filePath, filePath, "local");
+              await this.preserveConflictFile(tmpPath, filePath, "local");
             } catch {
             }
             try {
-              await fs.unlink(filePath);
-            } catch (unlinkError) {
-              if ((unlinkError as NodeJS.ErrnoException).code !== "ENOENT") rollbackError = unlinkError;
+              await fs.copyFile(recoveryPath, tmpPath);
+            } catch (restorePublishedError) {
+              rollbackError = restorePublishedError;
             }
           }
           try {
@@ -753,9 +753,10 @@ export class MemoryStore {
 
   private async pruneRecoveryFiles(filePath: string): Promise<void> {
     const directory = path.dirname(filePath);
-    const recoveryPrefix = `.${path.basename(filePath)}.recovery-`;
-    const retiredPrefix = `.${path.basename(filePath)}.retired-`;
     const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const uuidPattern = "[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+    const recoveryPattern = new RegExp(`^\\.${escapedName}\\.recovery-\\d+-${uuidPattern}$`, "i");
+    const retiredPattern = new RegExp(`^\\.${escapedName}\\.retired-\\d+-${uuidPattern}$`, "i");
     const conflictPattern = new RegExp(
       `^\\.${escapedName}\\.conflict-local-\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
       "i",
@@ -763,21 +764,23 @@ export class MemoryStore {
     const activeCutoff = Date.now() - RECOVERY_ACTIVE_GRACE_MS;
     try {
       const names = await fs.readdir(directory);
-      await Promise.all(names.filter((name) => name.startsWith(recoveryPrefix)).map(async (name) => {
+      await Promise.all(names.filter((name) => recoveryPattern.test(name)).map(async (name) => {
         const recoveryPath = path.join(directory, name);
         try {
-          const state = await fs.stat(recoveryPath);
+          const state = await fs.lstat(recoveryPath);
+          if (!state.isFile()) return;
           if (state.mtimeMs >= activeCutoff) return;
           await this.retireRecoveryFile(recoveryPath, filePath);
         } catch {
         }
       }));
 
-      const retiredNames = (await fs.readdir(directory)).filter((name) => name.startsWith(retiredPrefix));
+      const retiredNames = (await fs.readdir(directory)).filter((name) => retiredPattern.test(name));
       const retired = await Promise.all(retiredNames.map(async (name) => {
         const retiredPath = path.join(directory, name);
         try {
-          return { path: retiredPath, state: await fs.stat(retiredPath) };
+          const state = await fs.lstat(retiredPath);
+          return state.isFile() ? { path: retiredPath, state } : null;
         } catch {
           return null;
         }
@@ -853,7 +856,7 @@ export class MemoryStore {
       path.dirname(filePath),
       `.${path.basename(filePath)}.conflict-${kind}-${Date.now()}-${randomUUID()}`,
     );
-    await fs.rename(sourcePath, conflictPath);
+    await fs.copyFile(sourcePath, conflictPath);
     return conflictPath;
   }
 }

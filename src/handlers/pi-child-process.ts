@@ -93,14 +93,6 @@ export function inheritedExtensionArgs(argv: string[] = process.argv.slice(2)): 
   return args;
 }
 
-function inheritedExtensionPaths(argv: string[]): string[] {
-  return inheritedExtensionArgs(argv).flatMap((arg, index, args) => {
-    if (arg === "-e" || arg === "--extension") return args[index + 1] ? [args[index + 1]] : [];
-    if (arg.startsWith("--extension=")) return [arg.slice("--extension=".length)];
-    return [];
-  });
-}
-
 export function detectClaudeOAuthAdapterPaths(ownExtensionPath = OWN_EXTENSION_PATH): string[] {
   const candidates = new Set<string>();
   if (ownExtensionPath) {
@@ -111,11 +103,10 @@ export function detectClaudeOAuthAdapterPaths(ownExtensionPath = OWN_EXTENSION_P
   return [...candidates].filter((candidate) => existsSync(candidate));
 }
 
-function childExtensionPaths(config: ChildLlmConfig, argv: string[]): string[] {
+function childExtensionPaths(config: ChildLlmConfig): string[] {
   const candidates = [
     OWN_EXTENSION_PATH,
     ...(config.childExtensionPaths ?? []),
-    ...inheritedExtensionPaths(argv),
     ...detectClaudeOAuthAdapterPaths(),
   ];
   const seen = new Set<string>();
@@ -131,11 +122,11 @@ function childExtensionPaths(config: ChildLlmConfig, argv: string[]): string[] {
   return paths;
 }
 
-function appendOwnExtensionArgs(args: string[], config: ChildLlmConfig, argv: string[]): void {
+function appendOwnExtensionArgs(args: string[], config: ChildLlmConfig): void {
   // Skip all packages from settings.json (--no-extensions) — the subprocess
   // loads only Hermes and explicitly required provider adapters.
   args.push("--no-extensions");
-  for (const extensionPath of childExtensionPaths(config, argv)) {
+  for (const extensionPath of childExtensionPaths(config)) {
     args.push("-e", extensionPath);
   }
 }
@@ -143,7 +134,7 @@ function appendOwnExtensionArgs(args: string[], config: ChildLlmConfig, argv: st
 export function buildChildPiPromptArgs(
   prompt: string,
   config: ChildLlmConfig,
-  argv: string[] = process.argv.slice(2),
+  _argv: string[] = process.argv.slice(2),
 ): string[] {
   const args = ["-p", "--no-session"];
   const model = normalizedModelOverride(config);
@@ -151,7 +142,7 @@ export function buildChildPiPromptArgs(
 
   if (model) args.push("--model", model);
   if (thinking) args.push("--thinking", thinking);
-  appendOwnExtensionArgs(args, config, argv);
+  appendOwnExtensionArgs(args, config);
   args.push(prompt);
 
   return args;
@@ -161,7 +152,7 @@ function basePromptArgs(prompt: string, config: ChildLlmConfig): string[] {
   // Always use --no-extensions + own path so the retry also avoids loading
   // all settings.json packages — matching the primary code path.
   const args = ["-p", "--no-session"];
-  appendOwnExtensionArgs(args, config, process.argv.slice(2));
+  appendOwnExtensionArgs(args, config);
   args.push(prompt);
   return args;
 }

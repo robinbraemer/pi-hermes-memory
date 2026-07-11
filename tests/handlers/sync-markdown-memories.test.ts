@@ -420,7 +420,7 @@ describe('memory sqlite sync + markdown backfill', () => {
     fs.mkdirSync(legacyDir, { recursive: true });
     fs.mkdirSync(realDir, { recursive: true });
     fs.writeFileSync(realDbPath, 'not a sqlite database');
-    fs.symlinkSync(realDbPath, path.join(legacyDir, 'sessions.db'), 'file');
+    fs.symlinkSync(path.relative(legacyDir, realDbPath), path.join(legacyDir, 'sessions.db'), 'file');
     const targetManager = new DatabaseManager(targetDir);
 
     try {
