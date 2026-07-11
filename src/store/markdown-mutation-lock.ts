@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { AtomicLockCoordinator, type AtomicLockLease } from "./atomic-lock-coordinator.js";
 import { canonicalStoragePath } from "./canonical-storage-path.js";
@@ -9,9 +10,19 @@ export async function canonicalMarkdownIdentity(filePath: string): Promise<strin
   return canonicalStoragePath(filePath);
 }
 
+function nearestExistingDirectory(filePath: string): string {
+  let directory = path.dirname(filePath);
+  while (!fs.existsSync(directory)) {
+    const parent = path.dirname(directory);
+    if (parent === directory) return directory;
+    directory = parent;
+  }
+  return directory;
+}
+
 export async function acquireMarkdownMutationLock(filePath: string): Promise<AtomicLockLease> {
   const identity = await canonicalMarkdownIdentity(filePath);
-  const coordinatorDir = path.dirname(path.dirname(identity));
+  const coordinatorDir = nearestExistingDirectory(identity);
   const coordinator = new AtomicLockCoordinator(path.join(coordinatorDir, ".pi-hermes-locks.sqlite"));
   const lockKey = `mutation:${identity}`;
   const deadline = Date.now() + MUTATION_WAIT_MS;

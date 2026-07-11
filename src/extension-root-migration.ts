@@ -19,12 +19,14 @@ interface PreparingDatabaseMigrationMarker {
   version: 1;
   state: "preparing";
   retirementDirectory: string;
+  stagingDirectory?: string;
 }
 
 interface PublishingDatabaseMigrationMarker {
   version: 1;
   state: "publishing";
   retirementDirectory: string;
+  stagingDirectory?: string;
   retiredNames: DatabaseFileName[];
   publication: "snapshot" | "raw";
   targets: Record<string, ExpectedDatabaseEntry>;
@@ -91,10 +93,16 @@ async function databaseRetirementArtifacts(legacyRoot: string): Promise<string[]
   const directories: string[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith(".sessions-db-retirement-")) continue;
-    const directory = path.join(legacyRoot, entry.name);
-    if ((await databaseFilesAt(directory)).length > 0) directories.push(directory);
+    directories.push(path.join(legacyRoot, entry.name));
   }
   return directories;
+}
+
+async function databaseStagingArtifacts(targetRoot: string): Promise<string[]> {
+  const entries = await fs.readdir(targetRoot, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith(".sessions-db-migration-"))
+    .map((entry) => path.join(targetRoot, entry.name));
 }
 
 function sameNames(left: string[], right: string[]): boolean {
@@ -138,6 +146,7 @@ async function writeMigrationMarker(
 
 async function publishingMarker(
   retirementDir: string,
+  stagingDir: string,
   retiredNames: string[],
   publication: "snapshot" | "raw",
   sources: Record<string, string>,
@@ -150,6 +159,7 @@ async function publishingMarker(
     version: 1,
     state: "publishing",
     retirementDirectory: path.basename(retirementDir),
+    stagingDirectory: path.basename(stagingDir),
     retiredNames: retiredNames as DatabaseFileName[],
     publication,
     targets,
@@ -169,6 +179,10 @@ function parsePublishingMarker(content: string): PublishingDatabaseMigrationMark
   if (typeof marker.retirementDirectory !== "string"
     || path.basename(marker.retirementDirectory) !== marker.retirementDirectory
     || !marker.retirementDirectory.startsWith(".sessions-db-retirement-")) return null;
+  if (marker.stagingDirectory !== undefined
+    && (typeof marker.stagingDirectory !== "string"
+      || path.basename(marker.stagingDirectory) !== marker.stagingDirectory
+      || !marker.stagingDirectory.startsWith(".sessions-db-migration-"))) return null;
   if (!Array.isArray(marker.retiredNames)
     || marker.retiredNames.length === 0
     || !marker.retiredNames.includes("sessions.db")
@@ -216,34 +230,64 @@ function hasValidSqliteIntegrity(filePath: string): boolean {
   }
 }
 
-async function isVerifiedCompletedMigration(
+async function directoryContainsOnly(directory: string, allowedNames: readonly string[]): Promise<boolean> {
+  try {
+    const entries = await fs.readdir(directory);
+    return entries.every((name) => allowedNames.includes(name));
+  } catch {
+    return false;
+  }
+}
+
+async function verifiedCompletedMigrationMarker(
   legacyRoot: string,
   targetRoot: string,
   pendingMarker: string,
   retirementArtifacts: string[],
+  stagingArtifacts: string[],
   targetNames: string[],
-): Promise<boolean> {
+): Promise<PublishingDatabaseMigrationMarker | null> {
   let marker: PublishingDatabaseMigrationMarker | null;
   try {
     marker = parsePublishingMarker(await fs.readFile(pendingMarker, "utf-8"));
   } catch {
-    return false;
+    return null;
   }
-  if (!marker || retirementArtifacts.length > 1) return false;
+  if (!marker || retirementArtifacts.length > 1 || stagingArtifacts.length > 1) return null;
   const retirementDir = path.join(legacyRoot, marker.retirementDirectory);
   if (retirementArtifacts.length === 1) {
-    if (path.resolve(retirementArtifacts[0]) !== path.resolve(retirementDir)) return false;
-    if (!sameNames(await fs.readdir(retirementDir), marker.retiredNames)) return false;
+    if (path.resolve(retirementArtifacts[0]) !== path.resolve(retirementDir)) return null;
+    if (!await directoryContainsOnly(retirementDir, marker.retiredNames)) return null;
   } else if (await pathEntryExists(retirementDir)) {
-    return false;
+    return null;
   }
-  if (!sameNames(targetNames, Object.keys(marker.targets))) return false;
+  if (marker.stagingDirectory) {
+    const stagingDir = path.join(targetRoot, marker.stagingDirectory);
+    if (stagingArtifacts.length === 1) {
+      if (path.resolve(stagingArtifacts[0]) !== path.resolve(stagingDir)) return null;
+      if (!await directoryContainsOnly(stagingDir, ["sessions.db"])) return null;
+    } else if (await pathEntryExists(stagingDir)) {
+      return null;
+    }
+  } else if (stagingArtifacts.length > 0) {
+    return null;
+  }
+  if (!sameNames(targetNames, Object.keys(marker.targets))) return null;
   for (const [name, expected] of Object.entries(marker.targets)) {
-    if (!await matchesExpectedDatabaseEntry(path.join(targetRoot, name), expected)) return false;
+    if (!await matchesExpectedDatabaseEntry(path.join(targetRoot, name), expected)) return null;
   }
   if (marker.publication === "snapshot"
-    && !hasValidSqliteIntegrity(path.join(targetRoot, "sessions.db"))) return false;
-  return true;
+    && !hasValidSqliteIntegrity(path.join(targetRoot, "sessions.db"))) return null;
+  return marker;
+}
+
+async function removeAndConfirm(directory: string): Promise<string | null> {
+  try {
+    await fs.rm(directory, { recursive: true, force: true });
+  } catch (error) {
+    return `${directory}: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return await pathEntryExists(directory) ? `${directory}: cleanup left the directory in place` : null;
 }
 
 async function moveFileSafe(source: string, target: string): Promise<void> {
@@ -489,24 +533,61 @@ async function migrateDatabaseGeneration(
   const retirementArtifacts = hadPendingMarker
     ? await databaseRetirementArtifacts(legacyRoot)
     : [];
-  if (sourceNames.length === 0
+  const stagingArtifacts = hadPendingMarker
+    ? await databaseStagingArtifacts(targetRoot)
+    : [];
+  const completedMarker = sourceNames.length === 0
     && hadPendingMarker
     && targetNames.includes("sessions.db")
-    && await isVerifiedCompletedMigration(
+    ? await verifiedCompletedMigrationMarker(
       legacyRoot,
       targetRoot,
       pendingMarker,
       retirementArtifacts,
+      stagingArtifacts,
       targetNames,
-    )) {
-    for (const retirementArtifact of retirementArtifacts) {
-      await fs.rm(retirementArtifact, { recursive: true, force: true });
+    )
+    : null;
+  if (sourceNames.length === 0
+    && hadPendingMarker
+    && targetNames.includes("sessions.db")
+    && completedMarker) {
+    const ownedArtifacts = [
+      path.join(legacyRoot, completedMarker.retirementDirectory),
+      ...(completedMarker.stagingDirectory
+        ? [path.join(targetRoot, completedMarker.stagingDirectory)]
+        : []),
+    ];
+    const cleanupFailures = (await Promise.all(ownedArtifacts.map(removeAndConfirm)))
+      .filter((failure): failure is string => failure !== null);
+    if (cleanupFailures.length > 0) {
+      const message = `completed SQLite migration cleanup failed: ${cleanupFailures.join("; ")}`;
+      result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+      result.criticalFailures.push({
+        name: "sessions.db",
+        source: path.join(legacyRoot, "sessions.db"),
+        target: path.join(targetRoot, "sessions.db"),
+        message,
+      });
+      return;
     }
-    await fs.unlink(pendingMarker);
+    try {
+      await fs.unlink(pendingMarker);
+    } catch (error) {
+      const message = `completed SQLite migration marker cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+      result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+      result.criticalFailures.push({
+        name: "sessions.db",
+        source: path.join(legacyRoot, "sessions.db"),
+        target: path.join(targetRoot, "sessions.db"),
+        message,
+      });
+    }
     return;
   }
-  if (retirementArtifacts.length > 0) {
-    const message = `an interrupted migration preserved recovery artifacts at ${retirementArtifacts.join(", ")}`;
+  if (retirementArtifacts.length > 0 || stagingArtifacts.length > 0) {
+    const artifacts = [...retirementArtifacts, ...stagingArtifacts];
+    const message = `an interrupted migration preserved recovery artifacts at ${artifacts.join(", ")}`;
     result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
     result.criticalFailures.push({
       name: "sessions.db",
@@ -578,6 +659,7 @@ async function migrateDatabaseGeneration(
       version: 1,
       state: "preparing",
       retirementDirectory: path.basename(retirementDir),
+      stagingDirectory: path.basename(stagingDir),
     }, true);
     await fs.mkdir(stagingDir, { mode: 0o700 });
     const source = path.join(legacyRoot, "sessions.db");
@@ -659,7 +741,7 @@ async function migrateDatabaseGeneration(
       );
       await writeMigrationMarker(
         pendingMarker,
-        await publishingMarker(retirementDir, retired, "raw", rawSources),
+        await publishingMarker(retirementDir, stagingDir, retired, "raw", rawSources),
       );
       for (const name of retired) {
         const target = path.join(targetRoot, name);
@@ -670,10 +752,15 @@ async function migrateDatabaseGeneration(
       const target = path.join(targetRoot, "sessions.db");
       await writeMigrationMarker(
         pendingMarker,
-        await publishingMarker(retirementDir, retired, "snapshot", { "sessions.db": staged }),
+        await publishingMarker(retirementDir, stagingDir, retired, "snapshot", { "sessions.db": staged }),
       );
       await publish(staged, target);
       published.set(target, await fileIdentity(target));
+    }
+
+    const publicationSuccessors = await databaseFilesAt(legacyRoot);
+    if (publicationSuccessors.length > 0) {
+      throw new Error(`legacy SQLite generation changed during publication: ${publicationSuccessors.join(", ")}`);
     }
 
     if (writeLock) writeLock.exec("COMMIT");
@@ -713,12 +800,35 @@ async function migrateDatabaseGeneration(
     if (writeLock) {
       try { writeLock.close(); } catch {}
     }
-    try { await fs.rm(stagingDir, { recursive: true, force: true }); } catch {}
+    const cleanupFailures: string[] = [];
+    const stagingFailure = await removeAndConfirm(stagingDir);
+    if (stagingFailure) cleanupFailures.push(stagingFailure);
     if (!preserveRetirement) {
-      try { await fs.rm(retirementDir, { recursive: true, force: true }); } catch {}
+      const retirementFailure = await removeAndConfirm(retirementDir);
+      if (retirementFailure) cleanupFailures.push(retirementFailure);
     }
+    if (cleanupFailures.length > 0) keepPendingMarker = true;
     if (!keepPendingMarker) {
-      try { await fs.unlink(pendingMarker); } catch {}
+      try {
+        await fs.unlink(pendingMarker);
+      } catch (error) {
+        cleanupFailures.push(`${pendingMarker}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (cleanupFailures.length > 0) {
+      const message = `SQLite migration cleanup failed: ${cleanupFailures.join("; ")}`;
+      result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+      const existingFailure = result.criticalFailures.find((failure) => failure.name === "sessions.db");
+      if (existingFailure) {
+        existingFailure.message += `; ${message}`;
+      } else {
+        result.criticalFailures.push({
+          name: "sessions.db",
+          source: path.join(legacyRoot, "sessions.db"),
+          target: path.join(targetRoot, "sessions.db"),
+          message,
+        });
+      }
     }
   }
   } finally {

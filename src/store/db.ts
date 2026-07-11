@@ -156,6 +156,10 @@ export class DatabaseManager {
     return this.canonicalDbPath;
   }
 
+  private refreshCanonicalDbPath(): void {
+    this.canonicalDbPath = canonicalStoragePathSync(this.displayDbPath);
+  }
+
   setOpenGuard(guard: (() => void) | null): void {
     this.openGuard = guard;
   }
@@ -191,6 +195,7 @@ export class DatabaseManager {
   getDb(): DatabaseLike {
     if (!this.db) {
       this.openGuard?.();
+      this.refreshCanonicalDbPath();
       this.db = this.open();
     }
     return this.db;

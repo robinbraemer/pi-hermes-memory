@@ -91,6 +91,36 @@ describe('DatabaseManager', () => {
       assert.strictEqual(db1, db2);
     });
 
+    it('re-resolves a file-symlinked database after the manager is closed', { skip: process.platform === 'win32' }, () => {
+      dbManager.close();
+      const memoryDir = path.join(tmpDir, 'memory');
+      const targetsDir = path.join(tmpDir, 'targets');
+      const firstTarget = path.join(targetsDir, 'first.db');
+      const secondTarget = path.join(targetsDir, 'second.db');
+      const aliasPath = path.join(memoryDir, 'sessions.db');
+      fs.mkdirSync(memoryDir);
+      fs.mkdirSync(targetsDir);
+      fs.symlinkSync(firstTarget, aliasPath, 'file');
+      const manager = new DatabaseManager(memoryDir);
+
+      manager.getDb().prepare("INSERT INTO extension_metadata (key, value) VALUES ('target', 'first')").run();
+      manager.close();
+      fs.unlinkSync(aliasPath);
+      fs.symlinkSync(secondTarget, aliasPath, 'file');
+      manager.getDb().prepare("INSERT INTO extension_metadata (key, value) VALUES ('target', 'second')").run();
+      manager.close();
+
+      const first = new Database(firstTarget, { readonly: true });
+      const second = new Database(secondTarget, { readonly: true });
+      try {
+        assert.deepStrictEqual(first.prepare("SELECT value FROM extension_metadata WHERE key = 'target'").all(), [{ value: 'first' }]);
+        assert.deepStrictEqual(second.prepare("SELECT value FROM extension_metadata WHERE key = 'target'").all(), [{ value: 'second' }]);
+      } finally {
+        first.close();
+        second.close();
+      }
+    });
+
     it('should create parent directory if it does not exist', () => {
       const nestedDir = path.join(tmpDir, 'nested', 'dir');
       const manager = new DatabaseManager(nestedDir);
