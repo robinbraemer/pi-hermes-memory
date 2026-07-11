@@ -105,6 +105,62 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.match(failures.at(-1) ?? '', /failed after 3 attempts/);
   });
 
+  it('cancels a scheduled startup retry', async () => {
+    let scheduled: (() => void) | null = null;
+    const timer = {};
+    let cleared = false;
+    let attempts = 0;
+    let initialized = false;
+    const retrier = new PersistenceReconciliationRetrier(
+      async () => {
+        attempts++;
+        throw new Error('retry later');
+      },
+      () => { initialized = true; },
+      () => {},
+      {
+        setTimeoutFn: (callback) => {
+          scheduled = callback;
+          return timer;
+        },
+        clearTimeoutFn: (value) => {
+          assert.strictEqual(value, timer);
+          cleared = true;
+        },
+      },
+    );
+
+    await retrier.start();
+    await retrier.cancel();
+    scheduled?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(cleared, true);
+    assert.equal(attempts, 1);
+    assert.equal(initialized, false);
+  });
+
+  it('waits for an in-flight startup attempt without succeeding after cancellation', async () => {
+    let resolveAttempt!: (value: { failedScopes: string[] }) => void;
+    const operation = new Promise<{ failedScopes: string[] }>((resolve) => {
+      resolveAttempt = resolve;
+    });
+    let initialized = false;
+    const retrier = new PersistenceReconciliationRetrier(
+      () => operation,
+      () => { initialized = true; },
+      () => {},
+    );
+
+    const start = retrier.start();
+    const cancellation = retrier.cancel();
+    resolveAttempt({ failedScopes: [] });
+    await Promise.all([start, cancellation]);
+
+    assert.equal(initialized, false);
+    assert.equal(retrier.isInitialized(), false);
+  });
+
   it('memory tool writes are immediately searchable in SQLite', async () => {
     let capturedTool: any;
     const mockPi = {

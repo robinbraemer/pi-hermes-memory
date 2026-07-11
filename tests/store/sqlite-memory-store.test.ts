@@ -224,6 +224,39 @@ describe('sqlite-memory-store', () => {
       assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 1);
     });
 
+    it('preserves inferred project scope across a trusted replacement', async () => {
+      const previousContent = '[correction] use pnpm — Project: project-a';
+      const previousRaw = `${previousContent} <!-- created=2026-05-08, last=2026-05-09 -->`;
+      addMemory(dbManager, previousContent, 'failure', 'project-a', 'correction');
+      reconcileMarkdownFailureScopes(dbManager, [previousRaw]);
+      fs.writeFileSync(path.join(tmpDir, 'failures.md'), previousRaw, 'utf-8');
+
+      const store = new MemoryStore({
+        memoryDir: tmpDir,
+        memoryCharLimit: 5_000,
+        userCharLimit: 5_000,
+        failureCharLimit: 5_000,
+      } as any);
+      await store.loadFromDisk();
+      store.setMutationObserver(async (target, entries, replacements) => {
+        if (target === 'failure') reconcileMarkdownFailureScopes(dbManager, entries, replacements);
+        return null;
+      });
+
+      const result = await store.replace(
+        'failure',
+        'use pnpm',
+        '[correction] use corepack pnpm — Project: spoofed-project',
+      );
+
+      assert.equal(result.success, true);
+      assert.deepStrictEqual(
+        getMemories(dbManager, { target: 'failure' }).map((entry) => [entry.project, entry.content]),
+        [['project-a', '[correction] use corepack pnpm — Project: spoofed-project']],
+      );
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: 'spoofed-project' }).length, 0);
+    });
+
     it('round-trips project correction scope through authoritative Markdown metadata', async () => {
       const store = new MemoryStore({
         memoryDir: tmpDir,

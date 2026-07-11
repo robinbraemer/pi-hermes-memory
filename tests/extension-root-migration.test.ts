@@ -529,6 +529,9 @@ describe("migrateExtensionRoot", () => {
     const targetDb = path.join(target, "sessions.db");
     fs.copyFileSync(path.join(retirement, "sessions.db"), targetDb);
     const targetState = fs.lstatSync(targetDb);
+    const reservationPath = path.join(legacy, "sessions.db");
+    fs.mkdirSync(reservationPath);
+    const reservationState = fs.lstatSync(reservationPath);
     fs.writeFileSync(path.join(target, ".sessions-db-migration-pending"), JSON.stringify({
       version: 1,
       state: "publishing",
@@ -538,12 +541,14 @@ describe("migrateExtensionRoot", () => {
       targets: {
         "sessions.db": { type: "file", dev: targetState.dev, ino: targetState.ino },
       },
+      reservation: { dev: reservationState.dev, ino: reservationState.ino },
     }), "utf-8");
 
     const result = await migrateExtensionRoot(legacy, target);
 
     assert.deepStrictEqual(result.criticalFailures, []);
     assert.equal(fs.existsSync(path.join(target, ".sessions-db-migration-pending")), false);
+    assert.equal(fs.existsSync(reservationPath), false);
     assert.equal(fs.existsSync(retirement), false);
     const migrated = new Database(path.join(target, "sessions.db"), { readonly: true });
     try {

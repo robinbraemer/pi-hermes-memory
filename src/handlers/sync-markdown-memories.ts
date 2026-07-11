@@ -34,14 +34,19 @@ interface PersistenceReconciliationRetrierOptions {
   maxAttempts?: number;
   retryDelayMs?: number;
   setTimeoutFn?: (callback: () => void, delayMs: number) => unknown;
+  clearTimeoutFn?: (timer: unknown) => void;
 }
 
 export class PersistenceReconciliationRetrier {
-  private state: 'idle' | 'running' | 'waiting' | 'succeeded' | 'exhausted' = 'idle';
+  private state: 'idle' | 'running' | 'waiting' | 'succeeded' | 'exhausted' | 'cancelled' = 'idle';
   private attempts = 0;
+  private retryTimer: unknown = null;
+  private retryScheduled = false;
+  private activeAttempt: Promise<void> | null = null;
   private readonly maxAttempts: number;
   private readonly retryDelayMs: number;
   private readonly setTimeoutFn: (callback: () => void, delayMs: number) => unknown;
+  private readonly clearTimeoutFn: (timer: unknown) => void;
 
   constructor(
     private readonly operation: () => Promise<
@@ -54,6 +59,7 @@ export class PersistenceReconciliationRetrier {
     this.maxAttempts = Math.max(1, options.maxAttempts ?? 3);
     this.retryDelayMs = Math.max(0, options.retryDelayMs ?? 1_000);
     this.setTimeoutFn = options.setTimeoutFn ?? setTimeout;
+    this.clearTimeoutFn = options.clearTimeoutFn ?? ((timer) => clearTimeout(timer as NodeJS.Timeout));
   }
 
   isInitialized(): boolean {
@@ -62,10 +68,40 @@ export class PersistenceReconciliationRetrier {
 
   async start(): Promise<void> {
     if (this.state !== 'idle') return;
-    await this.attempt();
+    await this.runAttempt();
+  }
+
+  async cancel(): Promise<void> {
+    if (this.state === 'cancelled') {
+      if (this.activeAttempt) await this.activeAttempt;
+      return;
+    }
+    if (this.state === 'succeeded' || this.state === 'exhausted') return;
+    this.state = 'cancelled';
+    if (this.retryScheduled) {
+      this.retryScheduled = false;
+      try { this.clearTimeoutFn(this.retryTimer); } catch {}
+      this.retryTimer = null;
+    }
+    if (this.activeAttempt) await this.activeAttempt;
+  }
+
+  private async runAttempt(): Promise<void> {
+    const attempt = this.attempt();
+    this.activeAttempt = attempt;
+    try {
+      await attempt;
+    } finally {
+      if (this.activeAttempt === attempt) this.activeAttempt = null;
+    }
+  }
+
+  private isCancelled(): boolean {
+    return this.state === 'cancelled';
   }
 
   private async attempt(): Promise<void> {
+    if (this.isCancelled()) return;
     this.state = 'running';
     this.attempts++;
     let failure: string | null = null;
@@ -83,6 +119,7 @@ export class PersistenceReconciliationRetrier {
       failure = error instanceof Error ? error.message : String(error);
     }
 
+    if (this.isCancelled()) return;
     if (!failure) {
       this.state = 'succeeded';
       try { this.onSucceeded(); } catch {}
@@ -101,11 +138,14 @@ export class PersistenceReconciliationRetrier {
     }
     if (exhausted) return;
 
-    const timer = this.setTimeoutFn(() => {
+    this.retryScheduled = true;
+    this.retryTimer = this.setTimeoutFn(() => {
+      this.retryScheduled = false;
+      this.retryTimer = null;
       if (this.state !== 'waiting') return;
-      void this.attempt();
+      void this.runAttempt();
     }, this.retryDelayMs);
-    (timer as { unref?: () => void } | null)?.unref?.();
+    (this.retryTimer as { unref?: () => void } | null)?.unref?.();
   }
 }
 

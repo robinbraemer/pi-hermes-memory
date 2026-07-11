@@ -688,18 +688,6 @@ async function migrateDatabaseGeneration(
       });
       return;
     }
-    try {
-      await fs.unlink(pendingMarker);
-    } catch (error) {
-      const message = `completed SQLite migration marker cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
-      result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
-      result.criticalFailures.push({
-        name: "sessions.db",
-        source: path.join(legacyRoot, "sessions.db"),
-        target: path.join(targetRoot, "sessions.db"),
-        message,
-      });
-    }
     if (resumedReservation) {
       try {
         await removeOwnedReservation(path.join(legacyRoot, "sessions.db"), resumedReservation);
@@ -712,7 +700,20 @@ async function migrateDatabaseGeneration(
           target: path.join(targetRoot, "sessions.db"),
           message,
         });
+        return;
       }
+    }
+    try {
+      await fs.unlink(pendingMarker);
+    } catch (error) {
+      const message = `completed SQLite migration marker cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+      result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+      result.criticalFailures.push({
+        name: "sessions.db",
+        source: path.join(legacyRoot, "sessions.db"),
+        target: path.join(targetRoot, "sessions.db"),
+        message,
+      });
     }
     return;
   }
@@ -956,20 +957,20 @@ async function migrateDatabaseGeneration(
       const retirementFailure = await removeAndConfirm(retirementDir);
       if (retirementFailure) cleanupFailures.push(retirementFailure);
     }
-    if (cleanupFailures.length > 0) keepPendingMarker = true;
-    if (!keepPendingMarker) {
-      try {
-        await fs.unlink(pendingMarker);
-      } catch (error) {
-        cleanupFailures.push(`${pendingMarker}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
     if (sourceReservation) {
       try {
         await removeOwnedReservation(source, sourceReservation);
         sourceReservation = null;
       } catch (error) {
         cleanupFailures.push(`${source}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (cleanupFailures.length > 0) keepPendingMarker = true;
+    if (!keepPendingMarker) {
+      try {
+        await fs.unlink(pendingMarker);
+      } catch (error) {
+        cleanupFailures.push(`${pendingMarker}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (cleanupFailures.length > 0) {

@@ -142,21 +142,40 @@ export default function (pi: ExtensionAPI) {
   const scheduleBackfillAfterInitialization = () => {
     scheduleSessionBackfill(dbManager, sessionsDir, { notify: notifyPersistence });
   };
+
+  // Keep project memory available for users upgrading from the old
+  // ~/.pi/agent/<project>/ layout. This is non-destructive: legacy folders
+  // remain in place while entries are copied/merged into projects-memory/.
+  migrateLegacyProjectMemoryDirs(agentRoot, config.projectsMemoryDir);
+  // Detect project from cwd using shared helper
+  // Project-scoped store: ~/.pi/agent/<projectsMemoryDir>/<project_name>/
+  const projectConfig = project.memoryDir
+    ? { ...config, memoryCharLimit: config.projectCharLimit, memoryDir: project.memoryDir }
+    : { ...config, memoryDir: undefined };
+  const projectStore = project.memoryDir ? new MemoryStore(projectConfig) : null;
+
   const persistenceRetrier = new PersistenceReconciliationRetrier(
-    async () => migrateThenSyncMarkdownMemories(
-      dbManager,
-      extensionRootMigrationPending ? legacyGlobalDir : null,
-      globalDir,
-      config.projectsMemoryDir,
-      agentRoot,
-      {
-        onMigrationSucceeded: () => {
-          extensionRootMigrationPending = false;
-          databaseMigrationPending = false;
-          dbManager.setOpenGuard(null);
+    async () => {
+      const result = await migrateThenSyncMarkdownMemories(
+        dbManager,
+        extensionRootMigrationPending ? legacyGlobalDir : null,
+        globalDir,
+        config.projectsMemoryDir,
+        agentRoot,
+        {
+          onMigrationSucceeded: () => {
+            extensionRootMigrationPending = false;
+            databaseMigrationPending = false;
+            dbManager.setOpenGuard(null);
+          },
         },
-      },
-    ),
+      );
+      if (result.failedScopes.length === 0) {
+        await store.loadFromDisk();
+        if (projectStore) await projectStore.loadFromDisk();
+      }
+      return result;
+    },
     () => {
       persistenceInitialized = true;
       scheduleBackfillAfterInitialization();
@@ -172,17 +191,6 @@ export default function (pi: ExtensionAPI) {
       resource,
     };
   };
-
-  // Keep project memory available for users upgrading from the old
-  // ~/.pi/agent/<project>/ layout. This is non-destructive: legacy folders
-  // remain in place while entries are copied/merged into projects-memory/.
-  migrateLegacyProjectMemoryDirs(agentRoot, config.projectsMemoryDir);
-  // Detect project from cwd using shared helper
-  // Project-scoped store: ~/.pi/agent/<projectsMemoryDir>/<project_name>/
-  const projectConfig = project.memoryDir
-    ? { ...config, memoryCharLimit: config.projectCharLimit, memoryDir: project.memoryDir }
-    : { ...config, memoryDir: undefined };
-  const projectStore = project.memoryDir ? new MemoryStore(projectConfig) : null;
 
   // ── 1. Load memory from disk on session start ──
   pi.on("session_start", async (_event, ctx) => {
@@ -272,6 +280,7 @@ export default function (pi: ExtensionAPI) {
   // DB-writing session_shutdown handler after this block — it would run after
   // close() and silently no-op.
   pi.on("session_shutdown", async (_event, ctx) => {
+    await persistenceRetrier.cancel();
     try {
       const sessionFile = ctx.sessionManager.getSessionFile();
       if (sessionFile && require("node:fs").existsSync(sessionFile)) {

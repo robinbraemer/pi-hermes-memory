@@ -559,10 +559,22 @@ function initializeLegacyFailureScopeAssignments(
 export function reconcileMarkdownFailureScopes(
   dbManager: DatabaseManager,
   rawEntries: string[],
+  replacements: Array<{ previous: string; next: string }> = [],
 ): MarkdownMemoryReconcileResult {
   const db = dbManager.getDb();
   const reconcile = (): MarkdownMemoryReconcileResult => {
     const legacyAssignments = initializeLegacyFailureScopeAssignments(dbManager, rawEntries);
+    for (const replacement of replacements) {
+      if (failureProject(replacement.previous) !== null || failureProject(replacement.next) !== null) continue;
+      const previousIdentity = failureIdentity(replacement.previous);
+      const nextIdentity = failureIdentity(replacement.next);
+      if (previousIdentity === nextIdentity) continue;
+      const previousProjects = legacyAssignments.get(previousIdentity);
+      if (!previousProjects) continue;
+      legacyAssignments.set(nextIdentity, [
+        ...new Set([...(legacyAssignments.get(nextIdentity) ?? []), ...previousProjects]),
+      ]);
+    }
     const explicitProjectsByIdentity = new Map<string, Set<string>>();
     for (const rawEntry of rawEntries) {
       const project = failureProject(rawEntry);

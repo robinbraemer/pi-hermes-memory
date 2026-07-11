@@ -114,7 +114,11 @@ export class MemoryStore {
   private storagePaths: Partial<Record<"memory" | "user" | "failure", string>> = {};
   private snapshot: MemorySnapshot = { memory: "", user: "" };
   private consolidator: ((target: "memory" | "user" | "failure", signal?: AbortSignal) => Promise<ConsolidationResult>) | null = null;
-  private mutationObserver: ((target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>) | null = null;
+  private mutationObserver: ((
+    target: "memory" | "user" | "failure",
+    entries: string[],
+    replacements: Array<{ previous: string; next: string }>,
+  ) => Promise<string | null | undefined>) | null = null;
 
   constructor(private config: MemoryConfig) {}
 
@@ -127,7 +131,11 @@ export class MemoryStore {
   }
 
   setMutationObserver(
-    fn: (target: "memory" | "user" | "failure", entries: string[]) => Promise<string | null | undefined>,
+    fn: (
+      target: "memory" | "user" | "failure",
+      entries: string[],
+      replacements: Array<{ previous: string; next: string }>,
+    ) => Promise<string | null | undefined>,
   ): void {
     this.mutationObserver = fn;
   }
@@ -386,7 +394,7 @@ export class MemoryStore {
   }
 
   async replace(target: "memory" | "user" | "failure", oldText: string, newContent: string): Promise<MemoryResult> {
-    return this.runTargetMutation(target, () => this.replaceUnlocked(target, oldText, newContent));
+    return this.runTargetMutation(target, () => this.replaceUnlocked(target, oldText, newContent), true);
   }
 
   private async replaceUnlocked(target: "memory" | "user" | "failure", oldText: string, newContent: string): Promise<MemoryResult> {
@@ -679,12 +687,14 @@ export class MemoryStore {
   private async runTargetMutation(
     target: "memory" | "user" | "failure",
     mutation: () => Promise<MemoryResult>,
+    isReplacement = false,
   ): Promise<MemoryResult> {
     while (true) {
       const storagePath = await this.refreshStoragePath(target);
       const outcome = await withMarkdownMutationLock(storagePath, async (): Promise<MemoryResult | null> => {
         if (await this.refreshStoragePath(target) !== storagePath) return null;
         await recoverInterruptedMarkdownPublication(storagePath);
+        let previousEntries = (await this.readFileState(storagePath)).entries;
         for (let attempt = 0; ; attempt++) {
           try {
             const result = await mutation();
@@ -693,7 +703,13 @@ export class MemoryStore {
               const state = await this.readFileState(filePath);
               this.setEntries(target, [...new Set(state.entries)]);
               this.fileFingerprints[filePath] = state.fingerprint;
-              const warning = await this.mutationObserver(target, [...state.entries]);
+              const replacements = isReplacement
+                ? previousEntries.flatMap((previous, index) => {
+                    const next = state.entries[index];
+                    return next !== undefined && next !== previous ? [{ previous, next }] : [];
+                  })
+                : [];
+              const warning = await this.mutationObserver(target, [...state.entries], replacements);
               if (warning) {
                 const warnings = [...(result.warnings ?? []), warning];
                 return {
@@ -716,6 +732,7 @@ export class MemoryStore {
             this.fileFingerprints[currentPath] = state.fingerprint;
             if (error instanceof MarkdownTargetChanged) return null;
             if (!(error instanceof ExternalMemoryWriteConflict)) throw error;
+            previousEntries = state.entries;
             if (attempt >= MAX_EXTERNAL_WRITE_RETRIES) {
               return {
                 success: false,

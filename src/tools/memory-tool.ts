@@ -192,11 +192,12 @@ async function reconcileStoreScope(
   rawTarget: "memory" | "user" | "project" | "failure",
   dbManager: DatabaseManager | null,
   projectName?: string | null,
+  replacements: Array<{ previous: string; next: string }> = [],
 ): Promise<string | null | undefined> {
   if (!dbManager) return undefined;
   try {
     if (rawTarget === "failure") {
-      reconcileMarkdownFailureScopes(dbManager, entries);
+      reconcileMarkdownFailureScopes(dbManager, entries, replacements);
       return null;
     }
     const target = sqliteTargetFor(rawTarget);
@@ -221,7 +222,8 @@ export function registerMemoryTool(
 ): void {
   const reconciledStores = new WeakSet<MemoryStore>();
   if (typeof store.setMutationObserver === "function") {
-    store.setMutationObserver((target, entries) => reconcileStoreScope(entries, target, dbManager, projectName));
+    store.setMutationObserver((target, entries, replacements) =>
+      reconcileStoreScope(entries, target, dbManager, projectName, replacements));
     reconciledStores.add(store);
   }
   if (projectStore && typeof projectStore.setMutationObserver === "function") {
