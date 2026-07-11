@@ -775,4 +775,63 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(!memRaw.includes(`${TEST_MARKER} user fact`));
     });
   });
+
+  describe("external file changes", () => {
+    async function replaceOnDiskSameSize(from: string, to: string): Promise<void> {
+      assert.equal(Buffer.byteLength(from), Buffer.byteLength(to));
+      const before = await readRaw(memoryPath);
+      const after = before.replace(from, to);
+      assert.notEqual(after, before);
+      assert.equal(Buffer.byteLength(after), Buffer.byteLength(before));
+      await writeRaw(memoryPath, after);
+    }
+
+    it("add preserves a same-size external rewrite", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} stale-A`);
+      await settle();
+
+      await replaceOnDiskSameSize("stale-A", "fresh-B");
+      const result = await store.add("memory", `${TEST_MARKER} appended`);
+      await settle();
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /fresh-B/);
+      assert.match(raw, /appended/);
+      assert.doesNotMatch(raw, /stale-A/);
+    });
+
+    it("replace sees a same-size external rewrite", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} stale-A`);
+      await settle();
+
+      await replaceOnDiskSameSize("stale-A", "fresh-B");
+      const result = await store.replace("memory", `${TEST_MARKER} fresh-B`, `${TEST_MARKER} replaced`);
+      await settle();
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /replaced/);
+      assert.doesNotMatch(raw, /fresh-B|stale-A/);
+    });
+
+    it("remove sees a same-size external rewrite", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} stale-A`);
+      await settle();
+
+      await replaceOnDiskSameSize("stale-A", "fresh-B");
+      const result = await store.remove("memory", `${TEST_MARKER} fresh-B`);
+      await settle();
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.doesNotMatch(raw, /fresh-B|stale-A/);
+    });
+  });
 });

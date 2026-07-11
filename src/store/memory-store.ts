@@ -11,6 +11,7 @@
  * - Content scanning before any write
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { scanContent } from "./content-scanner.js";
@@ -31,6 +32,7 @@ export class MemoryStore {
   private memoryEntries: string[] = [];
   private userEntries: string[] = [];
   private failureEntries: string[] = [];
+  private fileFingerprints: Record<string, string> = {};
   private snapshot: MemorySnapshot = { memory: "", user: "" };
   private consolidator: ((target: "memory" | "user" | "failure", signal?: AbortSignal) => Promise<ConsolidationResult>) | null = null;
 
@@ -86,15 +88,14 @@ export class MemoryStore {
 
   async loadFromDisk(): Promise<void> {
     await fs.mkdir(this.memoryDir, { recursive: true });
-    this.memoryEntries = await this.readFile(this.pathFor("memory"));
-    this.userEntries = await this.readFile(this.pathFor("user"));
-    this.failureEntries = await this.readFile(this.pathFor("failure"));
+    for (const target of ["memory", "user", "failure"] as const) {
+      const filePath = this.pathFor(target);
+      const state = await this.readFileState(filePath);
+      this.setEntries(target, [...new Set(state.entries)]);
+      this.fileFingerprints[filePath] = state.fingerprint;
+    }
 
     // Deduplicate preserving order
-    this.memoryEntries = [...new Set(this.memoryEntries)];
-    this.userEntries = [...new Set(this.userEntries)];
-    this.failureEntries = [...new Set(this.failureEntries)];
-
     // Capture frozen snapshot for system prompt injection
     // Strip metadata comments — the LLM doesn't need to see timestamps
     const strippedMemory = this.memoryEntries.map((e) => this.stripMetadata(e));
@@ -148,6 +149,7 @@ export class MemoryStore {
     const scanError = scanContent(content);
     if (scanError) return { success: false, error: scanError };
 
+    await this.syncTargetFromDiskIfChanged(target);
     const entries = this.entriesFor(target);
     const limit = this.charLimit(target);
 
@@ -244,6 +246,7 @@ export class MemoryStore {
     const scanError = scanContent(newContent);
     if (scanError) return { success: false, error: scanError };
 
+    await this.syncTargetFromDiskIfChanged(target);
     const entries = this.entriesFor(target);
     // Match against stripped text (entries may have metadata comments)
     const matches = entries.filter((e) => this.stripMetadata(e).includes(oldText));
@@ -285,6 +288,7 @@ export class MemoryStore {
     oldText = normalizeMemoryLookupText(oldText);
     if (!oldText) return { success: false, error: "old_text cannot be empty." };
 
+    await this.syncTargetFromDiskIfChanged(target);
     const entries = this.entriesFor(target);
     const matches = entries.filter((e) => this.stripMetadata(e).includes(oldText));
 
@@ -470,14 +474,33 @@ export class MemoryStore {
     return `${header}\n${bulletList}`;
   }
 
-  private async readFile(filePath: string): Promise<string[]> {
+  private fingerprint(content: Buffer | string): string {
+    return createHash("sha256").update(content).digest("hex");
+  }
+
+  private async readFileState(filePath: string): Promise<{ entries: string[]; fingerprint: string }> {
     try {
-      const raw = await fs.readFile(filePath, "utf-8");
-      if (!raw.trim()) return [];
-      return raw.split(ENTRY_DELIMITER).map((e) => e.trim()).filter(Boolean);
-    } catch {
-      return [];
+      const raw = await fs.readFile(filePath);
+      const content = raw.toString("utf-8");
+      const entries = content.trim()
+        ? content.split(ENTRY_DELIMITER).map((entry) => entry.trim()).filter(Boolean)
+        : [];
+      return { entries, fingerprint: this.fingerprint(raw) };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return { entries: [], fingerprint: "missing" };
+      }
+      throw error;
     }
+  }
+
+  private async syncTargetFromDiskIfChanged(target: "memory" | "user" | "failure"): Promise<void> {
+    const filePath = this.pathFor(target);
+    const state = await this.readFileState(filePath);
+    if (this.fileFingerprints[filePath] === state.fingerprint) return;
+
+    this.setEntries(target, [...new Set(state.entries)]);
+    this.fileFingerprints[filePath] = state.fingerprint;
   }
 
   /**
@@ -498,6 +521,7 @@ export class MemoryStore {
     try {
       await fs.writeFile(tmpPath, content, "utf-8");
       await fs.rename(tmpPath, filePath);
+      this.fileFingerprints[filePath] = this.fingerprint(content);
     } catch (err) {
       try { await fs.unlink(tmpPath); } catch { /* ignore */ }
       throw err;
