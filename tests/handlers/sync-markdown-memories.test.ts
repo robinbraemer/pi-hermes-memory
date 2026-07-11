@@ -348,6 +348,30 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.ok(counters.warnings.some((warning) => warning.includes('linked-project')));
   });
 
+  it('preserves a rejected legacy project mirror when no new-layout scope exists', async (t) => {
+    const outsideDir = path.join(tmpDir, 'outside-legacy-project');
+    const projectName = 'legacy-linked-project';
+    const projectLink = path.join(agentRoot, projectName);
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'MEMORY.md'), 'outside legacy directory bait', 'utf-8');
+    try {
+      fs.symlinkSync(outsideDir, projectLink, 'dir');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') return t.skip('directory symlinks unavailable');
+      throw error;
+    }
+    addMemory(dbManager, 'stale legacy linked project row', 'memory', projectName);
+
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(counters.removed, 0);
+    assert.deepStrictEqual(
+      getMemories(dbManager, { project: projectName, target: 'memory' }).map((entry) => entry.content),
+      ['stale legacy linked project row'],
+    );
+    assert.ok(counters.warnings.some((warning) => warning.includes(projectName)));
+  });
+
   it('preserves a symlinked project memory file mirror without reading its target', async (t) => {
     const outsideFile = path.join(tmpDir, 'outside-memory.md');
     const projectDir = path.join(agentRoot, 'projects-memory', 'linked-file-project');

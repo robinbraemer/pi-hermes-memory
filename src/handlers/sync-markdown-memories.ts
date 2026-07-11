@@ -40,16 +40,29 @@ function readEntries(filePath: string): string[] {
   return raw.split(ENTRY_DELIMITER).map((entry) => entry.trim()).filter(Boolean);
 }
 
-function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir = "projects-memory"): Array<{ name: string; memoryFile: string }> {
+function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir = "projects-memory"): {
+  projects: Array<{ name: string; memoryFile: string }>;
+  rejected: Set<string>;
+  authoritative: Set<string>;
+} {
   const projectsRoot = path.resolve(agentRoot, projectsMemoryDir);
   const projects = new Map<string, string>();
+  const rejected = new Set<string>();
+  const authoritative = new Set<string>();
 
   if (fs.existsSync(projectsRoot)) {
     for (const name of fs.readdirSync(projectsRoot)) {
-      if (!isSafeProjectName(name, projectsRoot)) continue;
+      if (!isSafeProjectName(name, projectsRoot)) {
+        rejected.add(name);
+        continue;
+      }
       const memoryFile = resolveAuthoritativeMemoryFile(projectsRoot, name);
       if (memoryFile) {
+        authoritative.add(name);
         projects.set(name, memoryFile);
+        rejected.delete(name);
+      } else {
+        rejected.add(name);
       }
     }
   }
@@ -62,18 +75,29 @@ function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir
   if (fs.existsSync(agentRoot)) {
     for (const name of fs.readdirSync(agentRoot)) {
       if ((globalDirName && name === globalDirName) || name === projectsMemoryDir || name === 'skills' || name.startsWith('.')) continue;
-      if (projects.has(name)) continue;
-      if (!isSafeProjectName(name, resolvedAgentRoot)) continue;
+      if (authoritative.has(name)) continue;
+      if (!isSafeProjectName(name, resolvedAgentRoot)) {
+        rejected.add(name);
+        continue;
+      }
       const memoryFile = resolveAuthoritativeMemoryFile(resolvedAgentRoot, name);
       if (memoryFile) {
+        authoritative.add(name);
         projects.set(name, memoryFile);
+        rejected.delete(name);
+      } else {
+        rejected.add(name);
       }
     }
   }
 
-  return [...projects.entries()]
-    .map(([name, memoryFile]) => ({ name, memoryFile }))
-    .filter(({ memoryFile }) => fs.existsSync(memoryFile));
+  return {
+    projects: [...projects.entries()]
+      .map(([name, memoryFile]) => ({ name, memoryFile }))
+      .filter(({ memoryFile }) => fs.existsSync(memoryFile)),
+    rejected,
+    authoritative,
+  };
 }
 
 function realpathIfPresent(filePath: string): string {
@@ -181,7 +205,8 @@ export async function syncMarkdownMemoriesToSqlite(
   await reconcileFile(globalUserFile, 'user');
   await reconcileFile(globalFailureFile, 'failure');
 
-  const projects = scanProjectDirs(agentRoot, globalDir, projectsMemoryDir);
+  const scan = scanProjectDirs(agentRoot, globalDir, projectsMemoryDir);
+  const projects = scan.projects;
   const projectFiles = new Map(projects.map((project) => [project.name, project.memoryFile]));
   const mirroredProjects = dbManager.getDb().prepare(`
     SELECT DISTINCT project
@@ -194,6 +219,10 @@ export async function syncMarkdownMemoriesToSqlite(
   ]);
   const projectsRoot = path.resolve(agentRoot, projectsMemoryDir ?? 'projects-memory');
   for (const projectName of projectNames) {
+    if (!projectFiles.has(projectName) && scan.rejected.has(projectName) && !scan.authoritative.has(projectName)) {
+      counters.warnings.push(`${projectName}/memory: authoritative project path was rejected as unsafe; SQLite rows were preserved`);
+      continue;
+    }
     const memoryFile = projectFiles.get(projectName)
       ?? resolveAuthoritativeMemoryFile(projectsRoot, projectName);
     if (!memoryFile) {

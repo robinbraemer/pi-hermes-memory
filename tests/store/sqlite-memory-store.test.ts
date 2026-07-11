@@ -128,6 +128,18 @@ describe('sqlite-memory-store', () => {
       assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 1);
     });
 
+    it('preserves legacy project scope only when the existing mirror identity matches', () => {
+      const content = '[correction] use pnpm — Project: project-a';
+      addMemory(dbManager, content, 'failure', 'project-a', 'correction');
+      const raw = `${content} <!-- created=2026-05-08, last=2026-05-09 -->`;
+
+      const result = reconcileMarkdownFailureScopes(dbManager, [raw]);
+
+      assert.strictEqual(result.removed, 0);
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: 'project-a' }).length, 1);
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
+    });
+
     it('round-trips project correction scope through authoritative Markdown metadata', async () => {
       const store = new MemoryStore({
         memoryDir: tmpDir,

@@ -485,12 +485,39 @@ export function reconcileMarkdownFailureScopes(
   dbManager: DatabaseManager,
   rawEntries: string[],
 ): MarkdownMemoryReconcileResult {
+  const scopedRows = dbManager.getDb().prepare(`
+    SELECT project, category, content
+    FROM memories
+    WHERE target = 'failure' AND project IS NOT NULL
+  `).all() as Array<{ project: string; category: MemoryCategory | null; content: string }>;
+  const mirroredProjectsByIdentity = new Map<string, Set<string>>();
+  for (const row of scopedRows) {
+    const identity = JSON.stringify([normalizeCategory(row.category), row.content.trim()]);
+    const projects = mirroredProjectsByIdentity.get(identity) ?? new Set<string>();
+    projects.add(row.project);
+    mirroredProjectsByIdentity.set(identity, projects);
+  }
+
   const entriesByProject = new Map<string | null, string[]>();
   for (const rawEntry of rawEntries) {
     const project = failureProject(rawEntry);
-    const entries = entriesByProject.get(project) ?? [];
-    entries.push(rawEntry);
-    entriesByProject.set(project, entries);
+    const parsed = project === null ? parseMarkdownMemoryEntry(rawEntry, 'failure') : null;
+    const inferredProjects = parsed
+      ? mirroredProjectsByIdentity.get(JSON.stringify([
+        normalizeCategory(parsed.category),
+        parsed.content.trim(),
+      ]))
+      : null;
+    const projects = project !== null
+      ? [project]
+      : inferredProjects && inferredProjects.size > 0
+        ? [...inferredProjects]
+        : [null];
+    for (const entryProject of projects) {
+      const entries = entriesByProject.get(entryProject) ?? [];
+      entries.push(rawEntry);
+      entriesByProject.set(entryProject, entries);
+    }
   }
 
   const mirroredProjects = dbManager.getDb().prepare(`

@@ -749,12 +749,19 @@ export class MemoryStore {
       if (currentState.fingerprint !== expectedFingerprint) {
         throw new ExternalMemoryWriteConflict();
       }
+      const publishedIdentity = await this.fileIdentity(tmpPath);
 
       if (expectedFingerprint === "missing") {
+        let published = false;
         try {
           await this.requireStoragePath(target, filePath);
           await fs.link(tmpPath, filePath);
+          published = true;
+          await this.requireStoragePath(target, filePath);
         } catch (error) {
+          if (published) {
+            await this.unlinkOwnedPublishedFile(filePath, publishedIdentity, this.fingerprint(content));
+          }
           if ((error as NodeJS.ErrnoException).code === "EEXIST") {
             throw new ExternalMemoryWriteConflict();
           }
@@ -763,7 +770,6 @@ export class MemoryStore {
       } else {
         const recoveryPath = this.recoveryPathFor(filePath);
         const pendingPath = publicationPendingPath(filePath);
-        const publishedIdentity = await this.fileIdentity(tmpPath);
         await writePublicationMarker(tmpDir, pendingPath, recoveryPath);
         try {
           await this.requireStoragePath(target, filePath);
@@ -789,6 +795,7 @@ export class MemoryStore {
           if (verifiedDisplacedState.fingerprint !== expectedFingerprint) {
             throw new ExternalMemoryWriteConflict();
           }
+          await this.requireStoragePath(target, filePath);
         } catch (error) {
           let rollbackError: unknown;
           if (published) {
@@ -840,6 +847,22 @@ export class MemoryStore {
   private async fileIdentity(filePath: string): Promise<{ dev: number; ino: number }> {
     const state = await fs.lstat(filePath);
     return { dev: state.dev, ino: state.ino };
+  }
+
+  private async unlinkOwnedPublishedFile(
+    filePath: string,
+    publishedIdentity: { dev: number; ino: number },
+    publishedFingerprint: string,
+  ): Promise<void> {
+    try {
+      const currentIdentity = await this.fileIdentity(filePath);
+      if (!this.sameFileIdentity(currentIdentity, publishedIdentity)) return;
+      const currentState = await this.readFileState(filePath);
+      if (currentState.fingerprint !== publishedFingerprint) return;
+      await fs.unlink(filePath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
 
   private sameFileIdentity(

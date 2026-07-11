@@ -30,6 +30,7 @@ interface PublishingDatabaseMigrationMarker {
   retiredNames: DatabaseFileName[];
   publication: "snapshot" | "raw";
   targets: Record<string, ExpectedDatabaseEntry>;
+  reservation?: { dev: number; ino: number };
 }
 
 export interface ExtensionRootMigrationResult {
@@ -150,6 +151,7 @@ async function publishingMarker(
   retiredNames: string[],
   publication: "snapshot" | "raw",
   sources: Record<string, string>,
+  reservation: FileIdentity,
 ): Promise<PublishingDatabaseMigrationMarker> {
   const targets: Record<string, ExpectedDatabaseEntry> = {};
   for (const [name, source] of Object.entries(sources)) {
@@ -163,6 +165,7 @@ async function publishingMarker(
     retiredNames: retiredNames as DatabaseFileName[],
     publication,
     targets,
+    reservation,
   };
 }
 
@@ -203,7 +206,29 @@ function parsePublishingMarker(content: string): PublishingDatabaseMigrationMark
       return null;
     }
   }
+  if (marker.reservation !== undefined
+    && (!Number.isSafeInteger(marker.reservation.dev) || !Number.isSafeInteger(marker.reservation.ino))) return null;
   return marker as PublishingDatabaseMigrationMarker;
+}
+
+function parsePreparingMarker(content: string): PreparingDatabaseMigrationMarker | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const marker = value as Partial<PreparingDatabaseMigrationMarker>;
+  if (marker.version !== 1 || marker.state !== "preparing") return null;
+  if (typeof marker.retirementDirectory !== "string"
+    || path.basename(marker.retirementDirectory) !== marker.retirementDirectory
+    || !marker.retirementDirectory.startsWith(".sessions-db-retirement-")) return null;
+  if (marker.stagingDirectory !== undefined
+    && (typeof marker.stagingDirectory !== "string"
+      || path.basename(marker.stagingDirectory) !== marker.stagingDirectory
+      || !marker.stagingDirectory.startsWith(".sessions-db-migration-"))) return null;
+  return marker as PreparingDatabaseMigrationMarker;
 }
 
 async function matchesExpectedDatabaseEntry(filePath: string, expected: ExpectedDatabaseEntry): Promise<boolean> {
@@ -237,6 +262,35 @@ async function directoryContainsOnly(directory: string, allowedNames: readonly s
   } catch {
     return false;
   }
+}
+
+async function recoverOwnedPreparingMigration(
+  legacyRoot: string,
+  targetRoot: string,
+  pendingMarker: string,
+  retirementArtifacts: string[],
+  stagingArtifacts: string[],
+): Promise<boolean> {
+  let marker: PreparingDatabaseMigrationMarker | null;
+  try {
+    marker = parsePreparingMarker(await fs.readFile(pendingMarker, "utf-8"));
+  } catch {
+    return false;
+  }
+  if (!marker || retirementArtifacts.length > 0 || stagingArtifacts.length > 1) return false;
+  if (await pathEntryExists(path.join(legacyRoot, marker.retirementDirectory))) return false;
+  if (marker.stagingDirectory) {
+    const stagingDir = path.join(targetRoot, marker.stagingDirectory);
+    if (stagingArtifacts.length === 1 && path.resolve(stagingArtifacts[0]) !== path.resolve(stagingDir)) return false;
+    if (await pathEntryExists(stagingDir)) {
+      if (!await directoryContainsOnly(stagingDir, [])) return false;
+      if (await removeAndConfirm(stagingDir)) return false;
+    }
+  } else if (stagingArtifacts.length > 0) {
+    return false;
+  }
+  await fs.unlink(pendingMarker);
+  return true;
 }
 
 async function verifiedCompletedMigrationMarker(
@@ -436,6 +490,31 @@ async function unlinkIfOwned(filePath: string, identity: FileIdentity): Promise<
   }
 }
 
+async function ownedEmptyDirectory(filePath: string, identity: FileIdentity): Promise<boolean> {
+  try {
+    const state = await fs.lstat(filePath);
+    if (!state.isDirectory() || state.dev !== identity.dev || state.ino !== identity.ino) return false;
+    return (await fs.readdir(filePath)).length === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function removeOwnedReservation(filePath: string, identity: FileIdentity): Promise<void> {
+  if (!await ownedEmptyDirectory(filePath, identity)) {
+    throw new Error(`${filePath} is no longer the owned migration reservation`);
+  }
+  await fs.rmdir(filePath);
+}
+
+async function databaseSuccessorsAt(root: string, reservation: FileIdentity | null): Promise<string[]> {
+  const names = await databaseFilesAt(root);
+  if (!reservation || !names.includes("sessions.db")) return names;
+  return await ownedEmptyDirectory(path.join(root, "sessions.db"), reservation)
+    ? names.filter((name) => name !== "sessions.db")
+    : names;
+}
+
 async function stageDatabaseSymlink(source: string, staged: string): Promise<void> {
   const before = await fs.readlink(source);
   await fs.symlink(path.resolve(path.dirname(source), before), staged);
@@ -527,15 +606,38 @@ async function migrateDatabaseGeneration(
 
   try {
   const pendingMarker = path.join(targetRoot, DATABASE_MIGRATION_PENDING_FILE);
-  const hadPendingMarker = await pathEntryExists(pendingMarker);
-  const sourceNames = await databaseFilesAt(legacyRoot);
+  let hadPendingMarker = await pathEntryExists(pendingMarker);
+  let sourceNames = await databaseFilesAt(legacyRoot);
   const targetNames = await databaseFilesAt(targetRoot);
-  const retirementArtifacts = hadPendingMarker
+  let retirementArtifacts = hadPendingMarker
     ? await databaseRetirementArtifacts(legacyRoot)
     : [];
-  const stagingArtifacts = hadPendingMarker
+  let stagingArtifacts = hadPendingMarker
     ? await databaseStagingArtifacts(targetRoot)
     : [];
+  if (hadPendingMarker && targetNames.length === 0 && await recoverOwnedPreparingMigration(
+    legacyRoot,
+    targetRoot,
+    pendingMarker,
+    retirementArtifacts,
+    stagingArtifacts,
+  )) {
+    hadPendingMarker = false;
+    retirementArtifacts = [];
+    stagingArtifacts = [];
+  }
+  let resumedReservation: FileIdentity | null = null;
+  if (hadPendingMarker && sourceNames.includes("sessions.db")) {
+    try {
+      const marker = parsePublishingMarker(await fs.readFile(pendingMarker, "utf-8"));
+      if (marker?.reservation
+        && await ownedEmptyDirectory(path.join(legacyRoot, "sessions.db"), marker.reservation)) {
+        resumedReservation = marker.reservation;
+        sourceNames = sourceNames.filter((name) => name !== "sessions.db");
+      }
+    } catch {
+    }
+  }
   const completedMarker = sourceNames.length === 0
     && hadPendingMarker
     && targetNames.includes("sessions.db")
@@ -582,6 +684,20 @@ async function migrateDatabaseGeneration(
         target: path.join(targetRoot, "sessions.db"),
         message,
       });
+    }
+    if (resumedReservation) {
+      try {
+        await removeOwnedReservation(path.join(legacyRoot, "sessions.db"), resumedReservation);
+      } catch (error) {
+        const message = `completed SQLite migration reservation cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+        result.warnings.push(`${path.join(legacyRoot, "sessions.db")}: ${message}`);
+        result.criticalFailures.push({
+          name: "sessions.db",
+          source: path.join(legacyRoot, "sessions.db"),
+          target: path.join(targetRoot, "sessions.db"),
+          message,
+        });
+      }
     }
     return;
   }
@@ -643,6 +759,7 @@ async function migrateDatabaseGeneration(
   await fs.mkdir(targetRoot, { recursive: true });
   const stagingDir = path.join(targetRoot, `.sessions-db-migration-${randomUUID()}`);
   const retirementDir = path.join(legacyRoot, `.sessions-db-retirement-${randomUUID()}`);
+  const source = path.join(legacyRoot, "sessions.db");
   const published = new Map<string, FileIdentity>();
   let retired: string[] = [];
   let preserveRetirement = false;
@@ -654,6 +771,7 @@ async function migrateDatabaseGeneration(
   } | null = null;
   let corruptGeneration = false;
   let generationNames = sourceNames;
+  let sourceReservation: FileIdentity | null = null;
   try {
     await writeMigrationMarker(pendingMarker, {
       version: 1,
@@ -662,7 +780,6 @@ async function migrateDatabaseGeneration(
       stagingDirectory: path.basename(stagingDir),
     }, true);
     await fs.mkdir(stagingDir, { mode: 0o700 });
-    const source = path.join(legacyRoot, "sessions.db");
     const staged = path.join(stagingDir, "sessions.db");
     const sourceState = await fs.lstat(source);
     try {
@@ -711,7 +828,9 @@ async function migrateDatabaseGeneration(
       if (error instanceof DatabaseGenerationMoveError) retired = error.moved;
       throw error;
     }
-    const successorNames = await databaseFilesAt(legacyRoot);
+    await fs.mkdir(source, { mode: 0o700 });
+    sourceReservation = await fileIdentity(source);
+    const successorNames = await databaseSuccessorsAt(legacyRoot, sourceReservation);
     if (successorNames.length > 0) {
       throw new Error(`legacy SQLite generation changed during retirement: ${successorNames.join(", ")}`);
     }
@@ -741,7 +860,7 @@ async function migrateDatabaseGeneration(
       );
       await writeMigrationMarker(
         pendingMarker,
-        await publishingMarker(retirementDir, stagingDir, retired, "raw", rawSources),
+        await publishingMarker(retirementDir, stagingDir, retired, "raw", rawSources, sourceReservation),
       );
       for (const name of retired) {
         const target = path.join(targetRoot, name);
@@ -752,13 +871,20 @@ async function migrateDatabaseGeneration(
       const target = path.join(targetRoot, "sessions.db");
       await writeMigrationMarker(
         pendingMarker,
-        await publishingMarker(retirementDir, stagingDir, retired, "snapshot", { "sessions.db": staged }),
+        await publishingMarker(
+          retirementDir,
+          stagingDir,
+          retired,
+          "snapshot",
+          { "sessions.db": staged },
+          sourceReservation,
+        ),
       );
       await publish(staged, target);
       published.set(target, await fileIdentity(target));
     }
 
-    const publicationSuccessors = await databaseFilesAt(legacyRoot);
+    const publicationSuccessors = await databaseSuccessorsAt(legacyRoot, sourceReservation);
     if (publicationSuccessors.length > 0) {
       throw new Error(`legacy SQLite generation changed during publication: ${publicationSuccessors.join(", ")}`);
     }
@@ -775,8 +901,16 @@ async function migrateDatabaseGeneration(
       writeLock = null;
     }
     let restoreFailures: string[] = [];
+    if (sourceReservation) {
+      try {
+        await removeOwnedReservation(source, sourceReservation);
+        sourceReservation = null;
+      } catch (reservationError) {
+        restoreFailures.push(`sessions.db reservation: ${reservationError instanceof Error ? reservationError.message : String(reservationError)}`);
+      }
+    }
     if (retired.length > 0) {
-      restoreFailures = await restoreDatabaseGeneration(retired, retirementDir, legacyRoot);
+      restoreFailures.push(...await restoreDatabaseGeneration(retired, retirementDir, legacyRoot));
       preserveRetirement = restoreFailures.length > 0;
       keepPendingMarker = preserveRetirement;
     }
@@ -813,6 +947,14 @@ async function migrateDatabaseGeneration(
         await fs.unlink(pendingMarker);
       } catch (error) {
         cleanupFailures.push(`${pendingMarker}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (sourceReservation) {
+      try {
+        await removeOwnedReservation(source, sourceReservation);
+        sourceReservation = null;
+      } catch (error) {
+        cleanupFailures.push(`${source}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     if (cleanupFailures.length > 0) {
