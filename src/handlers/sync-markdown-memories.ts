@@ -336,6 +336,16 @@ export async function migrateThenSyncMarkdownMemories(
     if (sessionsFailure) {
       throw new Error(`sessions.db migration failed: ${sessionsFailure.message}`);
     }
+    const authoritativeNames = new Set([MEMORY_FILE, USER_FILE, 'failures.md']);
+    const authoritativeFailure = migration.assetFailures.find((failure) =>
+      path.resolve(path.dirname(failure.source)) === path.resolve(legacyGlobalDir)
+      && authoritativeNames.has(path.basename(failure.source))
+    );
+    if (authoritativeFailure) {
+      throw new Error(
+        `${path.basename(authoritativeFailure.source)} migration failed: ${authoritativeFailure.message}`,
+      );
+    }
     migrationOptions.onMigrationSucceeded?.();
   }
   return await syncMarkdownMemoriesToSqlite(dbManager, globalDir, projectsMemoryDir, agentRoot);

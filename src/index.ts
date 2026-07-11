@@ -194,8 +194,6 @@ export default function (pi: ExtensionAPI) {
     await skillStore.ensureDiscoveredRoots();
     await store.loadFromDisk();
     if (projectStore) await projectStore.loadFromDisk();
-
-    if (persistenceInitialized) scheduleBackfillAfterInitialization();
   });
 
   registerProjectSkillDiscoveryHandler(pi, skillStore, config.projectsMemoryDir);

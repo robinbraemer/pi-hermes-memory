@@ -38,6 +38,11 @@ export interface ExtensionRootMigrationResult {
   merged: number;
   skipped: number;
   warnings: string[];
+  assetFailures: Array<{
+    source: string;
+    target: string;
+    message: string;
+  }>;
   criticalFailures: Array<{
     name: string;
     source: string;
@@ -552,6 +557,7 @@ async function moveDirContents(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         result.warnings.push(`${sourcePath}: ${message}`);
+        result.assetFailures.push({ source: sourcePath, target: targetPath, message });
       }
       continue;
     }
@@ -1001,6 +1007,7 @@ export async function migrateExtensionRoot(
     merged: 0,
     skipped: 0,
     warnings: [],
+    assetFailures: [],
     criticalFailures: [],
   };
 

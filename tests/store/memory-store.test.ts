@@ -150,6 +150,28 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(raw.includes(`${TEST_MARKER} project uses pnpm`));
     });
 
+    it("recovers an interrupted publication before mutating the missing target", async () => {
+      const pathStore = new MemoryStore(makeConfig());
+      const recoveryPath = (pathStore as any).recoveryPathFor(memoryPath) as string;
+      const pendingPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.publication-pending`);
+      await writeRaw(recoveryPath, `${TEST_MARKER} displaced before mutation`);
+      await writeRaw(pendingPath, path.basename(recoveryPath));
+
+      try {
+        const store = new MemoryStore(makeConfig());
+        const result = await store.add("memory", `${TEST_MARKER} added after interruption`);
+
+        assert.equal(result.success, true);
+        const raw = await readRaw(memoryPath);
+        assert.match(raw, /displaced before mutation/);
+        assert.match(raw, /added after interruption/);
+        await assert.rejects(fs.access(pendingPath), { code: "ENOENT" });
+      } finally {
+        await removeFile(recoveryPath);
+        await removeFile(pendingPath);
+      }
+    });
+
     it("no-ops on duplicate entry and returns message", async () => {
       const store = new MemoryStore(makeConfig());
       await store.loadFromDisk();
@@ -1626,6 +1648,76 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(!retiredFiles.includes(path.basename(staleRetiredPath)));
       assert.ok(retiredFiles.length <= 32);
       assert.ok(retiredStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
+    });
+
+    it("prunes generated retired temp snapshots during startup load", async () => {
+      const pathStore = new MemoryStore(makeConfig());
+      const stalePath = `${(pathStore as any).retiredRecoveryPathFor(memoryPath) as string}.tmp`;
+      await writeRaw(stalePath, `${TEST_MARKER} stale partial snapshot`);
+      const stale = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+      await fs.utimes(stalePath, stale, stale);
+
+      for (let index = 0; index < 40; index++) {
+        const tempPath = `${(pathStore as any).retiredRecoveryPathFor(memoryPath) as string}.tmp`;
+        await writeRaw(tempPath, `${TEST_MARKER} partial snapshot ${index}`);
+        await fs.truncate(tempPath, 2 * 1024 * 1024);
+      }
+
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+
+      const names = await fs.readdir(MEMORY_DIR);
+      const retiredArtifacts = names.filter((name) =>
+        new RegExp(`^\\.${MEMORY_FILE.replaceAll(".", "\\.")}\\.retired-\\d+-[0-9a-f-]{36}(?:\\.tmp)?$`, "i").test(name)
+      );
+      const regularArtifacts: string[] = [];
+      for (const name of retiredArtifacts) {
+        const artifactPath = path.join(MEMORY_DIR, name);
+        if ((await fs.lstat(artifactPath)).isFile()) regularArtifacts.push(artifactPath);
+      }
+      const stats = await Promise.all(regularArtifacts.map((artifactPath) => fs.stat(artifactPath)));
+      assert.equal(names.includes(path.basename(stalePath)), false);
+      assert.ok(regularArtifacts.length <= 32);
+      assert.ok(stats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
+    });
+
+    it("removes its partial retired snapshot when retirement fails", async () => {
+      const store = new MemoryStore(makeConfig());
+      const recoveryPath = (store as any).recoveryPathFor(memoryPath) as string;
+      const occupiedRetiredPath = path.join(MEMORY_DIR, `occupied-retired-${randomUUID()}`);
+      const snapshotPath = `${occupiedRetiredPath}.tmp`;
+      await writeRaw(recoveryPath, `${TEST_MARKER} recovery retained after failed retirement`);
+      await fs.mkdir(occupiedRetiredPath);
+      (store as any).retiredRecoveryPathFor = () => occupiedRetiredPath;
+
+      try {
+        await assert.rejects((store as any).retireRecoveryFile(recoveryPath, memoryPath));
+        await assert.rejects(fs.access(snapshotPath), { code: "ENOENT" });
+        assert.equal(await readRaw(recoveryPath), `${TEST_MARKER} recovery retained after failed retirement`);
+      } finally {
+        await fs.rm(occupiedRetiredPath, { recursive: true, force: true });
+        await removeFile(snapshotPath);
+        await removeFile(recoveryPath);
+      }
+    });
+
+    it("preserves an unowned retired temp snapshot on name collision", async () => {
+      const store = new MemoryStore(makeConfig());
+      const recoveryPath = (store as any).recoveryPathFor(memoryPath) as string;
+      const retiredPath = (store as any).retiredRecoveryPathFor(memoryPath) as string;
+      const snapshotPath = `${retiredPath}.tmp`;
+      await writeRaw(recoveryPath, `${TEST_MARKER} recovery awaiting retirement`);
+      await writeRaw(snapshotPath, `${TEST_MARKER} unowned colliding snapshot`);
+      (store as any).retiredRecoveryPathFor = () => retiredPath;
+
+      try {
+        await assert.rejects((store as any).retireRecoveryFile(recoveryPath, memoryPath), { code: "EEXIST" });
+        assert.equal(await readRaw(snapshotPath), `${TEST_MARKER} unowned colliding snapshot`);
+        assert.equal(await readRaw(recoveryPath), `${TEST_MARKER} recovery awaiting retirement`);
+      } finally {
+        await removeFile(snapshotPath);
+        await removeFile(recoveryPath);
+      }
     });
 
     it("bounds generated conflict artifacts without following lookalike symlinks", async () => {

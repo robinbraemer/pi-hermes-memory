@@ -684,6 +684,7 @@ export class MemoryStore {
       const storagePath = await this.refreshStoragePath(target);
       const outcome = await withMarkdownMutationLock(storagePath, async (): Promise<MemoryResult | null> => {
         if (await this.refreshStoragePath(target) !== storagePath) return null;
+        await recoverInterruptedMarkdownPublication(storagePath);
         for (let attempt = 0; ; attempt++) {
           try {
             const result = await mutation();
@@ -928,6 +929,7 @@ export class MemoryStore {
     const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const recoveryPattern = recoveryFilePattern(filePath);
     const retiredPattern = new RegExp(`^\\.${escapedName}\\.retired-\\d+-${UUID_PATTERN}$`, "i");
+    const retiredTempPattern = new RegExp(`^\\.${escapedName}\\.retired-\\d+-${UUID_PATTERN}\\.tmp$`, "i");
     const conflictPattern = new RegExp(
       `^\\.${escapedName}\\.conflict-local-\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
       "i",
@@ -971,7 +973,9 @@ export class MemoryStore {
         try { await this.retireRecoveryFile(item.path, filePath); } catch {}
       }
 
-      const retiredNames = (await fs.readdir(directory)).filter((name) => retiredPattern.test(name));
+      const retiredNames = (await fs.readdir(directory)).filter(
+        (name) => retiredPattern.test(name) || retiredTempPattern.test(name),
+      );
       const retired = await Promise.all(retiredNames.map(async (name) => {
         const retiredPath = path.join(directory, name);
         try {
@@ -1036,15 +1040,28 @@ export class MemoryStore {
     const retiredPath = this.retiredRecoveryPathFor(filePath);
     const snapshotPath = `${retiredPath}.tmp`;
     const snapshot = await fs.readFile(recoveryPath);
-    const handle = await fs.open(snapshotPath, "wx", 0o600);
+    let snapshotIdentity: { dev: number; ino: number } | null = null;
     try {
-      await handle.writeFile(snapshot);
-      await handle.sync();
-    } finally {
-      await handle.close();
+      const handle = await fs.open(snapshotPath, "wx", 0o600);
+      try {
+        const state = await handle.stat();
+        snapshotIdentity = { dev: state.dev, ino: state.ino };
+        await handle.writeFile(snapshot);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await fs.rename(snapshotPath, retiredPath);
+      await fs.unlink(recoveryPath);
+    } catch (error) {
+      if (snapshotIdentity) {
+        try {
+          const currentIdentity = await this.fileIdentity(snapshotPath);
+          if (this.sameFileIdentity(currentIdentity, snapshotIdentity)) await fs.unlink(snapshotPath);
+        } catch {}
+      }
+      throw error;
     }
-    await fs.rename(snapshotPath, retiredPath);
-    await fs.unlink(recoveryPath);
   }
 
   private async preserveConflictFile(sourcePath: string, filePath: string, kind: string): Promise<string> {

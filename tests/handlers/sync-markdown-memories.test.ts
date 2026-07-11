@@ -61,6 +61,25 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.equal(attempts, 2);
   });
 
+  it('signals immediate startup initialization exactly once', async () => {
+    let attempts = 0;
+    let initialized = 0;
+    const retrier = new PersistenceReconciliationRetrier(
+      async () => {
+        attempts++;
+        return { failedScopes: [] };
+      },
+      () => { initialized++; },
+      () => assert.fail('successful reconciliation must not report a failure'),
+    );
+
+    await retrier.start();
+    await retrier.start();
+
+    assert.equal(attempts, 1);
+    assert.equal(initialized, 1);
+  });
+
   it('bounds failed startup reconciliation retries', async () => {
     const scheduled: Array<() => void> = [];
     const failures: string[] = [];
@@ -568,6 +587,49 @@ describe('memory sqlite sync + markdown backfill', () => {
       assert.equal(fs.existsSync(path.join(targetDir, 'sessions.db')), false);
       assert.equal(fs.existsSync(path.join(legacyDir, 'sessions.db')), true);
       assert.equal(migrationSucceeded, false);
+    } finally {
+      targetManager.close();
+    }
+  });
+
+  it('retries an authoritative Markdown migration failure before reconciliation', async () => {
+    dbManager.close();
+    const legacyDir = path.join(agentRoot, 'memory');
+    const targetDir = path.join(agentRoot, 'pi-hermes-memory');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.writeFileSync(path.join(legacyDir, 'MEMORY.md'), 'legacy authoritative memory', 'utf-8');
+    const targetManager = new DatabaseManager(targetDir);
+    addMemory(targetManager, 'mirrored row retained while migration is pending');
+    let migrationSucceeded = false;
+
+    try {
+      await assert.rejects(
+        migrateThenSyncMarkdownMemories(
+          targetManager,
+          legacyDir,
+          targetDir,
+          undefined,
+          agentRoot,
+          {
+            moveFile: async (source, target) => {
+              if (path.basename(source) === 'MEMORY.md') {
+                throw new Error('injected MEMORY.md move failure');
+              }
+              fs.renameSync(source, target);
+            },
+            onMigrationSucceeded: () => { migrationSucceeded = true; },
+          },
+        ),
+        /MEMORY\.md migration failed/,
+      );
+
+      assert.equal(migrationSucceeded, false);
+      assert.equal(fs.existsSync(path.join(legacyDir, 'MEMORY.md')), true);
+      assert.equal(fs.existsSync(path.join(targetDir, 'MEMORY.md')), false);
+      assert.deepStrictEqual(
+        getMemories(targetManager, { target: 'memory' }).map((entry) => entry.content),
+        ['mirrored row retained while migration is pending'],
+      );
     } finally {
       targetManager.close();
     }
