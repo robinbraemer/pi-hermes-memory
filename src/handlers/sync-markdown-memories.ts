@@ -33,14 +33,15 @@ function readEntries(filePath: string): string[] {
 }
 
 function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir = "projects-memory"): Array<{ name: string; memoryFile: string }> {
-  const projectsRoot = path.join(agentRoot, projectsMemoryDir);
+  const projectsRoot = path.resolve(agentRoot, projectsMemoryDir);
   const projects = new Map<string, string>();
 
   if (fs.existsSync(projectsRoot)) {
     for (const name of fs.readdirSync(projectsRoot)) {
+      if (!isSafeProjectName(name, projectsRoot)) continue;
       const dir = path.join(projectsRoot, name);
       const memoryFile = path.join(dir, MEMORY_FILE);
-      if (fs.existsSync(dir) && fs.statSync(dir).isDirectory() && fs.existsSync(memoryFile)) {
+      if (fs.existsSync(dir) && fs.lstatSync(dir).isDirectory() && fs.existsSync(memoryFile)) {
         projects.set(name, memoryFile);
       }
     }
@@ -55,9 +56,10 @@ function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir
     for (const name of fs.readdirSync(agentRoot)) {
       if ((globalDirName && name === globalDirName) || name === projectsMemoryDir || name === 'skills' || name.startsWith('.')) continue;
       if (projects.has(name)) continue;
+      if (!isSafeProjectName(name, resolvedAgentRoot)) continue;
       const dir = path.join(agentRoot, name);
       const memoryFile = path.join(dir, MEMORY_FILE);
-      if (fs.existsSync(dir) && fs.statSync(dir).isDirectory() && fs.existsSync(memoryFile)) {
+      if (fs.existsSync(dir) && fs.lstatSync(dir).isDirectory() && fs.existsSync(memoryFile)) {
         projects.set(name, memoryFile);
       }
     }
@@ -66,6 +68,14 @@ function scanProjectDirs(agentRoot: string, globalDir: string, projectsMemoryDir
   return [...projects.entries()]
     .map(([name, memoryFile]) => ({ name, memoryFile }))
     .filter(({ memoryFile }) => fs.existsSync(memoryFile));
+}
+
+function isSafeProjectName(name: string, projectsRoot: string): boolean {
+  if (!name || name === '.' || name === '..' || name.includes('/') || name.includes('\\') || path.isAbsolute(name)) {
+    return false;
+  }
+  const projectDir = path.resolve(projectsRoot, name);
+  return path.dirname(projectDir) === projectsRoot && path.basename(projectDir) === name;
 }
 
 export async function syncMarkdownMemoriesToSqlite(
@@ -88,13 +98,13 @@ export async function syncMarkdownMemoriesToSqlite(
   const globalFailureFile = path.join(globalDir, 'failures.md');
 
   const reconcileFile = async (
-    filePath: string,
+    filePath: string | null,
     target: 'memory' | 'user' | 'failure',
     project: string | null = null,
   ) => {
-    await withMarkdownMutationLock(filePath, () => {
-      if (fs.existsSync(filePath)) counters.filesScanned++;
-      const entries = readEntries(filePath);
+    const reconcile = () => {
+      if (filePath && fs.existsSync(filePath)) counters.filesScanned++;
+      const entries = filePath ? readEntries(filePath) : [];
       counters.entriesScanned += entries.length;
       try {
         const result = target === 'failure'
@@ -108,7 +118,9 @@ export async function syncMarkdownMemoriesToSqlite(
           `${path.basename(project ?? 'global')}/${target}: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
-    });
+    };
+    if (filePath) await withMarkdownMutationLock(filePath, reconcile);
+    else reconcile();
   };
 
   await reconcileFile(globalMemoryFile, 'memory');
@@ -126,9 +138,10 @@ export async function syncMarkdownMemoriesToSqlite(
     ...projectFiles.keys(),
     ...mirroredProjects.map(({ project }) => project),
   ]);
+  const projectsRoot = path.resolve(agentRoot, projectsMemoryDir ?? 'projects-memory');
   for (const projectName of projectNames) {
     const memoryFile = projectFiles.get(projectName)
-      ?? path.join(agentRoot, projectsMemoryDir ?? 'projects-memory', projectName, MEMORY_FILE);
+      ?? (isSafeProjectName(projectName, projectsRoot) ? path.join(projectsRoot, projectName, MEMORY_FILE) : null);
     await reconcileFile(memoryFile, 'memory', projectName);
   }
 

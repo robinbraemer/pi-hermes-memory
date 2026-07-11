@@ -864,6 +864,32 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.doesNotMatch(raw, /fresh-B|stale-A/);
     });
 
+    it("reapplies an add when an external write lands immediately before rename", async () => {
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} existing`);
+
+      const originalSave = (store as any).saveToDisk.bind(store);
+      let injected = false;
+      (store as any).saveToDisk = async (target: "memory") => {
+        if (!injected) {
+          injected = true;
+          const current = await readRaw(memoryPath);
+          await writeRaw(memoryPath, `${current}${ENTRY_DELIMITER}${TEST_MARKER} external editor`);
+        }
+        return originalSave(target);
+      };
+
+      const result = await store.add("memory", `${TEST_MARKER} local add`);
+
+      assert.equal(result.success, true);
+      const raw = await readRaw(memoryPath);
+      assert.match(raw, /external editor/);
+      assert.match(raw, /local add/);
+      assert.equal(raw.match(/external editor/g)?.length, 1);
+      assert.equal(raw.match(/local add/g)?.length, 1);
+    });
+
     it("serializes concurrent mutations of the same canonical target", async () => {
       const firstStore = new MemoryStore(makeConfig());
       const secondStore = new MemoryStore(makeConfig());

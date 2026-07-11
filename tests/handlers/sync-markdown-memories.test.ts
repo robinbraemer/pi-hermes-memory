@@ -271,6 +271,19 @@ describe('memory sqlite sync + markdown backfill', () => {
     );
   });
 
+  it('reconciles unsafe SQLite project scopes empty without reading outside projects-memory', async () => {
+    const outsideDir = path.join(agentRoot, 'outside');
+    fs.mkdirSync(outsideDir, { recursive: true });
+    fs.writeFileSync(path.join(outsideDir, 'MEMORY.md'), 'outside traversal bait', 'utf-8');
+    addMemory(dbManager, 'outside traversal bait', 'memory', '../outside');
+
+    const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(counters.removed, 1);
+    assert.deepStrictEqual(getMemories(dbManager, { project: '../outside', target: 'memory' }), []);
+    assert.strictEqual(fs.readFileSync(path.join(outsideDir, 'MEMORY.md'), 'utf-8'), 'outside traversal bait');
+  });
+
   it('still scans project markdown under ~/.pi/agent when memoryDir is customized elsewhere', async () => {
     const customGlobalDir = path.join(tmpDir, 'external-memory-root');
     fs.mkdirSync(customGlobalDir, { recursive: true });

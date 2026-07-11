@@ -29,6 +29,10 @@ import type { MemoryConfig, MemoryResult, MemorySnapshot, ConsolidationResult, M
 import { AGENT_ROOT } from "../paths.js";
 import { canonicalMarkdownIdentity, withMarkdownMutationLock } from "./markdown-mutation-lock.js";
 
+const MAX_EXTERNAL_WRITE_RETRIES = 2;
+
+class ExternalMemoryWriteConflict extends Error {}
+
 export class MemoryStore {
   private memoryEntries: string[] = [];
   private userEntries: string[] = [];
@@ -565,24 +569,40 @@ export class MemoryStore {
     mutation: () => Promise<MemoryResult>,
   ): Promise<MemoryResult> {
     return withMarkdownMutationLock(this.pathFor(target), async () => {
-      const result = await mutation();
-      if (result.success && this.mutationObserver) {
-        const filePath = this.pathFor(target);
-        const state = await this.readFileState(filePath);
-        this.setEntries(target, [...new Set(state.entries)]);
-        this.fileFingerprints[filePath] = state.fingerprint;
-        const warning = await this.mutationObserver(target, [...state.entries]);
-        if (warning) {
-          const warnings = [...(result.warnings ?? []), warning];
-          return {
-            ...result,
-            message: result.message ? `${result.message} Warning: ${warning}` : warning,
-            warning,
-            warnings,
-          };
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const result = await mutation();
+          if (result.success && this.mutationObserver) {
+            const filePath = this.pathFor(target);
+            const state = await this.readFileState(filePath);
+            this.setEntries(target, [...new Set(state.entries)]);
+            this.fileFingerprints[filePath] = state.fingerprint;
+            const warning = await this.mutationObserver(target, [...state.entries]);
+            if (warning) {
+              const warnings = [...(result.warnings ?? []), warning];
+              return {
+                ...result,
+                message: result.message ? `${result.message} Warning: ${warning}` : warning,
+                warning,
+                warnings,
+              };
+            }
+          }
+          return result;
+        } catch (error) {
+          if (!(error instanceof ExternalMemoryWriteConflict)) throw error;
+          const filePath = this.pathFor(target);
+          const state = await this.readFileState(filePath);
+          this.setEntries(target, [...new Set(state.entries)]);
+          this.fileFingerprints[filePath] = state.fingerprint;
+          if (attempt >= MAX_EXTERNAL_WRITE_RETRIES) {
+            return {
+              success: false,
+              error: "Memory file changed repeatedly during this update. No external changes were overwritten.",
+            };
+          }
         }
       }
-      return result;
     });
   }
 
@@ -596,6 +616,7 @@ export class MemoryStore {
     const filePath = this.pathFor(target);
     const entries = this.entriesFor(target);
     const content = entries.length ? entries.join(ENTRY_DELIMITER) : "";
+    const expectedFingerprint = this.fileFingerprints[filePath] ?? "missing";
 
     // Use the memory directory for temp files so rename stays on the same device
     const tmpDir = await fs.mkdtemp(path.join(this.memoryDir, ".tmp-"));
@@ -603,6 +624,10 @@ export class MemoryStore {
 
     try {
       await fs.writeFile(tmpPath, content, "utf-8");
+      const currentState = await this.readFileState(filePath);
+      if (currentState.fingerprint !== expectedFingerprint) {
+        throw new ExternalMemoryWriteConflict();
+      }
       await fs.rename(tmpPath, filePath);
       this.fileFingerprints[filePath] = this.fingerprint(content);
     } catch (err) {
