@@ -179,7 +179,8 @@ async function restoreDatabaseGeneration(names: string[], holdingRoot: string, s
     const held = path.join(holdingRoot, name);
     if (!await pathEntryExists(held)) continue;
     try {
-      await fs.rename(held, path.join(sourceRoot, name));
+      await fs.link(held, path.join(sourceRoot, name));
+      await fs.unlink(held);
     } catch (error) {
       failures.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
     }

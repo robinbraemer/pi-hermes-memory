@@ -282,7 +282,7 @@ describe("migrateExtensionRoot", () => {
     const failed = await migrateExtensionRoot(legacy, target, {
       retireDatabaseFile: async (source, destination) => {
         await fs.promises.rename(source, destination);
-        fs.mkdirSync(source);
+        fs.writeFileSync(source, "concurrent legacy successor", "utf-8");
         throw new Error("injected retirement failure after move");
       },
     });
@@ -291,6 +291,7 @@ describe("migrateExtensionRoot", () => {
     const retirementDirs = fs.readdirSync(legacy).filter((name) => name.startsWith(".sessions-db-retirement-"));
     assert.equal(retirementDirs.length, 1);
     assert.equal(fs.existsSync(path.join(legacy, retirementDirs[0], "sessions.db")), true);
+    assert.equal(fs.readFileSync(path.join(legacy, "sessions.db"), "utf-8"), "concurrent legacy successor");
     assert.match(failed.criticalFailures[0].message, /recovery artifacts preserved at/);
     assert.equal(isDatabaseMigrationPending(legacy, target), true);
   });
