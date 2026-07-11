@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { AtomicLockCoordinator } from '../../src/store/atomic-lock-coordinator.js';
 
 describe('AtomicLockCoordinator', () => {
@@ -75,6 +75,69 @@ describe('AtomicLockCoordinator', () => {
       assert.strictEqual(coordinator.tryAcquireShared('database-access', { staleMs: 0 }), null);
       exclusive.release();
     } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps new readers behind an exclusive waiter while readers drain', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    const dbPath = path.join(tmpDir, 'locks.sqlite');
+    const coordinator = new AtomicLockCoordinator(dbPath);
+    const reader = coordinator.tryAcquireShared('database-access', { staleMs: 0 });
+    assert.ok(reader);
+    const moduleUrl = new URL('../../src/store/atomic-lock-coordinator.ts', import.meta.url).href;
+    const child = spawn(process.execPath, [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '-e',
+      `import { AtomicLockCoordinator } from ${JSON.stringify(moduleUrl)};
+       const coordinator = new AtomicLockCoordinator(process.argv[1]);
+       process.stdout.write('waiting\\n');
+       const lease = coordinator.tryAcquireExclusive('database-access', {
+         staleMs: 60_000,
+         waitMs: 1_000,
+         pollMs: 5,
+       });
+       process.stdout.write(lease ? 'acquired\\n' : 'missed\\n');
+       lease?.release();`,
+      dbPath,
+    ], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let waiterStarted: (() => void) | null = null;
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk);
+      if (stdout.includes('waiting')) waiterStarted?.();
+    });
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    const childExit = new Promise<number | null>((resolve) => child.once('exit', resolve));
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('exclusive waiter did not start')), 2_000);
+        waiterStarted = () => {
+          clearTimeout(timeout);
+          resolve();
+        };
+        if (stdout.includes('waiting')) waiterStarted();
+      });
+      const deadline = Date.now() + 500;
+      let readerBlocked = false;
+      while (!readerBlocked && Date.now() < deadline) {
+        const overtakingReader = coordinator.tryAcquireShared('database-access', { staleMs: 0 });
+        readerBlocked = overtakingReader === null;
+        overtakingReader?.release();
+        if (!readerBlocked) await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.strictEqual(readerBlocked, true);
+      reader.release();
+      const code = await childExit;
+      assert.strictEqual(code, 0, stderr);
+      assert.match(stdout, /acquired/);
+    } finally {
+      reader.release();
+      if (child.exitCode === null) child.kill();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

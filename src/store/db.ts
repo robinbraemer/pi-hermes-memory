@@ -309,7 +309,11 @@ export class DatabaseManager {
     const deadline = Date.now() + waitMs;
     while (true) {
       const lease = mode === 'exclusive'
-        ? coordinator.tryAcquireExclusive(lockKey, { staleMs: this.recoveryOptions.recoveryLockStaleMs })
+        ? coordinator.tryAcquireExclusive(lockKey, {
+            staleMs: this.recoveryOptions.recoveryLockStaleMs,
+            waitMs: Math.max(0, deadline - Date.now()),
+            pollMs: this.recoveryOptions.recoveryLockPollMs,
+          })
         : coordinator.tryAcquireShared(lockKey, { staleMs: this.recoveryOptions.recoveryLockStaleMs });
       if (lease) return lease;
       if (Date.now() >= deadline) {

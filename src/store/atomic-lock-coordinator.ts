@@ -20,6 +20,8 @@ type DatabaseCtor = new (dbPath: string) => DatabaseLike;
 
 export interface AtomicLockOptions {
   staleMs: number;
+  waitMs?: number;
+  pollMs?: number;
 }
 
 export interface AtomicLockLease {
@@ -97,6 +99,12 @@ interface PendingRelease {
 }
 
 const pendingReleases = new Map<string, PendingRelease>();
+
+function sleepSync(milliseconds: number): void {
+  if (milliseconds <= 0) return;
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(signal, 0, 0, milliseconds);
+}
 
 export class AtomicLockCoordinator {
   private readonly pid: number;
@@ -199,26 +207,39 @@ export class AtomicLockCoordinator {
       gate.release();
       throw error;
     }
-    let hasReaders = false;
+    const deadline = Date.now() + Math.max(0, options.waitMs ?? 0);
     try {
-      db.exec('BEGIN IMMEDIATE');
-      try {
-        const readers = db.prepare(`
-          SELECT token, pid, incarnation
-          FROM read_locks
-          WHERE lock_key = ?
-        `).all(key) as Array<{ token: string; pid: number; incarnation: string | null }>;
-        for (const reader of readers) {
-          if (!this.ownerIsActive(reader.pid, reader.incarnation)) {
-            db.prepare('DELETE FROM read_locks WHERE lock_key = ? AND token = ?').run(key, reader.token);
-          } else {
-            hasReaders = true;
+      while (true) {
+        let hasReaders = false;
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          const readers = db.prepare(`
+            SELECT token, pid, incarnation
+            FROM read_locks
+            WHERE lock_key = ?
+          `).all(key) as Array<{ token: string; pid: number; incarnation: string | null }>;
+          for (const reader of readers) {
+            if (!this.ownerIsActive(reader.pid, reader.incarnation)) {
+              db.prepare('DELETE FROM read_locks WHERE lock_key = ? AND token = ?').run(key, reader.token);
+            } else {
+              hasReaders = true;
+            }
           }
+          db.exec('COMMIT');
+        } catch (error) {
+          try { db.exec('ROLLBACK'); } catch {}
+          throw error;
         }
-        db.exec('COMMIT');
-      } catch (error) {
-        try { db.exec('ROLLBACK'); } catch {}
-        throw error;
+
+        if (!hasReaders) return gate;
+        if (Date.now() >= deadline) {
+          gate.release();
+          return null;
+        }
+        sleepSync(Math.min(
+          Math.max(1, options.pollMs ?? 10),
+          Math.max(1, deadline - Date.now()),
+        ));
       }
     } catch (error) {
       gate.release();
@@ -226,11 +247,6 @@ export class AtomicLockCoordinator {
     } finally {
       db.close();
     }
-    if (hasReaders) {
-      gate.release();
-      return null;
-    }
-    return gate;
   }
 
   release(key: string, token: string): void {
