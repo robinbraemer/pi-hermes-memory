@@ -359,6 +359,11 @@ export class MemoryStore {
     return this.userEntries.map((e) => this.stripMetadata(e));
   }
 
+  /** Raw Markdown entries, including metadata, for exact SQLite reconciliation. */
+  getRawEntriesForSync(target: "memory" | "user" | "failure"): string[] {
+    return [...this.entriesFor(target)];
+  }
+
   // ─── Internal helpers ───
 
   /**

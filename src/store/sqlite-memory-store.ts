@@ -74,6 +74,12 @@ export interface SqliteMemoryRemoveOptions {
   project?: string | null;
 }
 
+export interface MarkdownMemoryReconcileResult {
+  inserted: number;
+  existing: number;
+  removed: number;
+}
+
 export interface ParsedMarkdownMemoryEntry extends SqliteMemorySyncInput {}
 
 function today(): string {
@@ -401,6 +407,57 @@ export function syncMemoryEntry(
     action: 'existing',
     entry: getMemoryById(dbManager, existing.id)!,
   };
+}
+
+/**
+ * Make one exact Markdown target/project scope authoritative in SQLite.
+ * Upserts and orphan deletion are committed together when transactions are
+ * supported by the active SQLite driver.
+ */
+export function reconcileMarkdownMemoryScope(
+  dbManager: DatabaseManager,
+  rawEntries: string[],
+  target: 'memory' | 'user' | 'failure',
+  project: string | null = null,
+): MarkdownMemoryReconcileResult {
+  const db = dbManager.getDb();
+  const normalizedProject = normalizeNullable(project);
+
+  const reconcile = (): MarkdownMemoryReconcileResult => {
+    let inserted = 0;
+    let existing = 0;
+    const desiredContent = new Set<string>();
+
+    for (const rawEntry of rawEntries) {
+      const parsed = parseMarkdownMemoryEntry(rawEntry, target, normalizedProject);
+      desiredContent.add(parsed.content.trim());
+      const result = syncMemoryEntry(dbManager, parsed);
+      if (result.action === 'inserted') inserted++;
+      else existing++;
+    }
+
+    const params: unknown[] = [];
+    const conditions = buildScopeConditions(params, target, normalizedProject);
+    const scopedRows = db.prepare(`
+      SELECT id, content
+      FROM memories
+      WHERE ${conditions.join(' AND ')}
+    `).all(...params) as Array<{ id: number; content: string }>;
+    const orphanIds = scopedRows
+      .filter((row) => !desiredContent.has(row.content.trim()))
+      .map((row) => row.id);
+
+    let removed = 0;
+    if (orphanIds.length > 0) {
+      const placeholders = orphanIds.map(() => '?').join(', ');
+      removed = db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...orphanIds).changes;
+    }
+
+    return { inserted, existing, removed };
+  };
+
+  const transactional = db.transaction?.(reconcile);
+  return transactional ? transactional() : reconcile();
 }
 
 /**

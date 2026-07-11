@@ -297,7 +297,7 @@ The extension keeps Markdown memory as the human-readable source of truth, and m
 
 This means:
 - Fresh `memory` tool writes become searchable immediately
-- Older Markdown entries can be backfilled with `/memory-sync-markdown`
+- `/memory-sync-markdown` reconciles older Markdown entries and removes stale SQLite mirror rows
 - SQLite search does **not** replace the core Markdown limit
 
 This is the **hybrid memory architecture**:
@@ -370,7 +370,7 @@ This means skills build up naturally over time without you having to ask.
 | `/memory-interview` | Answer a few questions to pre-fill your user profile |
 | `/memory-switch-project` | List all project memories and their entry counts |
 | `/memory-index-sessions` | Import past Pi sessions into the search database |
-| `/memory-sync-markdown` | Backfill Markdown memories into the SQLite search store |
+| `/memory-sync-markdown` | Reconcile the SQLite search mirror with authoritative Markdown memories |
 | `/memory-preview-context` | Preview the memory policy or legacy memory blocks appended to the system prompt |
 | `/learn-memory-tool` | Skill that teaches users how to use the memory system |
 
@@ -530,7 +530,7 @@ The `sessions.db` SQLite database stores session history and extended memory ent
 - **`§` delimiter**: Memory entries are separated by `§` (section sign). If an entry naturally contains `§`, it will be split incorrectly on reload. This is rare in English text but possible. [Hermes uses the same delimiter.]
 - **Background review cost**: Each review cycle costs one full LLM API call via a child `pi -p` process. Correction detection and explicit skill saves can add additional calls when the agent decides they are worth it.
 - **Session search requires indexing**: Past sessions must be indexed before they're searchable. Run `/memory-index-sessions` to bulk-import, or let the extension auto-index on session shutdown.
-- **Older Markdown memories may need backfill**: If you saved memories before the SQLite mirror existed or search looks stale, run `/memory-sync-markdown`.
+- **Older Markdown memories may need reconciliation**: If you saved memories before the SQLite mirror existed or search looks stale, run `/memory-sync-markdown`; it also removes mirror rows absent from Markdown.
 - **Core memory limits still apply**: SQLite search mirroring does not bypass the 5,000-char core Markdown limit. If consolidation cannot free space, the write fails instead of becoming SQLite-only memory invisibly.
 - **System prompts are invisible**: Pi's TUI does not display the system prompt. Use `/memory-preview-context` to inspect whether policy-only or legacy memory injection is active.
 - **Project skill visibility depends on Pi discovery cycles**: project skills are exposed through `resources_discover` using the active project's `skills/` path. If a moved or newly created project skill doesn't show up immediately in a running session, trigger a reload/new session so Pi refreshes discovered resources.

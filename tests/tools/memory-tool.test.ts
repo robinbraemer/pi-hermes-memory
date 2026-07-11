@@ -150,6 +150,48 @@ describe("registerMemoryTool", () => {
     assert.strictEqual(results[0].content, 'Entry one');
   });
 
+  it("prunes same-scope SQLite orphans after a Markdown mutation", async () => {
+    let capturedResult: any;
+    const mockPi = {
+      registerTool: (definition: any) => { capturedResult = definition; },
+    } as unknown as ExtensionAPI;
+    const store = new MemoryStore({
+      memoryMode: "policy-only",
+      memoryCharLimit: 5000,
+      userCharLimit: 5000,
+      projectCharLimit: 5000,
+      nudgeInterval: 10,
+      reviewEnabled: false,
+      flushOnCompact: false,
+      flushOnShutdown: false,
+      flushMinTurns: 6,
+      autoConsolidate: false,
+      correctionDetection: false,
+      failureInjectionEnabled: true,
+      failureInjectionMaxAgeDays: 7,
+      failureInjectionMaxEntries: 5,
+      nudgeToolCalls: 15,
+      consolidationTimeoutMs: 60000,
+      memoryDir: tmpDir,
+    });
+    await store.loadFromDisk();
+    syncMemoryEntry(dbManager, { content: "orphaned row", target: "memory", project: null });
+
+    registerMemoryTool(mockPi, store, null, dbManager);
+    await capturedResult.execute(
+      "tc-1",
+      { action: "add", target: "memory", content: "authoritative Markdown row" },
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    assert.deepStrictEqual(
+      getMemories(dbManager, { target: "memory", project: null }).map((entry) => entry.content),
+      ["authoritative Markdown row"],
+    );
+  });
+
   it("removes FIFO-evicted entries from the SQLite mirror", async () => {
     let capturedResult: any;
     const mockPi = {

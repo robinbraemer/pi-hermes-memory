@@ -181,6 +181,32 @@ describe('memory sqlite sync + markdown backfill', () => {
     assert.strictEqual(results[0].content, 'latest path searchable entry');
   });
 
+  it('prunes Markdown orphans while preserving other targets and projects', () => {
+    fs.writeFileSync(path.join(globalDir, 'MEMORY.md'), 'kept global memory', 'utf-8');
+    fs.writeFileSync(path.join(globalDir, 'USER.md'), 'kept global user', 'utf-8');
+    const projectDir = path.join(agentRoot, 'projects-memory', 'project-a');
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, 'MEMORY.md'), 'kept project memory', 'utf-8');
+
+    syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+    dbManager.getDb().prepare(`
+      INSERT INTO memories (project, target, category, content, created, last_referenced)
+      VALUES (NULL, 'memory', NULL, 'orphaned global memory', '2026-07-01', '2026-07-01')
+    `).run();
+
+    const counters = syncMarkdownMemoriesToSqlite(dbManager, globalDir, undefined, agentRoot);
+
+    assert.strictEqual(counters.removed, 1);
+    assert.deepStrictEqual(
+      getMemories(dbManager).map((entry) => `${entry.project ?? 'global'}:${entry.target}:${entry.content}`).sort(),
+      [
+        'global:memory:kept global memory',
+        'global:user:kept global user',
+        'project-a:memory:kept project memory',
+      ].sort(),
+    );
+  });
+
   it('still scans project markdown under ~/.pi/agent when memoryDir is customized elsewhere', () => {
     const customGlobalDir = path.join(tmpDir, 'external-memory-root');
     fs.mkdirSync(customGlobalDir, { recursive: true });

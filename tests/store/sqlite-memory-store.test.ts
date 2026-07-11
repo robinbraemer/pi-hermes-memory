@@ -16,6 +16,7 @@ import {
   removeSyncedMemories,
   parseMarkdownMemoryEntry,
   formatFailureMemoryContent,
+  reconcileMarkdownMemoryScope,
 } from '../../src/store/sqlite-memory-store.js';
 
 describe('sqlite-memory-store', () => {
@@ -114,6 +115,35 @@ describe('sqlite-memory-store', () => {
       assert.strictEqual(parsed.failureReason, 'npm install rewrote lockfile');
       assert.strictEqual(parsed.created, '2026-05-08');
       assert.strictEqual(parsed.lastReferenced, '2026-05-09');
+    });
+  });
+
+  describe('reconcileMarkdownMemoryScope', () => {
+    it('prunes only absent rows in the exact target and project scope', () => {
+      addMemory(dbManager, 'kept global memory', 'memory', null);
+      addMemory(dbManager, 'orphaned global memory', 'memory', null);
+      addMemory(dbManager, 'unrelated global user', 'user', null);
+      addMemory(dbManager, 'unrelated project memory', 'memory', 'project-a');
+
+      const first = reconcileMarkdownMemoryScope(
+        dbManager,
+        ['kept global memory <!-- created=2026-07-01, last=2026-07-02 -->'],
+        'memory',
+        null,
+      );
+      const second = reconcileMarkdownMemoryScope(
+        dbManager,
+        ['kept global memory <!-- created=2026-07-01, last=2026-07-02 -->'],
+        'memory',
+        null,
+      );
+
+      assert.strictEqual(first.removed, 1);
+      assert.strictEqual(second.removed, 0);
+      assert.deepStrictEqual(
+        getMemories(dbManager).map((entry) => entry.content).sort(),
+        ['kept global memory', 'unrelated global user', 'unrelated project memory'].sort(),
+      );
     });
   });
 

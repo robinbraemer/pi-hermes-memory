@@ -11,6 +11,7 @@ import { MemoryStore } from "../store/memory-store.js";
 import { DatabaseManager } from "../store/db.js";
 import {
   formatFailureMemoryContent,
+  reconcileMarkdownMemoryScope,
   removeExactSyncedMemories,
   removeSyncedMemories,
   replaceSyncedMemories,
@@ -185,6 +186,27 @@ async function syncEvictionsFromSqlite(
   }
 }
 
+async function reconcileStoreScope(
+  store: MemoryStore,
+  rawTarget: "memory" | "user" | "project" | "failure",
+  dbManager: DatabaseManager | null,
+  projectName?: string | null,
+): Promise<string | null | undefined> {
+  if (!dbManager || typeof store.getRawEntriesForSync !== "function") return undefined;
+  try {
+    const target = sqliteTargetFor(rawTarget);
+    reconcileMarkdownMemoryScope(
+      dbManager,
+      store.getRawEntriesForSync(target),
+      target,
+      sqliteProjectFor(rawTarget, projectName) ?? null,
+    );
+    return null;
+  } catch (err) {
+    return `Saved to Markdown, but SQLite search reconciliation failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
 export function registerMemoryTool(
   pi: ExtensionAPI,
   store: MemoryStore,
@@ -340,6 +362,11 @@ export function registerMemoryTool(
             success: false,
             error: `Unknown action '${action}'. Use: add, replace, remove`,
           };
+      }
+
+      if (result.success) {
+        const reconciliationWarning = await reconcileStoreScope(store_, rawTarget, dbManager, projectName);
+        if (reconciliationWarning !== undefined) syncWarning = reconciliationWarning;
       }
 
       if (syncWarning && result.success) {

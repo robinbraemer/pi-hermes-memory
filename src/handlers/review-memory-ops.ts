@@ -10,6 +10,7 @@ import { MemoryStore } from "../store/memory-store.js";
 import { DatabaseManager } from "../store/db.js";
 import {
   formatFailureMemoryContent,
+  reconcileMarkdownMemoryScope,
   removeExactSyncedMemories,
   removeSyncedMemories,
   replaceSyncedMemories,
@@ -298,6 +299,22 @@ async function syncEvictions(
   }
 }
 
+function reconcileStoreScope(
+  store: MemoryStore,
+  rawTarget: ReviewMemoryOperation["target"],
+  dbManager: DatabaseManager | null,
+  projectName?: string | null,
+): void {
+  if (!dbManager) return;
+  const target = sqliteTargetFor(rawTarget);
+  reconcileMarkdownMemoryScope(
+    dbManager,
+    store.getRawEntriesForSync(target),
+    target,
+    sqliteProjectFor(rawTarget, projectName) ?? null,
+  );
+}
+
 export async function applyReviewOperations(
   store: MemoryStore,
   projectStore: MemoryStore | null,
@@ -379,6 +396,11 @@ export async function applyReviewOperations(
       }
       default:
         skippedCount++;
+        continue;
+    }
+
+    if (result.success) {
+      try { reconcileStoreScope(activeStore, rawTarget, dbManager, projectName); } catch { /* best effort */ }
     }
   }
 
