@@ -51,7 +51,7 @@ function publicationPendingPath(filePath: string): string {
 
 function recoveryFilePattern(filePath: string): RegExp {
   const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`^\\.${escapedName}\\.recovery-\\d+-${UUID_PATTERN}$`, "i");
+  return new RegExp(`^\\.${escapedName}\\.recovery-(\\d+)-${UUID_PATTERN}$`, "i");
 }
 
 async function writePublicationMarker(tmpDir: string, pendingPath: string, recoveryPath: string): Promise<void> {
@@ -930,10 +930,10 @@ export class MemoryStore {
     );
   }
 
-  private retiredRecoveryPathFor(filePath: string): string {
+  private retiredRecoveryPathFor(filePath: string, generationTimestamp = Date.now()): string {
     return path.join(
       path.dirname(filePath),
-      `.${path.basename(filePath)}.retired-${Date.now()}-${randomUUID()}`,
+      `.${path.basename(filePath)}.retired-${generationTimestamp}-${randomUUID()}`,
     );
   }
 
@@ -945,13 +945,14 @@ export class MemoryStore {
     const directory = path.dirname(filePath);
     const escapedName = path.basename(filePath).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const recoveryPattern = recoveryFilePattern(filePath);
-    const retiredPattern = new RegExp(`^\\.${escapedName}\\.retired-\\d+-${UUID_PATTERN}$`, "i");
+    const retiredPattern = new RegExp(`^\\.${escapedName}\\.retired-(\\d+)-${UUID_PATTERN}$`, "i");
     const retiredTempPattern = new RegExp(`^\\.${escapedName}\\.retired-\\d+-${UUID_PATTERN}\\.tmp$`, "i");
     const conflictPattern = new RegExp(
       `^\\.${escapedName}\\.conflict-local-\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`,
       "i",
     );
-    const activeCutoff = Date.now() - RECOVERY_ACTIVE_GRACE_MS;
+    const now = Date.now();
+    const activeCutoff = now - RECOVERY_ACTIVE_GRACE_MS;
     try {
       const names = await fs.readdir(directory);
       let referencedRecoveryName: string | null = null;
@@ -974,7 +975,6 @@ export class MemoryStore {
       const activeCandidates = active
         .filter((item): item is NonNullable<typeof item> => item !== null)
         .sort((left, right) => right.state.mtimeMs - left.state.mtimeMs);
-      const newlyRetiredPaths = new Set<string>();
       let activeCount = 0;
       let activeBytes = 0;
       for (const item of activeCandidates) {
@@ -988,7 +988,7 @@ export class MemoryStore {
           activeBytes += item.state.size;
           continue;
         }
-        try { newlyRetiredPaths.add(await this.retireRecoveryFile(item.path, filePath)); } catch {}
+        try { await this.retireRecoveryFile(item.path, filePath); } catch {}
       }
 
       const retiredNames = (await fs.readdir(directory)).filter(
@@ -998,7 +998,7 @@ export class MemoryStore {
         const retiredPath = path.join(directory, name);
         try {
           const state = await fs.lstat(retiredPath);
-          return state.isFile() ? { path: retiredPath, state } : null;
+          return state.isFile() ? { name, path: retiredPath, state } : null;
         } catch {
           return null;
         }
@@ -1007,16 +1007,21 @@ export class MemoryStore {
       const candidates = retired
         .filter((item): item is NonNullable<typeof item> => item !== null)
         .sort((left, right) => {
-          const retirementPriority = Number(newlyRetiredPaths.has(right.path)) - Number(newlyRetiredPaths.has(left.path));
-          return retirementPriority || right.state.mtimeMs - left.state.mtimeMs;
+          const leftTimestamp = Number(left.name.match(retiredPattern)?.[1]);
+          const rightTimestamp = Number(right.name.match(retiredPattern)?.[1]);
+          const leftProtected = leftTimestamp >= activeCutoff && leftTimestamp <= now;
+          const rightProtected = rightTimestamp >= activeCutoff && rightTimestamp <= now;
+          return Number(rightProtected) - Number(leftProtected) || right.state.mtimeMs - left.state.mtimeMs;
         });
       let retainedCount = 0;
       let retainedBytes = 0;
       for (const item of candidates) {
+        const generationTimestamp = Number(item.name.match(retiredPattern)?.[1]);
+        const withinRecoveryGrace = generationTimestamp >= activeCutoff && generationTimestamp <= now;
         const withinAge = item.state.mtimeMs >= maxAgeCutoff;
         const withinCount = retainedCount < RETIRED_RECOVERY_MAX_COUNT;
         const withinBytes = retainedBytes + item.state.size <= RETIRED_RECOVERY_MAX_BYTES;
-        if (withinAge && withinCount && withinBytes) {
+        if (withinRecoveryGrace || (withinAge && withinCount && withinBytes)) {
           retainedCount++;
           retainedBytes += item.state.size;
           continue;
@@ -1058,7 +1063,11 @@ export class MemoryStore {
   }
 
   private async retireRecoveryFile(recoveryPath: string, filePath: string): Promise<string> {
-    const retiredPath = this.retiredRecoveryPathFor(filePath);
+    const generationTimestamp = Number(path.basename(recoveryPath).match(recoveryFilePattern(filePath))?.[1]);
+    const retiredPath = this.retiredRecoveryPathFor(
+      filePath,
+      Number.isSafeInteger(generationTimestamp) ? generationTimestamp : Date.now(),
+    );
     const recoveryIdentity = await this.fileIdentity(recoveryPath);
     await fs.link(recoveryPath, retiredPath);
     let currentIdentity: { dev: number; ino: number };

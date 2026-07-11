@@ -1623,6 +1623,9 @@ describe("MemoryStore", { concurrency: 1 }, () => {
         }
 
         await (pathStore as any).pruneRecoveryFiles(cappedPath);
+        const nextRecoveryPath = (pathStore as any).recoveryPathFor(cappedPath) as string;
+        await writeRaw(nextRecoveryPath, `${TEST_MARKER} next active recovery`);
+        await (pathStore as any).pruneRecoveryFiles(cappedPath);
         await handle.truncate(0);
         await handle.writeFile(`${TEST_MARKER} late cap-retired descriptor write`, "utf-8");
         await handle.sync();
@@ -1660,23 +1663,26 @@ describe("MemoryStore", { concurrency: 1 }, () => {
 
     it("bounds retired recovery snapshots by age, count, and bytes", async () => {
       const pathStore = new MemoryStore(makeConfig());
-      const staleRetiredPath = (pathStore as any).retiredRecoveryPathFor(memoryPath) as string;
+      const cappedPath = path.join(MEMORY_DIR, "retired-cap.md");
+      const outsideGrace = Date.now() - 8 * 24 * 60 * 60 * 1000;
+      const staleRetiredPath = (pathStore as any).retiredRecoveryPathFor(
+        cappedPath,
+        Date.now() - 31 * 24 * 60 * 60 * 1000,
+      ) as string;
       await writeRaw(staleRetiredPath, `${TEST_MARKER} stale retired snapshot`);
       const stale = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
       await fs.utimes(staleRetiredPath, stale, stale);
 
       for (let index = 0; index < 40; index++) {
-        const retiredPath = (pathStore as any).retiredRecoveryPathFor(memoryPath) as string;
+        const retiredPath = (pathStore as any).retiredRecoveryPathFor(cappedPath, outsideGrace) as string;
         await writeRaw(retiredPath, `${TEST_MARKER} retired ${index}`);
         await fs.truncate(retiredPath, 2 * 1024 * 1024);
       }
 
-      const store = new MemoryStore(makeConfig());
-      await store.loadFromDisk();
-      await store.add("memory", `${TEST_MARKER} triggers retired pruning`);
+      await (pathStore as any).pruneRecoveryFiles(cappedPath);
 
       const siblings = await fs.readdir(MEMORY_DIR);
-      const retiredFiles = siblings.filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
+      const retiredFiles = siblings.filter((name) => name.startsWith(`.${path.basename(cappedPath)}.retired-`));
       const retiredStats = await Promise.all(
         retiredFiles.map((name) => fs.stat(path.join(MEMORY_DIR, name))),
       );
@@ -1687,23 +1693,23 @@ describe("MemoryStore", { concurrency: 1 }, () => {
 
     it("prunes generated retired temp snapshots during startup load", async () => {
       const pathStore = new MemoryStore(makeConfig());
-      const stalePath = `${(pathStore as any).retiredRecoveryPathFor(memoryPath) as string}.tmp`;
+      const cappedPath = path.join(MEMORY_DIR, "retired-temp-cap.md");
+      const stalePath = `${(pathStore as any).retiredRecoveryPathFor(cappedPath) as string}.tmp`;
       await writeRaw(stalePath, `${TEST_MARKER} stale partial snapshot`);
       const stale = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
       await fs.utimes(stalePath, stale, stale);
 
       for (let index = 0; index < 40; index++) {
-        const tempPath = `${(pathStore as any).retiredRecoveryPathFor(memoryPath) as string}.tmp`;
+        const tempPath = `${(pathStore as any).retiredRecoveryPathFor(cappedPath) as string}.tmp`;
         await writeRaw(tempPath, `${TEST_MARKER} partial snapshot ${index}`);
         await fs.truncate(tempPath, 2 * 1024 * 1024);
       }
 
-      const store = new MemoryStore(makeConfig());
-      await store.loadFromDisk();
+      await (pathStore as any).pruneRecoveryFiles(cappedPath);
 
       const names = await fs.readdir(MEMORY_DIR);
       const retiredArtifacts = names.filter((name) =>
-        new RegExp(`^\\.${MEMORY_FILE.replaceAll(".", "\\.")}\\.retired-\\d+-[0-9a-f-]{36}(?:\\.tmp)?$`, "i").test(name)
+        new RegExp(`^\\.${path.basename(cappedPath).replaceAll(".", "\\.")}\\.retired-\\d+-[0-9a-f-]{36}(?:\\.tmp)?$`, "i").test(name)
       );
       const regularArtifacts: string[] = [];
       for (const name of retiredArtifacts) {
