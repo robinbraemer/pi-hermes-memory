@@ -30,7 +30,10 @@ import { AGENT_ROOT } from "../paths.js";
 import { canonicalMarkdownIdentity, withMarkdownMutationLock } from "./markdown-mutation-lock.js";
 
 const MAX_EXTERNAL_WRITE_RETRIES = 2;
-const RECOVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const RECOVERY_ACTIVE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+const RETIRED_RECOVERY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const RETIRED_RECOVERY_MAX_COUNT = 32;
+const RETIRED_RECOVERY_MAX_BYTES = 64 * 1024 * 1024;
 
 class ExternalMemoryWriteConflict extends Error {}
 
@@ -722,21 +725,64 @@ export class MemoryStore {
 
   private async pruneRecoveryFiles(filePath: string): Promise<void> {
     const directory = path.dirname(filePath);
-    const prefix = `.${path.basename(filePath)}.recovery-`;
-    const cutoff = Date.now() - RECOVERY_RETENTION_MS;
+    const recoveryPrefix = `.${path.basename(filePath)}.recovery-`;
+    const retiredPrefix = `.${path.basename(filePath)}.retired-`;
+    const activeCutoff = Date.now() - RECOVERY_ACTIVE_GRACE_MS;
     try {
       const names = await fs.readdir(directory);
-      await Promise.all(names.filter((name) => name.startsWith(prefix)).map(async (name) => {
+      await Promise.all(names.filter((name) => name.startsWith(recoveryPrefix)).map(async (name) => {
         const recoveryPath = path.join(directory, name);
         try {
           const state = await fs.stat(recoveryPath);
-          if (state.mtimeMs >= cutoff) return;
-          await fs.rename(recoveryPath, this.retiredRecoveryPathFor(filePath));
+          if (state.mtimeMs >= activeCutoff) return;
+          await this.retireRecoveryFile(recoveryPath, filePath);
         } catch {
         }
       }));
+
+      const retiredNames = (await fs.readdir(directory)).filter((name) => name.startsWith(retiredPrefix));
+      const retired = await Promise.all(retiredNames.map(async (name) => {
+        const retiredPath = path.join(directory, name);
+        try {
+          return { path: retiredPath, state: await fs.stat(retiredPath) };
+        } catch {
+          return null;
+        }
+      }));
+      const maxAgeCutoff = Date.now() - RETIRED_RECOVERY_MAX_AGE_MS;
+      const candidates = retired
+        .filter((item): item is NonNullable<typeof item> => item !== null)
+        .sort((left, right) => right.state.mtimeMs - left.state.mtimeMs);
+      let retainedCount = 0;
+      let retainedBytes = 0;
+      for (const item of candidates) {
+        const withinAge = item.state.mtimeMs >= maxAgeCutoff;
+        const withinCount = retainedCount < RETIRED_RECOVERY_MAX_COUNT;
+        const withinBytes = retainedBytes + item.state.size <= RETIRED_RECOVERY_MAX_BYTES;
+        if (withinAge && withinCount && withinBytes) {
+          retainedCount++;
+          retainedBytes += item.state.size;
+          continue;
+        }
+        try { await fs.unlink(item.path); } catch {}
+      }
     } catch {
     }
+  }
+
+  private async retireRecoveryFile(recoveryPath: string, filePath: string): Promise<void> {
+    const retiredPath = this.retiredRecoveryPathFor(filePath);
+    const snapshotPath = `${retiredPath}.tmp`;
+    const snapshot = await fs.readFile(recoveryPath);
+    const handle = await fs.open(snapshotPath, "wx", 0o600);
+    try {
+      await handle.writeFile(snapshot);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(snapshotPath, retiredPath);
+    await fs.unlink(recoveryPath);
   }
 
   private async preserveConflictFile(sourcePath: string, filePath: string, kind: string): Promise<string> {

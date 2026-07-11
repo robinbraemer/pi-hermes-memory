@@ -1154,33 +1154,57 @@ describe("MemoryStore", { concurrency: 1 }, () => {
 
       await assert.rejects(fs.stat(expiredPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
       assert.equal(await fs.readFile(activePath, "utf-8"), `${TEST_MARKER} active recovery`);
+      const retiredFiles = (await fs.readdir(MEMORY_DIR))
+        .filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
+      const retiredContents = await Promise.all(
+        retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+      );
+      assert.ok(retiredContents.some((content) => content.includes("expired recovery")));
     });
 
-    it("keeps a pathname for late writes after expired recovery retirement", async () => {
-      const expiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-late-writer`);
-      await writeRaw(expiredPath, `${TEST_MARKER} displaced original`);
-      const expired = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
-      await fs.utimes(expiredPath, expired, expired);
-      const handle = await fs.open(expiredPath, "r+");
+    it("keeps the active recovery pathname stable for late writes within the grace period", async () => {
+      const activePath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.recovery-late-writer`);
+      await writeRaw(activePath, `${TEST_MARKER} displaced original`);
+      const handle = await fs.open(activePath, "r+");
 
       try {
         const store = new MemoryStore(makeConfig());
         await store.loadFromDisk();
-        await store.add("memory", `${TEST_MARKER} triggers recovery retirement`);
+        await store.add("memory", `${TEST_MARKER} triggers recovery pruning`);
         await handle.truncate(0);
-        await handle.writeFile(`${TEST_MARKER} late retired descriptor write`, "utf-8");
+        await handle.writeFile(`${TEST_MARKER} late active descriptor write`, "utf-8");
         await handle.sync();
       } finally {
         await handle.close();
       }
 
+      assert.match(await fs.readFile(activePath, "utf-8"), /late active descriptor write/);
+    });
+
+    it("bounds retired recovery snapshots by age, count, and bytes", async () => {
+      const staleRetiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.retired-stale`);
+      await writeRaw(staleRetiredPath, `${TEST_MARKER} stale retired snapshot`);
+      const stale = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+      await fs.utimes(staleRetiredPath, stale, stale);
+
+      for (let index = 0; index < 40; index++) {
+        const retiredPath = path.join(MEMORY_DIR, `.${MEMORY_FILE}.retired-${String(index).padStart(2, "0")}`);
+        await writeRaw(retiredPath, `${TEST_MARKER} retired ${index}`);
+        await fs.truncate(retiredPath, 2 * 1024 * 1024);
+      }
+
+      const store = new MemoryStore(makeConfig());
+      await store.loadFromDisk();
+      await store.add("memory", `${TEST_MARKER} triggers retired pruning`);
+
       const siblings = await fs.readdir(MEMORY_DIR);
       const retiredFiles = siblings.filter((name) => name.startsWith(`.${MEMORY_FILE}.retired-`));
-      assert.ok(retiredFiles.length > 0);
-      const retiredContents = await Promise.all(
-        retiredFiles.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+      const retiredStats = await Promise.all(
+        retiredFiles.map((name) => fs.stat(path.join(MEMORY_DIR, name))),
       );
-      assert.ok(retiredContents.some((content) => content.includes("late retired descriptor write")));
+      assert.ok(!retiredFiles.includes(path.basename(staleRetiredPath)));
+      assert.ok(retiredFiles.length <= 32);
+      assert.ok(retiredStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
     });
 
     it("commits and observes a mutation when published-link cleanup fails", async () => {

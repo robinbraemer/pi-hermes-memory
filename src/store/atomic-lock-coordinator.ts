@@ -84,6 +84,8 @@ function probeProcessIncarnation(pid: number): string | null {
 }
 
 const currentProcessIncarnation = probeProcessIncarnation(process.pid);
+const RELEASE_ATTEMPTS = 3;
+const pendingReleases = new Map<string, () => void>();
 
 export class AtomicLockCoordinator {
   private readonly pid: number;
@@ -100,6 +102,7 @@ export class AtomicLockCoordinator {
   }
 
   tryAcquire(key: string, options: AtomicLockOptions): AtomicLockLease | null {
+    this.retryPendingReleases(key);
     const token = randomUUID();
     const now = Date.now();
     const db = this.open();
@@ -155,12 +158,36 @@ export class AtomicLockCoordinator {
   }
 
   release(key: string, token: string): void {
+    const pendingKey = this.pendingReleaseKey(key, token);
+    for (let attempt = 0; attempt < RELEASE_ATTEMPTS; attempt++) {
+      try {
+        this.deleteOwnedLock(key, token);
+        pendingReleases.delete(pendingKey);
+        return;
+      } catch {
+      }
+    }
+    pendingReleases.set(pendingKey, () => this.release(key, token));
+  }
+
+  private deleteOwnedLock(key: string, token: string): void {
     const db = this.open();
     try {
       db.prepare('DELETE FROM locks WHERE lock_key = ? AND token = ?').run(key, token);
     } finally {
       db.close();
     }
+  }
+
+  private retryPendingReleases(key: string): void {
+    const prefix = `${path.resolve(this.dbPath)}\0${key}\0`;
+    for (const [pendingKey, release] of [...pendingReleases.entries()]) {
+      if (pendingKey.startsWith(prefix)) release();
+    }
+  }
+
+  private pendingReleaseKey(key: string, token: string): string {
+    return `${path.resolve(this.dbPath)}\0${key}\0${token}`;
   }
 
   private open(): DatabaseLike {

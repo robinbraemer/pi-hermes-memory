@@ -434,6 +434,35 @@ describe('DatabaseManager', () => {
       assertQuickCheckOk(db as InstanceType<typeof Database>);
     });
 
+    it('keeps verified recovery successful and clears a failed release before retry', () => {
+      const prototype = AtomicLockCoordinator.prototype as any;
+      const originalDeleteOwnedLock = prototype.deleteOwnedLock;
+      let deleteAttempts = 0;
+      prototype.deleteOwnedLock = function (key: string, token: string): void {
+        deleteAttempts++;
+        if (deleteAttempts <= 3) throw new Error('injected recovery release failure');
+        return originalDeleteOwnedLock.call(this, key, token);
+      };
+
+      try {
+        dbManager.close();
+        const dbPath = path.join(tmpDir, 'sessions.db');
+        fs.writeFileSync(dbPath, 'first corrupt database');
+        dbManager = new DatabaseManager(tmpDir);
+        assert.doesNotThrow(() => dbManager.getDb());
+        assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'recreated-empty');
+
+        dbManager.close();
+        fs.writeFileSync(dbPath, 'second corrupt database');
+        dbManager = new DatabaseManager(tmpDir);
+        assert.doesNotThrow(() => dbManager.getDb());
+        assert.strictEqual(dbManager.getLastRecovery()?.strategy, 'recreated-empty');
+        assert.ok(deleteAttempts >= 4);
+      } finally {
+        prototype.deleteOwnedLock = originalDeleteOwnedLock;
+      }
+    });
+
     it('opens the recovery circuit after a failed recovery', () => {
       dbManager.close();
       fs.writeFileSync(path.join(tmpDir, 'sessions.db'), 'corrupt database');

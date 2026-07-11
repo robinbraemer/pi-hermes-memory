@@ -295,6 +295,8 @@ For users who prefer source anchors over snippets, `sessionSearch.variant` can b
 
 The extension keeps Markdown memory as the human-readable source of truth, and mirrors successful writes into the SQLite-backed search store used by `memory_search`.
 
+Markdown overwrites retain displaced originals at stable recovery paths for seven days so late writes through an already-open editor handle remain recoverable. After that finite grace period, each original becomes a durable retired snapshot; later writes prune retired snapshots older than 30 days and cap each Markdown target at 32 files or 64 MiB, whichever limit is reached first.
+
 This means:
 - Fresh `memory` tool writes become searchable immediately
 - `/memory-sync-markdown` reconciles older Markdown entries and removes stale SQLite mirror rows

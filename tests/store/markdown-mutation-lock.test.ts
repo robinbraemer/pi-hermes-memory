@@ -10,22 +10,24 @@ describe("markdown mutation lock", () => {
   it("preserves a committed result and recovers release before the next acquire", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "markdown-lock-test-"));
     const filePath = path.join(tmpDir, "memory", "MEMORY.md");
-    const originalRelease = AtomicLockCoordinator.prototype.release;
-    let failRelease = true;
-    AtomicLockCoordinator.prototype.release = function (key: string, token: string): void {
-      if (failRelease) throw new Error("injected release failure");
-      return originalRelease.call(this, key, token);
+    const prototype = AtomicLockCoordinator.prototype as any;
+    const originalDeleteOwnedLock = prototype.deleteOwnedLock;
+    let deleteAttempts = 0;
+    prototype.deleteOwnedLock = function (key: string, token: string): void {
+      deleteAttempts++;
+      if (deleteAttempts <= 3) throw new Error("injected release failure");
+      return originalDeleteOwnedLock.call(this, key, token);
     };
 
     try {
       const first = await withMarkdownMutationLock(filePath, async () => "committed");
       assert.equal(first, "committed");
 
-      failRelease = false;
       const second = await withMarkdownMutationLock(filePath, async () => "next mutation");
       assert.equal(second, "next mutation");
+      assert.ok(deleteAttempts >= 4);
     } finally {
-      AtomicLockCoordinator.prototype.release = originalRelease;
+      prototype.deleteOwnedLock = originalDeleteOwnedLock;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

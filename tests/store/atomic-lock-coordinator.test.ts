@@ -108,4 +108,31 @@ describe('AtomicLockCoordinator', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('retries a failed owner release before the next same-process acquisition', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'atomic-lock-test-'));
+    const prototype = AtomicLockCoordinator.prototype as any;
+    const originalDeleteOwnedLock = prototype.deleteOwnedLock;
+    let deleteAttempts = 0;
+    prototype.deleteOwnedLock = function (key: string, token: string): void {
+      deleteAttempts++;
+      if (deleteAttempts <= 3) throw new Error('injected release failure');
+      return originalDeleteOwnedLock.call(this, key, token);
+    };
+
+    try {
+      const coordinator = new AtomicLockCoordinator(path.join(tmpDir, 'locks.sqlite'));
+      const first = coordinator.tryAcquire('shared', { staleMs: 60_000 });
+      assert.ok(first);
+      assert.doesNotThrow(() => first.release());
+
+      const second = coordinator.tryAcquire('shared', { staleMs: 60_000 });
+      assert.ok(second);
+      assert.equal(deleteAttempts, 4);
+      second.release();
+    } finally {
+      prototype.deleteOwnedLock = originalDeleteOwnedLock;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
