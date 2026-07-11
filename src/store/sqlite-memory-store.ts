@@ -497,7 +497,7 @@ function readLegacyFailureScopeAssignments(dbManager: DatabaseManager): Map<stri
 
   try {
     const parsed = JSON.parse(row.value) as { version?: unknown; assignments?: unknown };
-    if (parsed.version !== 1 || !Array.isArray(parsed.assignments)) return new Map();
+    if (parsed.version !== 1 || !Array.isArray(parsed.assignments)) return null;
     const assignments = new Map<string, string[]>();
     for (const value of parsed.assignments) {
       if (!value || typeof value !== 'object') continue;
@@ -511,7 +511,7 @@ function readLegacyFailureScopeAssignments(dbManager: DatabaseManager): Map<stri
     }
     return assignments;
   } catch {
-    return new Map();
+    return null;
   }
 }
 

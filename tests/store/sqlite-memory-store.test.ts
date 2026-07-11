@@ -140,6 +140,30 @@ describe('sqlite-memory-store', () => {
       assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
     });
 
+    it('reconstructs legacy scope assignments when persisted metadata is corrupt', () => {
+      const content = '[correction] use pnpm — Project: project-a';
+      const raw = `${content} <!-- created=2026-05-08, last=2026-05-09 -->`;
+      addMemory(dbManager, content, 'failure', 'project-a', 'correction');
+      dbManager.getDb().prepare(`
+        INSERT OR REPLACE INTO extension_metadata (key, value)
+        VALUES (?, ?)
+      `).run('markdown-failure-legacy-scopes-v1', '{not-json');
+
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: 'project-a' }).length, 1);
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
+      const metadata = dbManager.getDb().prepare(`
+        SELECT value FROM extension_metadata WHERE key = ?
+      `).get('markdown-failure-legacy-scopes-v1') as { value: string };
+      const parsed = JSON.parse(metadata.value) as {
+        version: number;
+        assignments: Array<{ identity: string; projects: string[] }>;
+      };
+      assert.strictEqual(parsed.version, 1);
+      assert.deepStrictEqual(parsed.assignments.map((entry) => entry.projects), [['project-a']]);
+    });
+
     it('allows an identical global failure after one-time legacy scope inference', () => {
       const content = '[correction] use pnpm — Project: project-a';
       const raw = `${content} <!-- created=2026-05-08, last=2026-05-09 -->`;
