@@ -974,6 +974,7 @@ export class MemoryStore {
       const activeCandidates = active
         .filter((item): item is NonNullable<typeof item> => item !== null)
         .sort((left, right) => right.state.mtimeMs - left.state.mtimeMs);
+      const newlyRetiredPaths = new Set<string>();
       let activeCount = 0;
       let activeBytes = 0;
       for (const item of activeCandidates) {
@@ -987,7 +988,7 @@ export class MemoryStore {
           activeBytes += item.state.size;
           continue;
         }
-        try { await this.retireRecoveryFile(item.path, filePath); } catch {}
+        try { newlyRetiredPaths.add(await this.retireRecoveryFile(item.path, filePath)); } catch {}
       }
 
       const retiredNames = (await fs.readdir(directory)).filter(
@@ -1005,7 +1006,10 @@ export class MemoryStore {
       const maxAgeCutoff = Date.now() - RETIRED_RECOVERY_MAX_AGE_MS;
       const candidates = retired
         .filter((item): item is NonNullable<typeof item> => item !== null)
-        .sort((left, right) => right.state.mtimeMs - left.state.mtimeMs);
+        .sort((left, right) => {
+          const retirementPriority = Number(newlyRetiredPaths.has(right.path)) - Number(newlyRetiredPaths.has(left.path));
+          return retirementPriority || right.state.mtimeMs - left.state.mtimeMs;
+        });
       let retainedCount = 0;
       let retainedBytes = 0;
       for (const item of candidates) {
@@ -1053,32 +1057,27 @@ export class MemoryStore {
     }
   }
 
-  private async retireRecoveryFile(recoveryPath: string, filePath: string): Promise<void> {
+  private async retireRecoveryFile(recoveryPath: string, filePath: string): Promise<string> {
     const retiredPath = this.retiredRecoveryPathFor(filePath);
-    const snapshotPath = `${retiredPath}.tmp`;
-    const snapshot = await fs.readFile(recoveryPath);
-    let snapshotIdentity: { dev: number; ino: number } | null = null;
+    const recoveryIdentity = await this.fileIdentity(recoveryPath);
+    await fs.link(recoveryPath, retiredPath);
+    let currentIdentity: { dev: number; ino: number };
     try {
-      const handle = await fs.open(snapshotPath, "wx", 0o600);
-      try {
-        const state = await handle.stat();
-        snapshotIdentity = { dev: state.dev, ino: state.ino };
-        await handle.writeFile(snapshot);
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      await fs.rename(snapshotPath, retiredPath);
-      await fs.unlink(recoveryPath);
+      currentIdentity = await this.fileIdentity(recoveryPath);
     } catch (error) {
-      if (snapshotIdentity) {
-        try {
-          const currentIdentity = await this.fileIdentity(snapshotPath);
-          if (this.sameFileIdentity(currentIdentity, snapshotIdentity)) await fs.unlink(snapshotPath);
-        } catch {}
-      }
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return retiredPath;
+      try { await fs.unlink(retiredPath); } catch {}
       throw error;
     }
+    if (!this.sameFileIdentity(currentIdentity, recoveryIdentity)) return retiredPath;
+    try {
+      await fs.unlink(recoveryPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return retiredPath;
+      try { await fs.unlink(retiredPath); } catch {}
+      throw error;
+    }
+    return retiredPath;
   }
 
   private async preserveConflictFile(sourcePath: string, filePath: string, kind: string): Promise<string> {

@@ -1603,6 +1603,41 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       assert.ok(activeStats.reduce((total, stat) => total + stat.size, 0) <= 64 * 1024 * 1024);
     });
 
+    it("keeps cap-retired recovery inodes reachable for late writes", async () => {
+      const pathStore = new MemoryStore(makeConfig());
+      const cappedPath = path.join(MEMORY_DIR, "cap-retirement.md");
+      const displacedPath = (pathStore as any).recoveryPathFor(cappedPath) as string;
+      await writeRaw(displacedPath, `${TEST_MARKER} recovery awaiting cap retirement`);
+      const oldest = new Date(Date.now() - 60_000);
+      await fs.utimes(displacedPath, oldest, oldest);
+      const handle = await fs.open(displacedPath, "r+");
+
+      try {
+        for (let index = 0; index < 32; index++) {
+          const retiredPath = (pathStore as any).retiredRecoveryPathFor(cappedPath) as string;
+          await writeRaw(retiredPath, `${TEST_MARKER} existing retired recovery ${index}`);
+        }
+        for (let index = 0; index < 32; index++) {
+          const recoveryPath = (pathStore as any).recoveryPathFor(cappedPath) as string;
+          await writeRaw(recoveryPath, `${TEST_MARKER} newer active recovery ${index}`);
+        }
+
+        await (pathStore as any).pruneRecoveryFiles(cappedPath);
+        await handle.truncate(0);
+        await handle.writeFile(`${TEST_MARKER} late cap-retired descriptor write`, "utf-8");
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+
+      const retiredNames = (await fs.readdir(MEMORY_DIR))
+        .filter((name) => name.startsWith(`.${path.basename(cappedPath)}.retired-`));
+      const retiredContents = await Promise.all(
+        retiredNames.map((name) => fs.readFile(path.join(MEMORY_DIR, name), "utf-8")),
+      );
+      assert.ok(retiredContents.some((content) => content.includes("late cap-retired descriptor write")));
+    });
+
     it("preserves the recovery generation referenced by an active publication marker", async () => {
       const pathStore = new MemoryStore(makeConfig());
       const referencedPath = (pathStore as any).recoveryPathFor(memoryPath) as string;
@@ -1701,23 +1736,47 @@ describe("MemoryStore", { concurrency: 1 }, () => {
       }
     });
 
-    it("preserves an unowned retired temp snapshot on name collision", async () => {
+    it("preserves an unowned retired destination on name collision", async () => {
       const store = new MemoryStore(makeConfig());
       const recoveryPath = (store as any).recoveryPathFor(memoryPath) as string;
       const retiredPath = (store as any).retiredRecoveryPathFor(memoryPath) as string;
-      const snapshotPath = `${retiredPath}.tmp`;
       await writeRaw(recoveryPath, `${TEST_MARKER} recovery awaiting retirement`);
-      await writeRaw(snapshotPath, `${TEST_MARKER} unowned colliding snapshot`);
+      await writeRaw(retiredPath, `${TEST_MARKER} unowned colliding snapshot`);
       (store as any).retiredRecoveryPathFor = () => retiredPath;
 
       try {
         await assert.rejects((store as any).retireRecoveryFile(recoveryPath, memoryPath), { code: "EEXIST" });
-        assert.equal(await readRaw(snapshotPath), `${TEST_MARKER} unowned colliding snapshot`);
+        assert.equal(await readRaw(retiredPath), `${TEST_MARKER} unowned colliding snapshot`);
         assert.equal(await readRaw(recoveryPath), `${TEST_MARKER} recovery awaiting retirement`);
       } finally {
-        await removeFile(snapshotPath);
+        await removeFile(retiredPath);
         await removeFile(recoveryPath);
       }
+    });
+
+    it("retains the retired inode when the active pathname disappears during retirement", async () => {
+      const store = new MemoryStore(makeConfig());
+      const recoveryPath = (store as any).recoveryPathFor(memoryPath) as string;
+      const retiredPath = (store as any).retiredRecoveryPathFor(memoryPath) as string;
+      await writeRaw(recoveryPath, `${TEST_MARKER} concurrently displaced recovery`);
+      (store as any).retiredRecoveryPathFor = () => retiredPath;
+      const originalFileIdentity = (store as any).fileIdentity.bind(store);
+      let identityReads = 0;
+      (store as any).fileIdentity = async (candidatePath: string) => {
+        identityReads++;
+        if (identityReads === 2) {
+          await fs.unlink(candidatePath);
+          const error = new Error("disappeared") as NodeJS.ErrnoException;
+          error.code = "ENOENT";
+          throw error;
+        }
+        return originalFileIdentity(candidatePath);
+      };
+
+      const result = await (store as any).retireRecoveryFile(recoveryPath, memoryPath);
+
+      assert.equal(result, retiredPath);
+      assert.equal(await readRaw(retiredPath), `${TEST_MARKER} concurrently displaced recovery`);
     });
 
     it("bounds generated conflict artifacts without following lookalike symlinks", async () => {
