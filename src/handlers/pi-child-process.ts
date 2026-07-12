@@ -195,6 +195,40 @@ function resolvedPiCliPath(options: ResolveChildPiInvocationOptions): string | u
   return resolvedInstalledPiCliPath();
 }
 
+function resolvedWindowsPiInvocation(
+  args: string[],
+  execPath: string,
+): ChildPiInvocation | undefined {
+  const pathEntries = (process.env.PATH ?? process.env.Path ?? "")
+    .split(";")
+    .map((entry) => entry.trim().replace(/^"|"$/g, ""))
+    .filter(Boolean);
+
+  for (const directory of pathEntries) {
+    for (const executableName of ["pi.exe", "pi.com"]) {
+      const executablePath = join(directory, executableName);
+      if (existsSync(executablePath)) {
+        return { command: executablePath, args };
+      }
+    }
+
+    if (!existsSync(join(directory, "pi.cmd")) && !existsSync(join(directory, "pi.bat"))) {
+      continue;
+    }
+
+    for (const cliPath of [
+      join(directory, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "cli.js"),
+      join(directory, "node_modules", "@earendil-works", "pi-coding-agent", "cli.js"),
+    ]) {
+      if (existsSync(cliPath)) {
+        return { command: execPath, args: [cliPath, ...args] };
+      }
+    }
+  }
+
+  return undefined;
+}
+
 export function resolveChildPiInvocation(
   args: string[],
   options: ResolveChildPiInvocationOptions = {},
@@ -205,25 +239,30 @@ export function resolveChildPiInvocation(
   }
 
   const piCliPath = resolvedPiCliPath(options);
-  if (!piCliPath) {
-    return { command: "pi", args };
+  if (piCliPath) {
+    return {
+      command: options.execPath ?? process.execPath,
+      args: [piCliPath, ...args],
+    };
   }
 
-  return {
-    command: options.execPath ?? process.execPath,
-    args: [piCliPath, ...args],
-  };
+  const fallback = resolvedWindowsPiInvocation(args, options.execPath ?? process.execPath);
+  if (fallback) return fallback;
+
+  throw new Error("Unable to resolve a directly executable Pi CLI on Windows");
 }
 
 export function resolveWatchedChildPiInvocation(
   invocation: ChildPiInvocation,
   timeoutMs: number,
+  cancellationPath = "-",
 ): ChildPiInvocation {
   return {
     command: process.execPath,
     args: [
       CHILD_PROCESS_WATCHDOG_PATH,
       String(timeoutMs),
+      cancellationPath,
       invocation.command,
       ...invocation.args,
     ],
@@ -286,17 +325,23 @@ export async function execChildPrompt(
 ): Promise<PiExecResult> {
   await sweepStalePromptDirectories();
   const execOptions = {
-    signal: options.signal,
     timeout: options.timeoutMs + WATCHDOG_EXIT_GRACE_MS,
   };
   const temporaryPrompt = await writePromptToTemporaryFile(prompt);
   const promptReference = `@${temporaryPrompt.filePath}`;
+  const cancellationPath = join(temporaryPrompt.dir, "cancel");
+  const requestCancellation = () => {
+    void fs.writeFile(cancellationPath, "", { mode: 0o600 }).catch(() => {});
+  };
+  options.signal?.addEventListener("abort", requestCancellation, { once: true });
+  if (options.signal?.aborted) requestCancellation();
 
   try {
     try {
       const invocation = resolveWatchedChildPiInvocation(
         resolveChildPiInvocation(buildChildPiPromptArgs(promptReference, config)),
         options.timeoutMs,
+        cancellationPath,
       );
       const result = await pi.exec(invocation.command, invocation.args, execOptions) as PiExecResult;
       if (
@@ -320,9 +365,11 @@ export async function execChildPrompt(
     const retryInvocation = resolveWatchedChildPiInvocation(
       resolveChildPiInvocation(basePromptArgs(promptReference, config)),
       options.timeoutMs,
+      cancellationPath,
     );
     return await pi.exec(retryInvocation.command, retryInvocation.args, execOptions) as PiExecResult;
   } finally {
+    options.signal?.removeEventListener("abort", requestCancellation);
     try {
       await dependencies.removeTemporaryDirectory(temporaryPrompt.dir);
     } catch {

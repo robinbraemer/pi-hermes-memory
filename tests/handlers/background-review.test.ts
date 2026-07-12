@@ -6,7 +6,7 @@ import {
   buildSubprocessReviewPrompt,
   setupBackgroundReview,
 } from "../../src/handlers/background-review.js";
-import { resolveChildPiInvocation } from "../../src/handlers/pi-child-process.js";
+import { resolveWatchedChildPiInvocation } from "../../src/handlers/pi-child-process.js";
 import type { DirectReviewResult } from "../../src/handlers/review-memory-ops.js";
 
 // ─── Mock infrastructure ───
@@ -140,11 +140,11 @@ async function waitForExecCalls(count: number, timeoutMs = 1_000) {
 
 function logicalChildArgs(index = execCalls.length - 1): string[] {
   const [cmd, args] = execCalls[index];
-  const logicalArgs = cmd === "pi" ? args : args.slice(1);
-  const expected = resolveChildPiInvocation(logicalArgs);
+  const underlying = { command: args[3], args: args.slice(4) };
+  const expected = resolveWatchedChildPiInvocation(underlying, Number(args[1]), args[2]);
   assert.strictEqual(cmd, expected.command);
   assert.deepStrictEqual(args, expected.args);
-  return logicalArgs;
+  return underlying.command === "pi" ? underlying.args : underlying.args.slice(1);
 }
 
 function reviewPrompt(index = execCalls.length - 1): string {

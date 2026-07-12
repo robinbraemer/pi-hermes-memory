@@ -2,7 +2,7 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { setupSessionFlush } from "../../src/handlers/session-flush.js";
-import { resolveChildPiInvocation } from "../../src/handlers/pi-child-process.js";
+import { resolveWatchedChildPiInvocation } from "../../src/handlers/pi-child-process.js";
 import { FLUSH_PROMPT } from "../../src/constants.js";
 import type { MemoryConfig } from "../../src/types.js";
 
@@ -97,11 +97,11 @@ const mockStore = { getMemoryEntries: () => [], getUserEntries: () => [] } as an
 
 function logicalChildArgs(call: { args: any[] }): string[] {
   const [cmd, args] = call.args;
-  const logicalArgs = cmd === "pi" ? args : args.slice(1);
-  const expected = resolveChildPiInvocation(logicalArgs);
+  const underlying = { command: args[3], args: args.slice(4) };
+  const expected = resolveWatchedChildPiInvocation(underlying, Number(args[1]), args[2]);
   assert.equal(cmd, expected.command);
   assert.deepEqual(args, expected.args);
-  return logicalArgs;
+  return underlying.command === "pi" ? underlying.args : underlying.args.slice(1);
 }
 
 function flushMessage(call: { args: any[] }): string {
@@ -248,7 +248,7 @@ describe("setupSessionFlush", () => {
 
     // Options should include timeout
     assert.ok(opts, "options should be passed");
-    assert.equal(opts.timeout, 30000);
+    assert.equal(opts.timeout, 35000);
   });
 
   it("passes child LLM override args to flush subprocesses", async () => {
@@ -391,7 +391,7 @@ describe("setupSessionFlush", () => {
     assert.equal(mockPi.execCalls.length, 2, "both events should trigger flush");
   });
 
-  it("Passes signal from compact event to exec", async () => {
+  it("Routes compact cancellation through the watchdog", async () => {
     const config = defaultConfig();
     setupSessionFlush(mockPi.pi, mockStore, null, config);
 
@@ -405,6 +405,6 @@ describe("setupSessionFlush", () => {
 
     assert.equal(mockPi.execCalls.length, 1);
     const opts = mockPi.execCalls[0].args[2];
-    assert.equal(opts.signal, signal, "signal should be forwarded to exec");
+    assert.equal(opts.signal, undefined, "signal must not be forwarded to the watchdog process");
   });
 });
