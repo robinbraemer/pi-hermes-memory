@@ -113,6 +113,10 @@ export class MemoryStore {
     return entries.length ? entries.join(ENTRY_DELIMITER).length : 0;
   }
 
+  getPersistedCharCount(target: "memory" | "user" | "failure"): number {
+    return this.charCount(target);
+  }
+
   private memoryOverflowStrategy(): MemoryOverflowStrategy {
     return this.config.memoryOverflowStrategy ?? (this.config.autoConsolidate ? "auto-consolidate" : "reject");
   }

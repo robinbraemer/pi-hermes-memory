@@ -138,6 +138,26 @@ describe("applyReviewOperations", () => {
     assert.strictEqual(result.skippedCount, 1);
   });
 
+  it("rejects operations outside an allowed target set", async () => {
+    const store = new MemoryStore({
+      memoryDir: tmpDir,
+      memoryCharLimit: 5000,
+      userCharLimit: 5000,
+      autoConsolidate: true,
+    });
+    await store.loadFromDisk();
+
+    const result = await applyReviewOperations(store, null, [
+      { action: "add", target: "memory", content: "allowed memory fact" },
+      { action: "add", target: "user", content: "disallowed user fact" },
+    ], null, null, ["memory"]);
+
+    assert.strictEqual(result.appliedCount, 1);
+    assert.strictEqual(result.skippedCount, 1);
+    assert.deepStrictEqual(store.getMemoryEntries(), ["allowed memory fact"]);
+    assert.deepStrictEqual(store.getUserEntries(), []);
+  });
+
   it("uses the in-lock mutation observer as the sole SQLite reconciliation path", async () => {
     const store = new MemoryStore({
       memoryDir: tmpDir,

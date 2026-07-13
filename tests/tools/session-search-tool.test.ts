@@ -180,7 +180,7 @@ describe("registerSessionSearchTool", () => {
           messages: [{
             id: `aggregate-message-${index}`,
             role: "assistant",
-            content: `needle-${index} ${"z".repeat(10_000)}`,
+            content: `needle-${index} ${"z".repeat(3_000)}`,
             timestamp: `2026-07-11T00:${String(index).padStart(2, "0")}:00.000Z`,
           }],
         });
@@ -196,6 +196,7 @@ describe("registerSessionSearchTool", () => {
 
       assert.ok(output.length <= 50 * 1024, `expected <= 50 KiB, got ${output.length}`);
       assert.strictEqual(result.details.outputTruncated, true);
+      assert.strictEqual(result.details.truncatedCount, 1);
       assert.match(output, /output truncated/);
       assert.match(output, /refine the query or lower the result limit/);
     } finally {

@@ -45,7 +45,7 @@ describe('registerMemorySearchTool', () => {
   it('enforces the aggregate ceiling across twenty large matches', async () => {
     const dbManager = makeDbManager();
     for (let index = 0; index < 20; index++) {
-      addMemory(dbManager, `synthetic-memory-needle-${index} ${'z'.repeat(10_000)}`, 'memory', `synthetic-project-${index}`);
+      addMemory(dbManager, `synthetic-memory-needle-${index} ${'z'.repeat(3_000)}`, 'memory', `synthetic-project-${index}`);
     }
     const captured = captureTool(dbManager);
 
@@ -58,6 +58,7 @@ describe('registerMemorySearchTool', () => {
 
     assert.ok(output.length <= 50 * 1024);
     assert.strictEqual(result.details.outputTruncated, true);
+    assert.strictEqual(result.details.truncatedCount, 1);
     assert.match(output, /output truncated/);
     dbManager.close();
   });

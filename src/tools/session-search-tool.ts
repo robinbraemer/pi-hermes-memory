@@ -226,7 +226,9 @@ Returns bounded conversation snippets with session dates and project context. La
         });
 
         const snippet = truncateLegacySnippet(r.snippet, snippetChars);
-        if (r.snippetTruncated || snippet.truncated) truncatedCount += 1;
+        const contextTruncated = [...r.window, ...r.bookendStart, ...r.bookendEnd]
+          .some((message) => message.snippetTruncated);
+        if (r.snippetTruncated || snippet.truncated || contextTruncated) truncatedCount += 1;
         const anchorIndex = r.window.findIndex((message) => message.anchor);
         const before = anchorIndex < 0 ? 0 : anchorIndex;
         const after = anchorIndex < 0 ? 0 : r.window.length - anchorIndex - 1;
@@ -251,13 +253,14 @@ Returns bounded conversation snippets with session dates and project context. La
       }
 
       const output = capLegacyOutput(blocks.join('\n\n').trim());
+      const reportedTruncatedCount = output.truncated ? Math.max(1, truncatedCount) : truncatedCount;
       const finalResult: SearchResult = {
         success: true,
         count: results.length,
         candidateCount: search.candidateCount,
         sourceCount: search.sourceCount,
         omittedCount: search.omittedCount,
-        truncatedCount,
+        truncatedCount: reportedTruncatedCount,
         snippetChars,
         outputChars: output.text.length,
         outputTruncated: output.truncated,

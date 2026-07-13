@@ -36,6 +36,7 @@ export interface RunDirectMemoryCompletionOptions {
   config: Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride">;
   timeoutMs?: number;
   signal?: AbortSignal;
+  allowedTargets?: readonly ReviewMemoryOperation["target"][];
 }
 
 /** Shared transport gate: review/flush/consolidation/correction all default to
@@ -209,11 +210,17 @@ export async function applyReviewOperations(
   operations: ReviewMemoryOperation[],
   _dbManager: DatabaseManager | null = null,
   _projectName?: string | null,
+  allowedTargets?: readonly ReviewMemoryOperation["target"][],
 ): Promise<ApplyReviewOperationsResult> {
   let appliedCount = 0;
   let skippedCount = 0;
+  const allowedTargetSet = allowedTargets ? new Set(allowedTargets) : null;
 
   for (const op of operations) {
+    if (allowedTargetSet && !allowedTargetSet.has(op.target)) {
+      skippedCount++;
+      continue;
+    }
     if (op.target === "project" && !projectStore) {
       skippedCount++;
       continue;
@@ -365,6 +372,7 @@ export async function runDirectMemoryCompletion(
       operations,
       dbManager,
       projectName,
+      options.allowedTargets,
     );
     return { ok: true, appliedCount };
   } catch (err) {

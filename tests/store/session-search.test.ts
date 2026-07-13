@@ -250,7 +250,7 @@ describe('session-search', () => {
           { id: 'synthetic-context-1', role: 'user', content: 'synthetic opener', timestamp: '2026-01-01T00:00:00Z' },
           { id: 'synthetic-context-2', role: 'assistant', content: 'synthetic earlier prose', timestamp: '2026-01-01T00:01:00Z' },
           { id: 'synthetic-context-3', role: 'system', content: 'synthetic system prose', timestamp: '2026-01-01T00:02:00Z' },
-          { id: 'synthetic-context-4', role: 'user', content: 'synthetic previous prose', timestamp: '2026-01-01T00:03:00Z' },
+          { id: 'synthetic-context-4', role: 'user', content: `synthetic previous prose ${'p'.repeat(500)} context needle`, timestamp: '2026-01-01T00:03:00Z' },
           { id: 'synthetic-context-5', role: 'assistant', content: `synthetic ${'x'.repeat(500)} context needle ${'y'.repeat(500)}`, timestamp: '2026-01-01T00:04:00Z' },
           { id: 'synthetic-context-6', role: 'assistant', content: 'synthetic next prose', timestamp: '2026-01-01T00:05:00Z' },
           { id: 'synthetic-context-7', role: 'user', content: 'synthetic closer', timestamp: '2026-01-01T00:06:00Z' },
@@ -276,6 +276,10 @@ describe('session-search', () => {
       assert.strictEqual(new Set(ids).size, ids.length);
       assert.ok(result.window.every((message) => message.role === 'user' || message.role === 'assistant'));
       assert.strictEqual(result.window.find((message) => message.anchor)?.id, 'synthetic-context-5');
+      const previous = result.window.find((message) => message.id === 'synthetic-context-4')!;
+      assert.match(previous.snippet, /context needle/);
+      assert.strictEqual(previous.snippetTruncated, true);
+      assert.ok(previous.contentChars > previous.snippet.length);
       assert.ok([...result.window, ...result.bookendStart, ...result.bookendEnd]
         .every((message) => message.snippet.length <= (message.anchor ? 120 : 240)));
     });
@@ -312,7 +316,9 @@ describe('session-search', () => {
       assert.ok(contextQueries.length > 0);
       assert.ok(contextQueries.every((source) => source.includes('COUNT(*)') || source.includes('LIMIT 1')));
       assert.ok(contextQueries.filter((source) => !source.includes('COUNT(*)'))
-        .every((source) => source.includes('substr(content, 1, ?)')));
+        .every((source) => source.includes('length(content) AS contentChars') && !source.includes(' content,')));
+      const fragmentQueries = statements.filter((source) => source.includes('substr(content, ?, ?)') && source.includes('WHERE id = ?'));
+      assert.ok(fragmentQueries.length > 0);
     });
 
     it('should find messages matching a search query', () => {

@@ -129,13 +129,14 @@ Returns matching memory entries with project context and dates.`,
       }
 
       const output = boundMemoryOutput(blocks.join('\n\n').trim());
+      const reportedTruncatedCount = output.truncated ? Math.max(1, truncatedCount) : truncatedCount;
       const finalResult: SearchResult = {
         success: true,
         count: results.length,
         candidateCount: search.candidateCount,
         sourceCount: search.sourceCount,
         omittedCount: search.omittedCount,
-        truncatedCount,
+        truncatedCount: reportedTruncatedCount,
         snippetChars,
         outputChars: output.text.length,
         outputTruncated: output.truncated,

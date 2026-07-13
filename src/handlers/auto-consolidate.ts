@@ -32,6 +32,7 @@ type ToolMemoryTarget = MemoryTarget | "project";
 type ConsolidationLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride" | "reviewTransport">;
 
 const CONSOLIDATION_LOCK_STALE_GRACE_MS = 30000;
+const CONSOLIDATION_MAX_TRANSPORT_ATTEMPTS = 3;
 const CONSOLIDATION_LOCK_ENV = "PI_HERMES_CONSOLIDATION_LOCK_DIR";
 
 interface ConsolidationLock {
@@ -64,7 +65,10 @@ async function tryAcquireConsolidationLock(
   const coordinator = new AtomicLockCoordinator(path.join(root, "locks.sqlite"));
   const lease = coordinator.tryAcquire(
     consolidationLockKey(target, toolTarget, storageIdentity),
-    { staleMs: Math.max(timeoutMs, 0) + CONSOLIDATION_LOCK_STALE_GRACE_MS },
+    {
+      staleMs: (Math.max(timeoutMs, 0) * CONSOLIDATION_MAX_TRANSPORT_ATTEMPTS)
+        + CONSOLIDATION_LOCK_STALE_GRACE_MS,
+    },
   );
   return lease ? { release: async () => lease.release() } : null;
 }
@@ -125,6 +129,7 @@ export async function triggerConsolidation(
     const currentContent = entries.join(ENTRY_DELIMITER);
 
     if (directCtx && usesDirectTransport(llmConfig)) {
+      const currentPersistedChars = store.getPersistedCharCount(target);
       try {
         const directResult = await runDirect(
           directCtx,
@@ -141,12 +146,13 @@ export async function triggerConsolidation(
             config: llmConfig,
             timeoutMs,
             signal,
+            allowedTargets: [toolTarget],
           },
           dbManager,
           projectName,
         );
-        const updatedContent = entriesForTarget(store, target).join(ENTRY_DELIMITER);
-        if (directResult.ok && updatedContent.length < currentContent.length) {
+        const updatedPersistedChars = store.getPersistedCharCount(target);
+        if (directResult.ok && updatedPersistedChars < currentPersistedChars) {
           return { consolidated: true };
         }
       } catch {

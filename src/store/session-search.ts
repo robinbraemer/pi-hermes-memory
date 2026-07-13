@@ -19,6 +19,8 @@ export interface SessionContextMessage {
   role: string;
   timestamp: string;
   snippet: string;
+  snippetTruncated: boolean;
+  contentChars: number;
   anchor: boolean;
 }
 
@@ -92,7 +94,7 @@ interface RankedCandidate extends CandidateRow {
 interface StoredMessage {
   id: string;
   role: string;
-  content: string;
+  contentChars: number;
   timestamp: string;
 }
 
@@ -101,6 +103,7 @@ const MIN_SNIPPET_CHARS = 100;
 const MAX_SNIPPET_CHARS = 4_000;
 const MAX_CANDIDATES = 300;
 const CONTEXT_SNIPPET_CHARS = 240;
+const MAX_CONTEXT_QUERY_TERMS = 16;
 const DEMOTED_SOURCES = new Set(['cron', 'automation']);
 
 function clampInteger(value: number | undefined, fallback: number, min: number, max: number): number {
@@ -184,6 +187,95 @@ function applyProjectSourceDiversity(
   return selected;
 }
 
+function contextQueryTerms(query: string): string[] {
+  const terms: string[] = [];
+  const seen = new Set<string>();
+  for (const term of collectNaturalLanguageTerms(query)) {
+    const normalized = term.toLocaleLowerCase('en-US');
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    terms.push(normalized);
+    if (terms.length === MAX_CONTEXT_QUERY_TERMS) break;
+  }
+  return terms;
+}
+
+function centeredContextStart(
+  contentChars: number,
+  anchorStart: number,
+  anchorChars: number,
+  budget: number,
+): number {
+  if (anchorStart < 0) return 0;
+  const remaining = Math.max(0, budget - anchorChars);
+  let start = Math.max(0, anchorStart - Math.floor(remaining / 2));
+  let end = start + budget;
+  if (end > contentChars) {
+    start = Math.max(0, start - (end - contentChars));
+    end = contentChars;
+  }
+  return start;
+}
+
+function loadContextSnippet(
+  db: ReturnType<DatabaseManager['getDb']>,
+  message: StoredMessage,
+  query: string,
+): { text: string; truncated: boolean; contentChars: number } {
+  if (message.contentChars <= 0) {
+    return { text: '', truncated: false, contentChars: 0 };
+  }
+
+  const terms = contextQueryTerms(query);
+  let anchorStart = -1;
+  let anchorChars = 0;
+  if (terms.length > 0) {
+    const projections = terms.map((_, index) => `instr(lower(content), ?) AS position_${index}`);
+    const positions = db.prepare(`
+      SELECT ${projections.join(', ')}
+      FROM messages
+      WHERE id = ?
+    `).get(...terms, message.id) as Record<string, number> | undefined;
+    for (let index = 0; index < terms.length; index++) {
+      const position = positions?.[`position_${index}`] ?? 0;
+      if (position > 0 && (anchorStart < 0 || position - 1 < anchorStart)) {
+        anchorStart = position - 1;
+        anchorChars = Array.from(terms[index]).length;
+      }
+    }
+  }
+
+  let bodyBudget = CONTEXT_SNIPPET_CHARS;
+  let start = 0;
+  let prefix = false;
+  let suffix = false;
+  if (message.contentChars > CONTEXT_SNIPPET_CHARS) {
+    bodyBudget = CONTEXT_SNIPPET_CHARS - 2;
+    start = centeredContextStart(message.contentChars, anchorStart, anchorChars, bodyBudget);
+    prefix = start > 0;
+    suffix = start + bodyBudget < message.contentChars;
+    bodyBudget = CONTEXT_SNIPPET_CHARS - Number(prefix) - Number(suffix);
+    start = centeredContextStart(message.contentChars, anchorStart, anchorChars, bodyBudget);
+    prefix = start > 0;
+    suffix = start + bodyBudget < message.contentChars;
+    bodyBudget = CONTEXT_SNIPPET_CHARS - Number(prefix) - Number(suffix);
+  }
+
+  const row = db.prepare(`
+    SELECT substr(content, ?, ?) AS fragment
+    FROM messages
+    WHERE id = ?
+  `).get(start + 1, bodyBudget, message.id) as { fragment: string } | undefined;
+  const fragment = row?.fragment ?? '';
+  const boundedFragment = termLocalSnippet(fragment, query, bodyBudget);
+  const text = `${prefix ? '…' : ''}${boundedFragment.text}${suffix ? '…' : ''}`;
+  return {
+    text,
+    truncated: prefix || suffix || boundedFragment.truncated,
+    contentChars: message.contentChars,
+  };
+}
+
 function loadContext(
   db: ReturnType<DatabaseManager['getDb']>,
   candidate: RankedCandidate,
@@ -200,13 +292,12 @@ function loadContext(
   const after = '(timestamp > ? OR (timestamp = ? AND id > ?))';
   const anchorOrderParams = [candidate.timestamp, candidate.timestamp, candidate.message_id];
   const selectMessage = (direction: 'before' | 'after', order: 'ASC' | 'DESC'): StoredMessage[] => db.prepare(`
-    SELECT id, role, substr(content, 1, ?) AS content, timestamp
+    SELECT id, role, length(content) AS contentChars, timestamp
     FROM messages
     WHERE session_id = ? AND ${eligibility} AND ${direction === 'before' ? before : after}
     ORDER BY timestamp ${order}, id ${order}
     LIMIT 1
   `).all(
-    CONTEXT_SNIPPET_CHARS,
     candidate.session_id,
     ...eligibilityParams,
     ...anchorOrderParams,
@@ -226,16 +317,21 @@ function loadContext(
   const anchor: StoredMessage = {
     id: candidate.message_id,
     role: candidate.role,
-    content: candidate.content,
+    contentChars: candidate.content.length,
     timestamp: candidate.timestamp,
   };
   const toContext = (message: StoredMessage): SessionContextMessage => {
     const anchor = message.id === candidate.message_id;
+    const snippet = anchor
+      ? { text: anchorSnippet.text, truncated: anchorSnippet.truncated, contentChars: candidate.content.length }
+      : loadContextSnippet(db, message, query);
     return {
       id: message.id,
       role: message.role,
       timestamp: message.timestamp,
-      snippet: anchor ? anchorSnippet.text : termLocalSnippet(message.content, query, CONTEXT_SNIPPET_CHARS).text,
+      snippet: snippet.text,
+      snippetTruncated: snippet.truncated,
+      contentChars: snippet.contentChars,
       anchor,
     };
   };
