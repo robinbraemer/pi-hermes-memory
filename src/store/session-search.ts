@@ -62,6 +62,13 @@ export interface SessionSearchOptions {
   candidateLimit?: number;
 }
 
+export interface SessionSearchResponse {
+  results: SessionSearchResult[];
+  candidateCount: number;
+  sourceCount: number;
+  omittedCount: number;
+}
+
 type SearchMatch =
   | { type: 'fts'; query: string; mode: 'exact' | 'fallback' }
   | { type: 'like'; terms: string[]; mode: 'like' };
@@ -102,7 +109,7 @@ function clampInteger(value: number | undefined, fallback: number, min: number, 
 }
 
 function escapeLikePattern(text: string): string {
-  return text.replace(/[\%_]/g, '\\$&');
+  return text.replace(/[\\%_]/g, '\\$&');
 }
 
 function resolveRoot(
@@ -151,7 +158,7 @@ function resolveRoot(
   }
 }
 
-function applyProjectDiversity(
+function applyProjectSourceDiversity(
   candidates: RankedCandidate[],
   limit: number,
   disabled: boolean,
@@ -162,10 +169,11 @@ function applyProjectDiversity(
   const remainder: RankedCandidate[] = [];
   const counts = new Map<string, number>();
   for (const candidate of candidates) {
-    const count = counts.get(candidate.project) ?? 0;
+    const diversityKey = `${candidate.project}\u0000${candidate.source}`;
+    const count = counts.get(diversityKey) ?? 0;
     if (count < 2 && selected.length < limit) {
       selected.push(candidate);
-      counts.set(candidate.project, count + 1);
+      counts.set(diversityKey, count + 1);
     } else {
       remainder.push(candidate);
     }
@@ -183,40 +191,44 @@ function loadContext(
   snippetChars: number,
   roleFilter?: string,
 ): Pick<SessionSearchResult, 'snippet' | 'snippetTruncated' | 'window' | 'bookendStart' | 'bookendEnd' | 'messagesBefore' | 'messagesAfter'> {
-  const rows = db.prepare(`
-    SELECT id, role, content, timestamp
-    FROM messages
-    WHERE session_id = ?
-    ORDER BY timestamp ASC, id ASC
-  `).all(candidate.session_id) as StoredMessage[];
-  const eligible = rows.filter((message) => {
-    if (!message.content.trim()) return false;
-    if (message.id === candidate.message_id) return true;
-    if (message.role !== 'user' && message.role !== 'assistant') return false;
-    return !roleFilter || message.role === roleFilter;
-  });
-  const anchorIndex = eligible.findIndex((message) => message.id === candidate.message_id);
   const anchorSnippet = termLocalSnippet(candidate.content, query, snippetChars);
-  if (anchorIndex < 0) {
-    return {
-      snippet: anchorSnippet.text,
-      snippetTruncated: anchorSnippet.truncated,
-      window: [{
-        id: candidate.message_id,
-        role: candidate.role,
-        timestamp: candidate.timestamp,
-        snippet: anchorSnippet.text,
-        anchor: true,
-      }],
-      bookendStart: [],
-      bookendEnd: [],
-      messagesBefore: 0,
-      messagesAfter: 0,
-    };
-  }
-
-  const windowStart = Math.max(0, anchorIndex - 1);
-  const windowEnd = Math.min(eligible.length, anchorIndex + 2);
+  const roleCondition = roleFilter ? 'role = ?' : "role IN ('user', 'assistant')";
+  const eligibility = `(id = ? OR (TRIM(content) <> '' AND ${roleCondition}))`;
+  const eligibilityParams: unknown[] = [candidate.message_id];
+  if (roleFilter) eligibilityParams.push(roleFilter);
+  const before = '(timestamp < ? OR (timestamp = ? AND id < ?))';
+  const after = '(timestamp > ? OR (timestamp = ? AND id > ?))';
+  const anchorOrderParams = [candidate.timestamp, candidate.timestamp, candidate.message_id];
+  const selectMessage = (direction: 'before' | 'after', order: 'ASC' | 'DESC'): StoredMessage[] => db.prepare(`
+    SELECT id, role, substr(content, 1, ?) AS content, timestamp
+    FROM messages
+    WHERE session_id = ? AND ${eligibility} AND ${direction === 'before' ? before : after}
+    ORDER BY timestamp ${order}, id ${order}
+    LIMIT 1
+  `).all(
+    CONTEXT_SNIPPET_CHARS,
+    candidate.session_id,
+    ...eligibilityParams,
+    ...anchorOrderParams,
+  ) as StoredMessage[];
+  const countMessages = (direction: 'before' | 'after'): number => {
+    const row = db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM messages
+      WHERE session_id = ? AND ${eligibility} AND ${direction === 'before' ? before : after}
+    `).get(candidate.session_id, ...eligibilityParams, ...anchorOrderParams) as { count: number };
+    return row.count;
+  };
+  const previous = selectMessage('before', 'DESC');
+  const next = selectMessage('after', 'ASC');
+  const beforeCount = countMessages('before');
+  const afterCount = countMessages('after');
+  const anchor: StoredMessage = {
+    id: candidate.message_id,
+    role: candidate.role,
+    content: candidate.content,
+    timestamp: candidate.timestamp,
+  };
   const toContext = (message: StoredMessage): SessionContextMessage => {
     const anchor = message.id === candidate.message_id;
     return {
@@ -227,21 +239,21 @@ function loadContext(
       anchor,
     };
   };
-  const window = eligible.slice(windowStart, windowEnd).map(toContext);
+  const window = [...previous.reverse(), anchor, ...next].map(toContext);
   const used = new Set(window.map((message) => message.id));
   const bookendStart: SessionContextMessage[] = [];
   const bookendEnd: SessionContextMessage[] = [];
 
-  if (windowStart > 0) {
-    const opener = eligible[0];
-    if (!used.has(opener.id)) {
+  if (beforeCount > previous.length) {
+    const [opener] = selectMessage('before', 'ASC');
+    if (opener && !used.has(opener.id)) {
       bookendStart.push(toContext(opener));
       used.add(opener.id);
     }
   }
-  if (windowEnd < eligible.length) {
-    const closer = eligible[eligible.length - 1];
-    if (!used.has(closer.id)) bookendEnd.push(toContext(closer));
+  if (afterCount > next.length) {
+    const [closer] = selectMessage('after', 'DESC');
+    if (closer && !used.has(closer.id)) bookendEnd.push(toContext(closer));
   }
 
   return {
@@ -250,18 +262,18 @@ function loadContext(
     window,
     bookendStart,
     bookendEnd,
-    messagesBefore: windowStart,
-    messagesAfter: eligible.length - windowEnd,
+    messagesBefore: Math.max(0, beforeCount - previous.length),
+    messagesAfter: Math.max(0, afterCount - next.length),
   };
 }
 
 /** Search across indexed session messages using FTS5. */
-export function searchSessions(
+export function searchSessionsDetailed(
   dbManager: DatabaseManager,
   query: string,
   options: SessionSearchOptions = {},
-): SessionSearchResult[] {
-  if (query.trim().length === 0) return [];
+): SessionSearchResponse {
+  if (query.trim().length === 0) return { results: [], candidateCount: 0, sourceCount: 0, omittedCount: 0 };
 
   const db = dbManager.getDb();
   const limit = clampInteger(options.limit, 10, 1, 20);
@@ -333,7 +345,7 @@ export function searchSessions(
   };
 
   const normalizedQuery = normalizeFts5Query(query);
-  if (!normalizedQuery) return [];
+  if (!normalizedQuery) return { results: [], candidateCount: 0, sourceCount: 0, omittedCount: 0 };
   addAttempt({ type: 'fts', query: normalizedQuery, mode: 'exact' });
 
   if (!hasExplicitFts5Operator(query)) {
@@ -361,9 +373,9 @@ export function searchSessions(
     roots.add(candidate.rootSessionId);
     collapsed.push(candidate);
   }
-  const selected = applyProjectDiversity(collapsed, limit, Boolean(options.project || options.sessionId));
+  const selected = applyProjectSourceDiversity(collapsed, limit, Boolean(options.project || options.sessionId));
 
-  return selected.map((candidate) => {
+  const results = selected.map((candidate) => {
     const context = loadContext(db, candidate, query, snippetChars, options.role);
     return {
       sessionId: candidate.session_id,
@@ -386,6 +398,20 @@ export function searchSessions(
       messagesAfter: context.messagesAfter,
     };
   });
+  return {
+    results,
+    candidateCount: ranked.length,
+    sourceCount: new Set(ranked.map((candidate) => `${candidate.project}\u0000${candidate.source}`)).size,
+    omittedCount: Math.max(0, ranked.length - results.length),
+  };
+}
+
+export function searchSessions(
+  dbManager: DatabaseManager,
+  query: string,
+  options: SessionSearchOptions = {},
+): SessionSearchResult[] {
+  return searchSessionsDetailed(dbManager, query, options).results;
 }
 
 /** Get the total number of indexed messages. */

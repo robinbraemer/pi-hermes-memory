@@ -332,6 +332,42 @@ describe("registerSessionSearchTool", () => {
     }
   });
 
+  it("reports pre-shaping candidates and omissions", async () => {
+    let captured: any;
+    const mockPi = { registerTool: (def: any) => { captured = def; } } as any;
+    const memoryDir = makeSessionsDir();
+    const dbManager = new DatabaseManager(memoryDir);
+
+    try {
+      for (let index = 0; index < 4; index++) {
+        indexSession(dbManager, {
+          id: `metadata-session-${index}`,
+          project: `metadata-project-${index}`,
+          cwd: "/synthetic/metadata",
+          source: `source-${index}`,
+          startedAt: `2026-07-1${index}T00:00:00.000Z`,
+          endedAt: null,
+          messages: [{
+            id: `metadata-message-${index}`,
+            role: "assistant",
+            content: "metadata candidate needle",
+            timestamp: `2026-07-1${index}T00:01:00.000Z`,
+          }],
+        });
+      }
+      registerSessionSearchTool(mockPi, dbManager);
+
+      const result = await captured.execute("tc-metadata", { query: "metadata candidate needle", limit: 2 });
+
+      assert.strictEqual(result.details.count, 2);
+      assert.strictEqual(result.details.candidateCount, 4);
+      assert.strictEqual(result.details.sourceCount, 4);
+      assert.strictEqual(result.details.omittedCount, 2);
+    } finally {
+      dbManager.close();
+    }
+  });
+
   it("registers and executes the anchor markdown-only schema when configured", async () => {
     let captured: any;
     const mockPi = {

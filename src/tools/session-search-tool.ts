@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { DatabaseManager } from '../store/db.js';
-import { searchSessions, getIndexedMessageCount } from '../store/session-search.js';
+import { searchSessionsDetailed, getIndexedMessageCount } from '../store/session-search.js';
 import { searchSessionAnchors } from '../store/session-anchor-search.js';
 import type { SessionAnchorRange, SessionAnchorSearchResult } from '../store/session-anchor-search.js';
 import type { SessionSearchConfig } from '../types.js';
@@ -200,7 +200,8 @@ Returns bounded conversation snippets with session dates and project context. La
         return { content: [{ type: 'text' as const, text: result.message! }], details: result };
       }
 
-      const results = searchSessions(dbManager, query, { project, sessionId, role, limit, snippetChars });
+      const search = searchSessionsDetailed(dbManager, query, { project, sessionId, role, limit, snippetChars });
+      const { results } = search;
 
       if (results.length === 0) {
         const output = capLegacyOutput('No results found. Try a different search term or broader query.');
@@ -253,9 +254,9 @@ Returns bounded conversation snippets with session dates and project context. La
       const finalResult: SearchResult = {
         success: true,
         count: results.length,
-        candidateCount: results.length,
-        sourceCount: new Set(results.map((result) => `${result.project}\u0000${result.source}`)).size,
-        omittedCount: 0,
+        candidateCount: search.candidateCount,
+        sourceCount: search.sourceCount,
+        omittedCount: search.omittedCount,
         truncatedCount,
         snippetChars,
         outputChars: output.text.length,

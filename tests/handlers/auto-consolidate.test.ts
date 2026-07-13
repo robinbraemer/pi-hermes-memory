@@ -380,12 +380,17 @@ describe("triggerConsolidation", () => {
       directCalls = [];
     });
 
-    it("returns consolidated true via direct transport without calling subprocess when appliedCount is positive", async () => {
+    it("returns consolidated true via direct transport only when it reduces target size", async () => {
       const pi = createMockPi();
       const directCtx = createDirectCtx();
+      let entries = ["old entry 1", "old entry 2"];
+      const store = {
+        ...mockStore,
+        getMemoryEntries: () => entries,
+      } as any;
       const result = await triggerConsolidation(
         pi,
-        mockStore,
+        store,
         "memory",
         undefined,
         60000,
@@ -394,13 +399,107 @@ describe("triggerConsolidation", () => {
         directCtx,
         null,
         null,
-        makeDirectDeps({ ok: true, appliedCount: 3 }),
+        {
+          runDirectMemoryCompletion: async (...args: unknown[]) => {
+            directCalls.push(args);
+            entries = ["short"];
+            return { ok: true, appliedCount: 3 };
+          },
+        },
       );
 
       assert.strictEqual(result.consolidated, true);
       assert.strictEqual(result.error, undefined);
       assert.strictEqual(directCalls.length, 1);
       assert.strictEqual(execCalls.length, 0, "subprocess must not run on successful direct consolidation");
+    });
+
+    it("falls back when direct operations do not reduce target size", async () => {
+      const pi = createMockPi();
+      const result = await triggerConsolidation(
+        pi,
+        mockStore,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        createDirectCtx(),
+        null,
+        null,
+        makeDirectDeps({ ok: true, appliedCount: 3 }),
+      );
+
+      assert.strictEqual(result.consolidated, true);
+      assert.strictEqual(directCalls.length, 1);
+      assert.strictEqual(execCalls.length, 1, "non-shrinking direct operations must fall back");
+    });
+
+    it("builds subprocess fallback from the post-direct snapshot", async () => {
+      const pi = createMockPi();
+      let entries = ["old entry"];
+      const store = {
+        ...mockStore,
+        getMemoryEntries: () => entries,
+      } as any;
+      await triggerConsolidation(
+        pi,
+        store,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        createDirectCtx(),
+        null,
+        null,
+        {
+          runDirectMemoryCompletion: async (...args: unknown[]) => {
+            directCalls.push(args);
+            entries = ["new larger entry after direct mutation"];
+            return { ok: true, appliedCount: 1 };
+          },
+        },
+      );
+
+      assert.strictEqual(execCalls.length, 1);
+      const prompt = childPrompt(execCalls[0]);
+      assert.match(prompt, /new larger entry after direct mutation/);
+      assert.doesNotMatch(prompt, /old entry/);
+    });
+
+    it("holds the consolidation lease while direct transport is running", async () => {
+      const pi = createMockPi();
+      const { promise: directPending, resolve: finishDirect } = Promise.withResolvers<{ ok: boolean; appliedCount: number }>();
+      const { promise: directStarted, resolve: markDirectStarted } = Promise.withResolvers<void>();
+      const deps = {
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          markDirectStarted();
+          return directPending;
+        },
+      };
+
+      const first = triggerConsolidation(
+        pi, mockStore, "memory", undefined, 60000, "memory",
+        directTransportLlmConfig, createDirectCtx(), null, null, deps,
+      );
+      await directStarted;
+      const second = triggerConsolidation(
+        pi, mockStore, "memory", undefined, 60000, "memory",
+        directTransportLlmConfig, createDirectCtx(), null, null, deps,
+      );
+      const secondRace = await Promise.race([
+        second.then((result) => ({ result })),
+        settle(100).then(() => ({ timeout: true as const })),
+      ]);
+      const directCallCount = directCalls.length;
+      finishDirect({ ok: false, appliedCount: 0 });
+      await Promise.all([first, second]);
+      assert.ok("result" in secondRace, "duplicate consolidation should return while direct transport is pending");
+      assert.strictEqual(directCallCount, 1, "duplicate direct completion must not start");
+      assert.strictEqual(secondRace.result.consolidated, false);
+      assert.match(secondRace.result.error!, /already in progress/i);
     });
 
     it("falls back to subprocess when direct transport succeeds with appliedCount 0", async () => {
@@ -601,6 +700,15 @@ describe("registerConsolidateCommand", () => {
 
   it("passes command ctx to direct consolidation and reflects success in the summary", async () => {
     directCalls = [];
+    let memoryEntries = ["old memory entry one", "old memory entry two"];
+    let userEntries = ["old user entry one", "old user entry two"];
+    let failureEntries = ["old failure entry one", "old failure entry two"];
+    const commandStore = {
+      ...mockStore,
+      getMemoryEntries: () => memoryEntries,
+      getUserEntries: () => userEntries,
+      getAllFailureEntries: () => failureEntries,
+    } as any;
     let handler: ((_args: unknown, ctx: unknown) => Promise<void>) | undefined;
     const notifications: string[] = [];
     const commandCtx = {
@@ -625,13 +733,22 @@ describe("registerConsolidateCommand", () => {
 
     registerConsolidateCommand(
       pi,
-      mockStore,
+      commandStore,
       60000,
       null,
       null,
       directTransportLlmConfig,
       null,
-      makeDirectDeps({ ok: true, appliedCount: 2 }),
+      {
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          const prompt = (args[3] as { userPrompt: string }).userPrompt;
+          if (prompt.includes("target: 'memory'")) memoryEntries = ["short"];
+          if (prompt.includes("target: 'user'")) userEntries = ["short"];
+          if (prompt.includes("target: 'failure'")) failureEntries = ["short"];
+          return { ok: true, appliedCount: 2 };
+        },
+      },
     );
 
     assert.ok(handler, "command handler should be registered");

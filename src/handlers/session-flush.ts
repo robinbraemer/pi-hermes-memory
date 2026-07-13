@@ -125,11 +125,9 @@ export function setupSessionFlush(
     await flush(ctx, event.signal, 30000);
   });
 
-  // Flush before session shutdown (must be fast, non-blocking)
+  // Flush before session shutdown (bounded to keep shutdown responsive)
   pi.on("session_shutdown", async (event, ctx) => {
     if (!config.flushOnShutdown) return;
-    // Fire-and-forget with a short timeout so we don't block Pi's shutdown.
-    // We intentionally do NOT await — Pi should not wait for the child process.
-    flush(ctx, undefined, 10000).catch(() => {});
+    await flush(ctx, undefined, 10000);
   });
 }

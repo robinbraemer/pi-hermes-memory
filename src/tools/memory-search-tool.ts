@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { DatabaseManager } from '../store/db.js';
-import { searchMemories, getMemoryStats } from '../store/sqlite-memory-store.js';
+import { searchMemoriesDetailed, getMemoryStats } from '../store/sqlite-memory-store.js';
 import type { MemoryCategory } from '../types.js';
 import { termLocalSnippet } from '../store/search-relevance.js';
 
@@ -95,7 +95,8 @@ Returns matching memory entries with project context and dates.`,
         return { content: [{ type: 'text' as const, text: result.message! }], details: result };
       }
 
-      const results = searchMemories(dbManager, query, { project, target, category, memoryId, limit });
+      const search = searchMemoriesDetailed(dbManager, query, { project, target, category, memoryId, limit });
+      const { results } = search;
 
       if (results.length === 0) {
         const message = 'No memories found. Try a different search term or broader query.';
@@ -131,9 +132,9 @@ Returns matching memory entries with project context and dates.`,
       const finalResult: SearchResult = {
         success: true,
         count: results.length,
-        candidateCount: results.length,
-        sourceCount: new Set(results.map((entry) => entry.sourceKey)).size,
-        omittedCount: 0,
+        candidateCount: search.candidateCount,
+        sourceCount: search.sourceCount,
+        omittedCount: search.omittedCount,
         truncatedCount,
         snippetChars,
         outputChars: output.text.length,

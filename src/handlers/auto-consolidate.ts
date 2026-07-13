@@ -109,51 +109,7 @@ export async function triggerConsolidation(
   projectName?: string | null,
   deps: { runDirectMemoryCompletion?: typeof runDirectMemoryCompletion } = {},
 ): Promise<ConsolidationResult> {
-  const entries = entriesForTarget(store, target);
-  const currentContent = entries.join(ENTRY_DELIMITER);
   const runDirect = deps.runDirectMemoryCompletion ?? runDirectMemoryCompletion;
-
-  if (directCtx && usesDirectTransport(llmConfig)) {
-    try {
-      const directResult = await runDirect(
-        directCtx,
-        store,
-        toolTarget === "project" ? store : null,
-        {
-          systemPrompt: DIRECT_CONSOLIDATION_SYSTEM_PROMPT,
-          userPrompt: [
-            `--- Current ${labelForTarget(target, toolTarget)} Entries (target: '${toolTarget}') ---`,
-            currentContent || "(empty)",
-            "",
-            `Only emit operations with "target": "${toolTarget}".`,
-          ].join("\n"),
-          config: llmConfig,
-          timeoutMs,
-          signal,
-        },
-        dbManager,
-        projectName,
-      );
-      // Consolidation only did its job if it actually freed space — unlike
-      // review/flush/correction, an empty or fully-skipped result here is a
-      // failure worth falling back to subprocess for, not a normal outcome.
-      if (directResult.ok && directResult.appliedCount > 0) {
-        return { consolidated: true };
-      }
-    } catch {
-      // Fall through to subprocess below.
-    }
-  }
-
-  const prompt = [
-    CONSOLIDATION_PROMPT,
-    "",
-    `--- Current ${labelForTarget(target, toolTarget)} Entries ---`,
-    currentContent || "(empty)",
-    "",
-    `Use the memory tool to consolidate. Target: '${toolTarget}'`,
-  ].join("\n");
-
   let lock: ConsolidationLock | null = null;
 
   try {
@@ -161,9 +117,51 @@ export async function triggerConsolidation(
     if (!lock) {
       return {
         consolidated: false,
-        error: `Consolidation already in progress for target '${toolTarget}'. Skipping duplicate subprocess.`,
+        error: `Consolidation already in progress for target '${toolTarget}'. Skipping duplicate consolidation.`,
       };
     }
+
+    const entries = entriesForTarget(store, target);
+    const currentContent = entries.join(ENTRY_DELIMITER);
+
+    if (directCtx && usesDirectTransport(llmConfig)) {
+      try {
+        const directResult = await runDirect(
+          directCtx,
+          store,
+          toolTarget === "project" ? store : null,
+          {
+            systemPrompt: DIRECT_CONSOLIDATION_SYSTEM_PROMPT,
+            userPrompt: [
+              `--- Current ${labelForTarget(target, toolTarget)} Entries (target: '${toolTarget}') ---`,
+              currentContent || "(empty)",
+              "",
+              `Only emit operations with "target": "${toolTarget}".`,
+            ].join("\n"),
+            config: llmConfig,
+            timeoutMs,
+            signal,
+          },
+          dbManager,
+          projectName,
+        );
+        const updatedContent = entriesForTarget(store, target).join(ENTRY_DELIMITER);
+        if (directResult.ok && updatedContent.length < currentContent.length) {
+          return { consolidated: true };
+        }
+      } catch {
+      }
+    }
+
+    const fallbackContent = entriesForTarget(store, target).join(ENTRY_DELIMITER);
+    const prompt = [
+      CONSOLIDATION_PROMPT,
+      "",
+      `--- Current ${labelForTarget(target, toolTarget)} Entries ---`,
+      fallbackContent || "(empty)",
+      "",
+      `Use the memory tool to consolidate. Target: '${toolTarget}'`,
+    ].join("\n");
 
     const result = await execChildPrompt(pi, prompt, llmConfig, {
       signal,

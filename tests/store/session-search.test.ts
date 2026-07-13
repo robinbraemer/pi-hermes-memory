@@ -203,6 +203,31 @@ describe('session-search', () => {
       assert.ok(filtered.every((result) => result.project === 'project-a'));
     });
 
+    it('uses project and source together for diversity buckets', () => {
+      const fixtures = [
+        ['same-source-a', 'project-a', 'interactive', '2026-04-04T00:00:00Z'],
+        ['same-source-b', 'project-a', 'interactive', '2026-04-03T00:00:00Z'],
+        ['other-source', 'project-a', 'imported', '2026-04-02T00:00:00Z'],
+        ['other-project', 'project-b', 'interactive', '2026-04-01T00:00:00Z'],
+      ] as const;
+      for (const [id, project, source, timestamp] of fixtures) {
+        indexSession(dbManager, createTestSession({
+          id,
+          project,
+          source,
+          messages: [{ id: `${id}-message`, role: 'assistant', content: 'combined diversity needle', timestamp }],
+        }));
+      }
+
+      const results = searchSessions(dbManager, 'combined diversity needle', { limit: 3 });
+
+      assert.deepStrictEqual(results.map((result) => result.sessionId), [
+        'same-source-a',
+        'same-source-b',
+        'other-source',
+      ]);
+    });
+
     it('filters by the owning session id', () => {
       indexSession(dbManager, createTestSession({
         id: 'synthetic-session-filter-a',
@@ -253,6 +278,41 @@ describe('session-search', () => {
       assert.strictEqual(result.window.find((message) => message.anchor)?.id, 'synthetic-context-5');
       assert.ok([...result.window, ...result.bookendStart, ...result.bookendEnd]
         .every((message) => message.snippet.length <= (message.anchor ? 120 : 240)));
+    });
+
+    it('uses bounded SQL for context neighbors and bookends', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'bounded-context-session',
+        messages: Array.from({ length: 9 }, (_, index) => ({
+          id: `bounded-context-${index}`,
+          role: index % 2 === 0 ? 'user' : 'assistant',
+          content: index === 4 ? 'bounded context needle' : `context body ${index}`,
+          timestamp: `2026-01-01T00:0${index}:00Z`,
+        })),
+      }));
+      const db = dbManager.getDb() as any;
+      const prototype = Object.getPrototypeOf(db) as { prepare: (source: string) => unknown };
+      const originalPrepare = prototype.prepare;
+      const statements: string[] = [];
+      prototype.prepare = function (source: string): unknown {
+        statements.push(source.replace(/\s+/g, ' ').trim());
+        return originalPrepare.call(this, source);
+      };
+
+      try {
+        const [result] = searchSessions(dbManager, 'bounded context needle');
+        assert.strictEqual(result.window.length, 3);
+        assert.strictEqual(result.bookendStart.length, 1);
+        assert.strictEqual(result.bookendEnd.length, 1);
+      } finally {
+        prototype.prepare = originalPrepare;
+      }
+
+      const contextQueries = statements.filter((source) => source.includes('FROM messages') && source.includes('id = ? OR'));
+      assert.ok(contextQueries.length > 0);
+      assert.ok(contextQueries.every((source) => source.includes('COUNT(*)') || source.includes('LIMIT 1')));
+      assert.ok(contextQueries.filter((source) => !source.includes('COUNT(*)'))
+        .every((source) => source.includes('substr(content, 1, ?)')));
     });
 
     it('should find messages matching a search query', () => {
@@ -430,6 +490,18 @@ describe('session-search', () => {
 
       assert.ok(results.length > 0);
       assert.ok(results.every((r) => r.content.includes('%')));
+    });
+
+    it('should escape backslashes during LIKE fallback', () => {
+      indexSession(dbManager, createTestSession({ id: 'like-backslash-session', messages: [
+        { id: 'like-backslash-hit', role: 'user', content: 'literal \\ backslash', timestamp: '2026-05-03T00:01:00Z' },
+        { id: 'like-backslash-decoy', role: 'user', content: 'literal backslash', timestamp: '2026-05-03T00:02:00Z' },
+      ] }));
+
+      const results = searchSessions(dbManager, '\\');
+
+      assert.ok(results.some((result) => result.messageId === 'like-backslash-hit'));
+      assert.ok(results.every((result) => result.messageId !== 'like-backslash-decoy'));
     });
 
     it('should not broaden explicit operator queries', () => {

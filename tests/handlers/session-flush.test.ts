@@ -555,6 +555,37 @@ describe("direct transport", () => {
     assert.equal(mockPi.execCalls.length, 1, "shutdown flush must survive direct throw");
   });
 
+  it("awaits the bounded direct flush before later shutdown handlers run", async () => {
+    const config = defaultConfig({ reviewTransport: "direct" });
+    const { promise: directPending, resolve: finishDirect } = Promise.withResolvers<DirectReviewResult>();
+    setupSessionFlush(
+      mockPi.pi,
+      mockStore,
+      null,
+      config,
+      null,
+      null,
+      {
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          return directPending;
+        },
+      },
+    );
+
+    await primeFlushReady(mockPi.handlers);
+    let shutdownSettled = false;
+    const shutdown = emit(mockPi.handlers, "session_shutdown", {}, defaultFlushCtx())
+      .then(() => { shutdownSettled = true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(directCalls.length, 1);
+    assert.equal(shutdownSettled, false, "shutdown dispatch must wait for direct memory writes");
+    finishDirect({ ok: true, appliedCount: 1 });
+    await shutdown;
+    assert.equal(shutdownSettled, true);
+  });
+
   it("skips direct transport when reviewTransport is subprocess", async () => {
     const config = defaultConfig({ reviewTransport: "subprocess" });
     setupSessionFlush(
@@ -574,4 +605,3 @@ describe("direct transport", () => {
     assert.equal(mockPi.execCalls.length, 1);
   });
 });
-

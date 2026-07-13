@@ -175,4 +175,25 @@ describe('registerMemorySearchTool', () => {
 
     dbManager.close();
   });
+
+  it('reports pre-shaping candidates and omissions', async () => {
+    const dbManager = makeDbManager();
+    for (let index = 0; index < 4; index++) {
+      addMemory(
+        dbManager,
+        `metadata memory candidate needle ${index}`,
+        index % 2 === 0 ? 'memory' : 'user',
+        `metadata-project-${index}`,
+      );
+    }
+    const captured = captureTool(dbManager);
+
+    const result = await captured.execute('tc-metadata', { query: 'metadata memory candidate needle', limit: 2 });
+
+    assert.strictEqual(result.details.count, 2);
+    assert.strictEqual(result.details.candidateCount, 4);
+    assert.strictEqual(result.details.sourceCount, 4);
+    assert.strictEqual(result.details.omittedCount, 2);
+    dbManager.close();
+  });
 });

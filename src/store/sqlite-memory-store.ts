@@ -63,6 +63,13 @@ export interface MemorySearchOptions {
   candidateLimit?: number;
 }
 
+export interface MemorySearchResponse {
+  results: MemorySearchResult[];
+  candidateCount: number;
+  sourceCount: number;
+  omittedCount: number;
+}
+
 export interface SqliteMemorySyncInput {
   content: string;
   target: 'memory' | 'user' | 'failure';
@@ -698,13 +705,13 @@ export function removeExactSyncedMemories(
 /**
  * Search memories using FTS5.
  */
-export function searchMemories(
+export function searchMemoriesDetailed(
   dbManager: DatabaseManager,
   query: string,
   options: MemorySearchOptions = {},
-): MemorySearchResult[] {
+): MemorySearchResponse {
   if (query.trim().length === 0) {
-    return [];
+    return { results: [], candidateCount: 0, sourceCount: 0, omittedCount: 0 };
   }
 
   const db = dbManager.getDb();
@@ -720,7 +727,7 @@ export function searchMemories(
   // FTS5 match via subquery with escaped query
   const normalizedQuery = normalizeFts5Query(query);
   if (normalizedQuery.length === 0) {
-    return [];
+    return { results: [], candidateCount: 0, sourceCount: 0, omittedCount: 0 };
   }
 
   const runSearch = (matchQuery: string): SqliteMemoryEntry[] => {
@@ -843,7 +850,21 @@ export function searchMemories(
     if (selected.length < limit) selected.push(...remainder.slice(0, limit - selected.length));
   }
 
-  return selected.map(({ key: _key, diversityKey: _diversityKey, ...entry }) => entry);
+  const results = selected.map(({ key: _key, diversityKey: _diversityKey, ...entry }) => entry);
+  return {
+    results,
+    candidateCount: ranked.length,
+    sourceCount: new Set(ranked.map((entry) => entry.sourceKey)).size,
+    omittedCount: Math.max(0, ranked.length - results.length),
+  };
+}
+
+export function searchMemories(
+  dbManager: DatabaseManager,
+  query: string,
+  options: MemorySearchOptions = {},
+): MemorySearchResult[] {
+  return searchMemoriesDetailed(dbManager, query, options).results;
 }
 
 /**
