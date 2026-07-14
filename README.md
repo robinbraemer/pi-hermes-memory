@@ -286,7 +286,7 @@ Search behavior notes:
 - Session hits collapse to one result per session lineage. Known `cron` and `automation` sources are demoted rather than hidden, and project/source diversity prevents one source from filling the first result pass while still filling unused capacity.
 - Session results include a small query-anchored message window and non-overlapping opener/closer bookends. Empty or tool-call-only prose does not displace useful context.
 - Both tools return query-local snippets bounded to 1,200 characters by default (`snippetChars`: 100–4,000) and enforce a hard 50 KiB total response ceiling.
-- Compact refs identify results as `session:<session-id>/message:<message-id>` or `memory:<id>`. Details contain counts and opaque IDs, not duplicated snippets, working directories, or full stored content.
+- Compact refs identify results as `session:<session-id>/message:<message-id>` or `memory:<id>`. Details contain counts and opaque IDs, not duplicated snippets, working directories, or full stored content; `truncatedCount` is non-zero when retrieval shaping or the final safety cap truncates output.
 
 To read one result more deeply without opening an unbounded browse mode, repeat the same query with its returned ref and a larger bounded snippet:
 
@@ -543,7 +543,7 @@ The `sessions.db` SQLite database stores session history and extended memory ent
 ## Known Limitations
 
 - **`§` delimiter**: Memory entries are separated by `§` (section sign). If an entry naturally contains `§`, it will be split incorrectly on reload. This is rare in English text but possible. [Hermes uses the same delimiter.]
-- **Background review cost**: Each review cycle costs one full LLM API call via a child `pi -p` process. Correction detection and explicit skill saves can add additional calls when the agent decides they are worth it.
+- **Background review cost**: Each review cycle costs one LLM API call. Direct transport makes that call in-process by default and falls back to a child `pi -p` process on failure. Correction detection and explicit skill saves can add additional calls when the agent decides they are worth it.
 - **Session search requires indexing**: Past sessions must be indexed before they're searchable. Run `/memory-index-sessions` to bulk-import, or let the extension auto-index on session shutdown.
 - **Older Markdown memories may need backfill**: If you saved memories before the SQLite mirror existed or search looks stale, run `/memory-sync-markdown`.
 - **Core memory limits still apply**: SQLite search mirroring does not bypass the 5,000-char core Markdown limit. If consolidation cannot free space, the write fails instead of becoming SQLite-only memory invisibly.
