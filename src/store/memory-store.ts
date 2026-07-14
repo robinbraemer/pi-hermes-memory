@@ -457,18 +457,6 @@ export class MemoryStore {
     return [...this.entriesFor(target)];
   }
 
-  async restoreRawEntries(
-    target: "memory" | "user" | "failure",
-    entries: readonly string[],
-  ): Promise<MemoryResult> {
-    return this.runTargetMutation(target, async () => {
-      await this.syncTargetFromDiskIfChanged(target);
-      this.setEntries(target, [...entries]);
-      await this.saveToDisk(target);
-      return this.successResponse(target, "Memory operations rolled back.");
-    });
-  }
-
   async runAtomicTargetMutation<T>(
     target: "memory" | "user" | "failure",
     mutation: (transaction: MemoryTargetTransaction) => Promise<MemoryTargetTransactionDecision<T>>,
