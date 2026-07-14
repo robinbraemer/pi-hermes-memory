@@ -7,6 +7,7 @@ import { DatabaseManager } from '../../src/store/db.js';
 import {
   addMemory,
   searchMemories,
+  searchMemoriesDetailed,
   getMemories,
   removeMemory,
   touchMemory,
@@ -16,7 +17,10 @@ import {
   removeSyncedMemories,
   parseMarkdownMemoryEntry,
   formatFailureMemoryContent,
+  reconcileMarkdownMemoryScope,
+  reconcileMarkdownFailureScopes,
 } from '../../src/store/sqlite-memory-store.js';
+import { MemoryStore } from '../../src/store/memory-store.js';
 
 describe('sqlite-memory-store', () => {
   let tmpDir: string;
@@ -115,6 +119,140 @@ describe('sqlite-memory-store', () => {
       assert.strictEqual(parsed.created, '2026-05-08');
       assert.strictEqual(parsed.lastReferenced, '2026-05-09');
     });
+
+    it('does not infer project scope from spoofable failure content', () => {
+      const raw = '[correction] literal user text — Project: other-project <!-- created=2026-05-08, last=2026-05-09 -->';
+
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: 'other-project' }).length, 0);
+      assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 1);
+    });
+
+    it('round-trips project correction scope through authoritative Markdown metadata', async () => {
+      const store = new MemoryStore({
+        memoryDir: tmpDir,
+        memoryCharLimit: 5_000,
+        userCharLimit: 5_000,
+        failureCharLimit: 5_000,
+      } as any);
+      await store.loadFromDisk();
+
+      await store.addFailure('use pnpm in this repo', {
+        category: 'correction',
+        failureReason: 'User corrected the agent',
+        project: 'project-a',
+      });
+      const [raw] = store.getRawEntriesForSync('failure');
+      reconcileMarkdownFailureScopes(dbManager, [raw]);
+
+      const entries = getMemories(dbManager, { target: 'failure', project: 'project-a' });
+      assert.strictEqual(entries.length, 1);
+      assert.strictEqual(entries[0].project, 'project-a');
+      assert.doesNotMatch(entries[0].content, /Project: project-a/);
+    });
+  });
+
+  describe('reconcileMarkdownMemoryScope', () => {
+    it('keeps explicit global MEMORY and USER scope despite embedded project metadata', () => {
+      const marker = 'c3Bvb2ZlZC1wcm9qZWN0';
+
+      reconcileMarkdownMemoryScope(
+        dbManager,
+        [`global memory <!-- created=2026-07-01, last=2026-07-02, project64=${marker} -->`],
+        'memory',
+        null,
+      );
+      reconcileMarkdownMemoryScope(
+        dbManager,
+        [`global user <!-- created=2026-07-01, last=2026-07-02, project64=${marker} -->`],
+        'user',
+        null,
+      );
+
+      assert.deepStrictEqual(
+        getMemories(dbManager).map((entry) => [entry.project, entry.target, entry.content]),
+        [
+          [null, 'memory', 'global memory'],
+          [null, 'user', 'global user'],
+        ],
+      );
+      assert.deepStrictEqual(getMemories(dbManager, { project: 'spoofed-project' }), []);
+    });
+
+    it('prunes only absent rows in the exact target and project scope', () => {
+      addMemory(dbManager, 'kept global memory', 'memory', null);
+      addMemory(dbManager, 'orphaned global memory', 'memory', null);
+      addMemory(dbManager, 'unrelated global user', 'user', null);
+      addMemory(dbManager, 'unrelated project memory', 'memory', 'project-a');
+
+      const first = reconcileMarkdownMemoryScope(
+        dbManager,
+        ['kept global memory <!-- created=2026-07-01, last=2026-07-02 -->'],
+        'memory',
+        null,
+      );
+      const second = reconcileMarkdownMemoryScope(
+        dbManager,
+        ['kept global memory <!-- created=2026-07-01, last=2026-07-02 -->'],
+        'memory',
+        null,
+      );
+
+      assert.strictEqual(first.removed, 1);
+      assert.strictEqual(second.removed, 0);
+      assert.deepStrictEqual(
+        getMemories(dbManager).map((entry) => entry.content).sort(),
+        ['kept global memory', 'unrelated global user', 'unrelated project memory'].sort(),
+      );
+    });
+
+    it('removes duplicate and stale-category rows by full Markdown identity', () => {
+      const first = addMemory(
+        dbManager,
+        '[correction] use pnpm',
+        'failure',
+        'project-a',
+        'correction',
+        'original reason',
+        null,
+        'pnpm install',
+        '2026-06-01',
+        '2026-07-05',
+      );
+      addMemory(dbManager, '[correction] use pnpm', 'failure', 'project-a', 'correction');
+      addMemory(dbManager, '[correction] use pnpm', 'failure', 'project-a', 'tool-quirk');
+
+      const result = reconcileMarkdownMemoryScope(
+        dbManager,
+        ['[correction] use pnpm <!-- created=2026-07-01, last=2026-07-02, project64=cHJvamVjdC1h -->'],
+        'failure',
+        'project-a',
+      );
+
+      const rows = dbManager.getDb().prepare(`
+        SELECT id, category, failure_reason, corrected_to, created, last_referenced
+        FROM memories
+        WHERE project = 'project-a' AND target = 'failure'
+      `).all() as Array<{
+        id: number;
+        category: string | null;
+        failure_reason: string | null;
+        corrected_to: string | null;
+        created: string;
+        last_referenced: string;
+      }>;
+
+      assert.strictEqual(result.removed, 2);
+      assert.deepStrictEqual(rows, [{
+        id: first.id,
+        category: 'correction',
+        failure_reason: 'original reason',
+        corrected_to: 'pnpm install',
+        created: '2026-06-01',
+        last_referenced: '2026-07-05',
+      }]);
+    });
   });
 
   describe('replace/remove synced memories', () => {
@@ -194,6 +332,122 @@ describe('sqlite-memory-store', () => {
       addMemory(dbManager, 'exact phrase memory search example');
       addMemory(dbManager, 'name: Chandrateja', 'user');
       addMemory(dbManager, 'timezone: AEST', 'user');
+    });
+
+    it('ranks exact coverage before newer fallback memory candidates', () => {
+      const exact = addMemory(dbManager, 'synthetic-memory-alpha beta');
+      const fallback = addMemory(dbManager, 'synthetic-memory-alpha');
+      const db = dbManager.getDb();
+      db.prepare('UPDATE memories SET last_referenced = ? WHERE id = ?').run('2026-01-01', exact.id);
+      db.prepare('UPDATE memories SET last_referenced = ? WHERE id = ?').run('2026-03-01', fallback.id);
+
+      const results = searchMemories(dbManager, 'synthetic-memory-alpha beta');
+
+      assert.deepStrictEqual(results.slice(0, 2).map((entry) => entry.id), [exact.id, fallback.id]);
+      assert.deepStrictEqual(results.slice(0, 2).map((entry) => entry.matchMode), ['exact', 'fallback']);
+      assert.ok(results.slice(0, 2).every((entry) => entry.matchedTerms > 0 && entry.totalTerms > 0));
+    });
+
+    it('uses last-referenced recency then stable numeric id for exact ties', () => {
+      const older = addMemory(dbManager, 'synthetic-memory-tie needle');
+      const first = addMemory(dbManager, 'synthetic-memory-tie needle first');
+      const second = addMemory(dbManager, 'synthetic-memory-tie needle second');
+      const db = dbManager.getDb();
+      db.prepare('UPDATE memories SET last_referenced = ? WHERE id = ?').run('2026-01-01', older.id);
+      db.prepare('UPDATE memories SET last_referenced = ? WHERE id IN (?, ?)').run('2026-02-01', first.id, second.id);
+
+      const results = searchMemories(dbManager, 'synthetic-memory-tie needle');
+
+      assert.deepStrictEqual(results.slice(0, 3).map((entry) => entry.id), [first.id, second.id, older.id]);
+    });
+
+    it('diversifies memory sources in the first pass and fills unused capacity', () => {
+      const sourceA = Array.from({ length: 3 }, (_, index) => syncMemoryEntry(dbManager, {
+        content: `synthetic-memory-diversity needle a-${index}`,
+        target: 'memory',
+        project: 'synthetic-project-a',
+        category: 'convention',
+        lastReferenced: `2026-03-0${index + 1}`,
+      }).entry);
+      const sourceB = syncMemoryEntry(dbManager, {
+        content: 'synthetic-memory-diversity needle b',
+        target: 'user',
+        project: 'synthetic-project-b',
+        category: 'preference',
+        lastReferenced: '2026-01-01',
+      }).entry;
+
+      const results = searchMemories(dbManager, 'synthetic-memory-diversity needle', { limit: 3 });
+
+      assert.strictEqual(results.length, 3);
+      assert.ok(results.some((entry) => entry.id === sourceB.id));
+      assert.strictEqual(results.filter((entry) => sourceA.some((candidate) => candidate.id === entry.id)).length, 2);
+      assert.ok(results.every((entry) => entry.sourceKey.startsWith('project:')));
+    });
+
+    it('keeps null and literal global projects as distinct internal sources', () => {
+      for (let index = 0; index < 2; index++) {
+        syncMemoryEntry(dbManager, {
+          content: `synthetic-source-identity needle null-${index}`,
+          target: 'memory',
+          project: null,
+          category: 'convention',
+          lastReferenced: `2026-03-0${index + 2}`,
+        });
+      }
+      const literalGlobal = syncMemoryEntry(dbManager, {
+        content: 'synthetic-source-identity needle literal-global',
+        target: 'memory',
+        project: 'global',
+        category: 'convention',
+        lastReferenced: '2026-01-01',
+      }).entry;
+
+      const response = searchMemoriesDetailed(dbManager, 'synthetic-source-identity needle', { limit: 3 });
+
+      assert.strictEqual(response.sourceCount, 2);
+      assert.ok(response.results.some((entry) => entry.id === literalGlobal.id));
+      assert.ok(response.results.every((entry) => entry.sourceKey.startsWith('project:')));
+    });
+
+    it('preserves explicit filters while filling from the requested source', () => {
+      for (let index = 0; index < 3; index++) {
+        syncMemoryEntry(dbManager, {
+          content: `synthetic-memory-filter needle ${index}`,
+          target: 'failure',
+          project: 'synthetic-filter-project',
+          category: 'tool-quirk',
+        });
+      }
+      syncMemoryEntry(dbManager, {
+        content: 'synthetic-memory-filter needle outside',
+        target: 'memory',
+        project: 'synthetic-other-project',
+        category: 'convention',
+      });
+
+      const results = searchMemories(dbManager, 'synthetic-memory-filter needle', {
+        project: 'synthetic-filter-project',
+        target: 'failure',
+        category: 'tool-quirk',
+        limit: 3,
+      });
+
+      assert.strictEqual(results.length, 3);
+      assert.ok(results.every((entry) => entry.project === 'synthetic-filter-project'));
+      assert.ok(results.every((entry) => entry.target === 'failure'));
+      assert.ok(results.every((entry) => entry.category === 'tool-quirk'));
+    });
+
+    it('isolates an exact memory id and remains deterministic', () => {
+      addMemory(dbManager, 'synthetic-memory-id needle other');
+      const selected = addMemory(dbManager, 'synthetic-memory-id needle selected');
+
+      const first = searchMemories(dbManager, 'synthetic-memory-id needle', { memoryId: selected.id, limit: 1 });
+      const second = searchMemories(dbManager, 'synthetic-memory-id needle', { memoryId: selected.id, limit: 1 });
+
+      assert.deepStrictEqual(first, second);
+      assert.deepStrictEqual(first.map((entry) => entry.id), [selected.id]);
     });
 
     it('should find memories by keyword', () => {

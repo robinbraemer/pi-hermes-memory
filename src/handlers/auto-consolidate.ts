@@ -2,19 +2,76 @@
  * Auto-consolidation — when memory hits capacity, trigger automatic
  * consolidation instead of returning an error.
  *
- * Uses pi.exec() to spawn a one-shot consolidation process.
- * The child process modifies files on disk, so the parent MUST reload
- * from disk after consolidation completes.
+ * Default transport: in-process direct completion (same mechanism as
+ * background review — see review-memory-ops.ts), used only when a caller
+ * supplies model/modelRegistry access (the manual `/memory-consolidate`
+ * command has it; the automatic over-capacity consolidator registered on
+ * MemoryStore does not, since MemoryStore itself has no extension-runtime
+ * access, so that path stays subprocess-only). Falls back to a `pi -p`
+ * subprocess when direct mode is unavailable, declines, or fails.
+ *
+ * The subprocess child process modifies files on disk, so the parent MUST
+ * reload from disk after a subprocess-based consolidation completes.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { createHash } from "node:crypto";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { MemoryStore } from "../store/memory-store.js";
-import { CONSOLIDATION_PROMPT, ENTRY_DELIMITER } from "../constants.js";
+import { DatabaseManager } from "../store/db.js";
+import { CONSOLIDATION_PROMPT, DIRECT_CONSOLIDATION_SYSTEM_PROMPT, ENTRY_DELIMITER } from "../constants.js";
 import type { ConsolidationResult, MemoryConfig } from "../types.js";
+import { AGENT_ROOT } from "../paths.js";
 import { execChildPrompt } from "./pi-child-process.js";
+import { runDirectMemoryCompletion, usesDirectTransport } from "./review-memory-ops.js";
+import { AtomicLockCoordinator } from "../store/atomic-lock-coordinator.js";
 
 type MemoryTarget = "memory" | "user" | "failure";
 type ToolMemoryTarget = MemoryTarget | "project";
+type ConsolidationLlmConfig = Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride" | "reviewTransport">;
+
+const CONSOLIDATION_LOCK_STALE_GRACE_MS = 30000;
+const CONSOLIDATION_MAX_TRANSPORT_ATTEMPTS = 3;
+const CONSOLIDATION_LOCK_ENV = "PI_HERMES_CONSOLIDATION_LOCK_DIR";
+
+interface ConsolidationLock {
+  release: () => Promise<void>;
+}
+
+function consolidationLockRoot(): string {
+  return process.env[CONSOLIDATION_LOCK_ENV]?.trim()
+    || path.join(AGENT_ROOT, "pi-hermes-memory", ".consolidation-locks");
+}
+
+function sanitizeLockPart(value: string): string {
+  return value.replace(/[^a-z0-9._-]+/gi, "_").slice(0, 80) || "unknown";
+}
+
+function consolidationLockKey(target: MemoryTarget, toolTarget: ToolMemoryTarget, storageIdentity: string): string {
+  const storageHash = createHash("sha256").update(storageIdentity).digest("hex");
+  return `${sanitizeLockPart(toolTarget)}:${sanitizeLockPart(target)}:${storageHash}`;
+}
+
+async function tryAcquireConsolidationLock(
+  store: MemoryStore,
+  target: MemoryTarget,
+  toolTarget: ToolMemoryTarget,
+  timeoutMs: number,
+): Promise<ConsolidationLock | null> {
+  const storageIdentity = await store.getStorageIdentity(target);
+  const root = consolidationLockRoot();
+  await fs.mkdir(root, { recursive: true });
+  const coordinator = new AtomicLockCoordinator(path.join(root, "locks.sqlite"));
+  const lease = coordinator.tryAcquire(
+    consolidationLockKey(target, toolTarget, storageIdentity),
+    {
+      staleMs: (Math.max(timeoutMs, 0) * CONSOLIDATION_MAX_TRANSPORT_ATTEMPTS)
+        + CONSOLIDATION_LOCK_STALE_GRACE_MS,
+    },
+  );
+  return lease ? { release: async () => lease.release() } : null;
+}
 
 function entriesForTarget(store: MemoryStore, target: MemoryTarget): string[] {
   if (target === "user") return store.getUserEntries();
@@ -50,21 +107,73 @@ export async function triggerConsolidation(
   signal?: AbortSignal,
   timeoutMs: number = 60000,
   toolTarget: ToolMemoryTarget = target,
-  llmConfig: Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride"> = {},
+  llmConfig: ConsolidationLlmConfig = {},
+  directCtx: Pick<ExtensionContext, "model" | "modelRegistry"> | null = null,
+  dbManager: DatabaseManager | null = null,
+  projectName?: string | null,
+  deps: { runDirectMemoryCompletion?: typeof runDirectMemoryCompletion } = {},
 ): Promise<ConsolidationResult> {
-  const entries = entriesForTarget(store, target);
-  const currentContent = entries.join(ENTRY_DELIMITER);
-
-  const prompt = [
-    CONSOLIDATION_PROMPT,
-    "",
-    `--- Current ${labelForTarget(target, toolTarget)} Entries ---`,
-    currentContent || "(empty)",
-    "",
-    `Use the memory tool to consolidate. Target: '${toolTarget}'`,
-  ].join("\n");
+  const runDirect = deps.runDirectMemoryCompletion ?? runDirectMemoryCompletion;
+  let lock: ConsolidationLock | null = null;
 
   try {
+    lock = await tryAcquireConsolidationLock(store, target, toolTarget, timeoutMs);
+    if (!lock) {
+      return {
+        consolidated: false,
+        error: `Consolidation already in progress for target '${toolTarget}'. Skipping duplicate consolidation.`,
+      };
+    }
+
+    const entries = entriesForTarget(store, target);
+    const currentContent = entries.join(ENTRY_DELIMITER);
+
+    if (directCtx && usesDirectTransport(llmConfig)) {
+      const currentPersistedChars = store.getPersistedCharCount(target);
+      try {
+        const directResult = await runDirect(
+          directCtx,
+          store,
+          toolTarget === "project" ? store : null,
+          {
+            systemPrompt: DIRECT_CONSOLIDATION_SYSTEM_PROMPT,
+            userPrompt: [
+              `--- Current ${labelForTarget(target, toolTarget)} Entries (target: '${toolTarget}') ---`,
+              currentContent || "(empty)",
+              "",
+              `Only emit operations with "target": "${toolTarget}".`,
+            ].join("\n"),
+            config: llmConfig,
+            timeoutMs,
+            signal,
+            allowedTargets: [toolTarget],
+            atomic: true,
+          },
+          dbManager,
+          projectName,
+        );
+        const updatedPersistedChars = store.getPersistedCharCount(target);
+        if (
+          directResult.ok
+          && (directResult.skippedCount ?? 0) === 0
+          && updatedPersistedChars < currentPersistedChars
+        ) {
+          return { consolidated: true };
+        }
+      } catch {
+      }
+    }
+
+    const fallbackContent = entriesForTarget(store, target).join(ENTRY_DELIMITER);
+    const prompt = [
+      CONSOLIDATION_PROMPT,
+      "",
+      `--- Current ${labelForTarget(target, toolTarget)} Entries ---`,
+      fallbackContent || "(empty)",
+      "",
+      `Use the memory tool to consolidate. Target: '${toolTarget}'`,
+    ].join("\n");
+
     const result = await execChildPrompt(pi, prompt, llmConfig, {
       signal,
       timeoutMs,
@@ -83,6 +192,10 @@ export async function triggerConsolidation(
       consolidated: false,
       error: `Consolidation failed: ${String(err).slice(0, 200)}`,
     };
+  } finally {
+    if (lock) {
+      try { await lock.release(); } catch { /* best-effort cleanup */ }
+    }
   }
 }
 
@@ -95,7 +208,9 @@ export function registerConsolidateCommand(
   timeoutMs: number = 60000,
   projectStore: MemoryStore | null = null,
   projectName?: string | null,
-  llmConfig: Pick<MemoryConfig, "llmModelOverride" | "llmThinkingOverride"> = {},
+  llmConfig: ConsolidationLlmConfig = {},
+  dbManager: DatabaseManager | null = null,
+  deps: { runDirectMemoryCompletion?: typeof runDirectMemoryCompletion } = {},
 ): void {
   pi.registerCommand("memory-consolidate", {
     description: "Manually trigger memory consolidation to free up space",
@@ -157,6 +272,10 @@ export function registerConsolidateCommand(
           manualTimeoutMs,
           item.toolTarget,
           llmConfig,
+          ctx,
+          dbManager,
+          projectName,
+          deps,
         );
 
         if (result.consolidated) {

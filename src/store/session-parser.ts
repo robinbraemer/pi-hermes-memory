@@ -10,6 +10,8 @@ export interface ParsedSession {
   cwd: string;
   startedAt: string;
   endedAt: string | null;
+  parentSessionId: string | null;
+  source: string;
   messages: ParsedMessage[];
 }
 
@@ -113,6 +115,8 @@ export function parseSessionFile(filePath: string): ParsedSession | null {
   let sessionId: string | null = null;
   let sessionCwd: string | null = null;
   let sessionTimestamp: string | null = null;
+  let parentSessionId: string | null = null;
+  let source = 'interactive';
   const messages: ParsedMessage[] = [];
 
   for (const line of lines) {
@@ -128,6 +132,11 @@ export function parseSessionFile(filePath: string): ParsedSession | null {
         sessionId = entry.id ?? null;
         sessionCwd = entry.cwd ?? null;
         sessionTimestamp = entry.timestamp ?? null;
+        {
+          const rawParent = entry.parentSessionId ?? entry.parent_session_id;
+          parentSessionId = typeof rawParent === 'string' && rawParent.trim() ? rawParent.trim() : null;
+          source = typeof entry.source === 'string' && entry.source.trim() ? entry.source.trim() : 'interactive';
+        }
         break;
 
       case 'message': {
@@ -167,6 +176,8 @@ export function parseSessionFile(filePath: string): ParsedSession | null {
     cwd: sessionCwd,
     startedAt: sessionTimestamp,
     endedAt: null, // We don't know when it ended from the JSONL
+    parentSessionId,
+    source,
     messages,
   };
 }

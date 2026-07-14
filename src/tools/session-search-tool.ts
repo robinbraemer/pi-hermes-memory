@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { DatabaseManager } from '../store/db.js';
-import { searchSessions, getIndexedMessageCount } from '../store/session-search.js';
+import { searchSessionsDetailed, getIndexedMessageCount } from '../store/session-search.js';
 import { searchSessionAnchors } from '../store/session-anchor-search.js';
 import type { SessionAnchorRange, SessionAnchorSearchResult } from '../store/session-anchor-search.js';
 import type { SessionSearchConfig } from '../types.js';
@@ -14,6 +14,14 @@ interface SearchResult {
   count?: number;
   message?: string;
   output?: string;
+  outputChars?: number;
+  outputTruncated?: boolean;
+  snippetChars?: number;
+  truncatedCount?: number;
+  candidateCount?: number;
+  sourceCount?: number;
+  omittedCount?: number;
+  refs?: Array<{ sessionId: string; rootSessionId: string; messageId: string }>;
   ranges?: SessionAnchorRange[];
 }
 
@@ -22,6 +30,26 @@ interface SessionSearchToolOptions {
 }
 
 const DEFAULT_SESSIONS_DIR = path.join(AGENT_ROOT, 'sessions');
+const DEFAULT_LEGACY_SNIPPET_CHARS = 1_200;
+const MAX_LEGACY_SNIPPET_CHARS = 4_000;
+const MAX_LEGACY_OUTPUT_CHARS = 50 * 1024;
+
+function truncateLegacySnippet(text: string, maxChars: number): { text: string; truncated: boolean } {
+  if (text.length <= maxChars) return { text, truncated: false };
+  return {
+    text: `${text.slice(0, maxChars)}\n... (truncated, ${text.length} chars total — refine the query or increase snippetChars)`,
+    truncated: true,
+  };
+}
+
+function capLegacyOutput(text: string): { text: string; truncated: boolean } {
+  if (text.length <= MAX_LEGACY_OUTPUT_CHARS) return { text, truncated: false };
+  const suffix = `\n... (output truncated, ${text.length} chars total — refine the query or lower the result limit)`;
+  return {
+    text: `${text.slice(0, MAX_LEGACY_OUTPUT_CHARS - suffix.length)}${suffix}`,
+    truncated: true,
+  };
+}
 
 export function registerSessionSearchTool(
   pi: ExtensionAPI,
@@ -127,7 +155,7 @@ Examples:
 - "Find the PR where we fixed the test hang"
 - "What approach did we take for the database migration?"
 
-Returns conversation snippets with session dates and project context.`,
+Returns bounded conversation snippets with session dates and project context. Large messages are truncated with their original character count.`,
     promptSnippet: 'Search past conversations for relevant context',
     promptGuidelines: [
       'Use session_search when the user asks about previous discussions or past work.',
@@ -136,14 +164,30 @@ Returns conversation snippets with session dates and project context.`,
     parameters: Type.Object({
       query: Type.String({ description: 'Search query. Use natural language or specific terms.' }),
       project: Type.Optional(Type.String({ description: 'Filter by project name (optional).' })),
+      sessionId: Type.Optional(Type.String({ description: 'Filter by an opaque session ref from a prior result (optional).' })),
       role: Type.Optional(StringEnum(['user', 'assistant'] as const, { description: 'Filter by message role (optional).' })),
-      limit: Type.Optional(Type.Number({ description: 'Maximum results to return (default: 10, max: 20).' })),
+      limit: Type.Optional(Type.Number({
+        description: 'Maximum results to return (default: 10, min: 1, max: 20).',
+        minimum: 1,
+        maximum: 20,
+      })),
+      snippetChars: Type.Optional(Type.Number({
+        description: `Maximum characters per result snippet (default: ${DEFAULT_LEGACY_SNIPPET_CHARS}, max: ${MAX_LEGACY_SNIPPET_CHARS}).`,
+        minimum: 100,
+        maximum: MAX_LEGACY_SNIPPET_CHARS,
+      })),
     }),
-    execute: async (_id: string, args: { query: string; project?: string; role?: string; limit?: number }) => {
+    execute: async (_id: string, args: { query: string; project?: string; sessionId?: string; role?: string; limit?: number; snippetChars?: number }) => {
       const query = args.query;
       const project = args.project;
+      const sessionId = args.sessionId;
       const role = args.role;
-      const limit = Math.min(args.limit || 10, 20);
+      const requestedLimit = Number.isFinite(args.limit) ? Math.floor(args.limit!) : 10;
+      const limit = Math.min(Math.max(requestedLimit, 1), 20);
+      const snippetChars = Math.min(
+        Math.max(Math.floor(args.snippetChars ?? DEFAULT_LEGACY_SNIPPET_CHARS), 100),
+        MAX_LEGACY_SNIPPET_CHARS,
+      );
 
       if (!query || query.trim().length === 0) {
         const result: SearchResult = { success: false, message: 'query is required' };
@@ -156,14 +200,23 @@ Returns conversation snippets with session dates and project context.`,
         return { content: [{ type: 'text' as const, text: result.message! }], details: result };
       }
 
-      const results = searchSessions(dbManager, query, { project, role, limit });
+      const search = searchSessionsDetailed(dbManager, query, { project, sessionId, role, limit, snippetChars });
+      const { results } = search;
 
       if (results.length === 0) {
-        const result: SearchResult = { success: true, count: 0, message: `No results found for "${query}". Try a different search term or broader query.` };
-        return { content: [{ type: 'text' as const, text: result.message! }], details: result };
+        const output = capLegacyOutput('No results found. Try a different search term or broader query.');
+        const result: SearchResult = {
+          success: true,
+          count: 0,
+          message: output.text,
+          outputChars: output.text.length,
+          outputTruncated: output.truncated,
+        };
+        return { content: [{ type: 'text' as const, text: output.text }], details: result };
       }
 
-      let output = `Found ${results.length} results for "${query}":\n\n`;
+      const blocks: string[] = [`Found ${results.length} results for "${query}":`];
+      let truncatedCount = 0;
 
       for (const r of results) {
         const date = new Date(r.timestamp).toLocaleDateString('en-US', {
@@ -172,13 +225,52 @@ Returns conversation snippets with session dates and project context.`,
           day: 'numeric',
         });
 
-        output += `---\n`;
-        output += `📅 ${date} | 📁 ${r.project} | ${r.role === 'user' ? '👤 User' : '🤖 Assistant'}\n`;
-        output += `${r.snippet}\n\n`;
+        const snippet = truncateLegacySnippet(r.snippet, snippetChars);
+        const contextTruncated = [...r.window, ...r.bookendStart, ...r.bookendEnd]
+          .some((message) => message.snippetTruncated);
+        if (r.snippetTruncated || snippet.truncated || contextTruncated) truncatedCount += 1;
+        const anchorIndex = r.window.findIndex((message) => message.anchor);
+        const before = anchorIndex < 0 ? 0 : anchorIndex;
+        const after = anchorIndex < 0 ? 0 : r.window.length - anchorIndex - 1;
+        const contextLines = [
+          `ref: session:${r.sessionId}/message:${r.messageId} root:${r.rootSessionId} source:${r.source} match:${r.matchMode} terms:${r.matchedTerms}/${r.totalTerms}`,
+          `context: ${before} before, ${after} after; ${r.messagesBefore} earlier, ${r.messagesAfter} later`,
+        ];
+        for (const message of r.bookendStart) {
+          contextLines.push(`bookend-start [${message.role}]: ${message.snippet}`);
+        }
+        for (const message of r.window) {
+          contextLines.push(`${message.anchor ? 'match' : 'window'} [${message.role}]: ${message.anchor ? snippet.text : message.snippet}`);
+        }
+        for (const message of r.bookendEnd) {
+          contextLines.push(`bookend-end [${message.role}]: ${message.snippet}`);
+        }
+        blocks.push([
+          '---',
+          `📅 ${date} | 📁 ${r.project} | ${r.role === 'user' ? '👤 User' : '🤖 Assistant'}`,
+          ...contextLines,
+        ].join('\n'));
       }
 
-      const finalResult: SearchResult = { success: true, count: results.length, output: output.trim() };
-      return { content: [{ type: 'text' as const, text: output.trim() }], details: finalResult };
+      const output = capLegacyOutput(blocks.join('\n\n').trim());
+      const reportedTruncatedCount = output.truncated ? Math.max(1, truncatedCount) : truncatedCount;
+      const finalResult: SearchResult = {
+        success: true,
+        count: results.length,
+        candidateCount: search.candidateCount,
+        sourceCount: search.sourceCount,
+        omittedCount: search.omittedCount,
+        truncatedCount: reportedTruncatedCount,
+        snippetChars,
+        outputChars: output.text.length,
+        outputTruncated: output.truncated,
+        refs: results.map((result) => ({
+          sessionId: result.sessionId,
+          rootSessionId: result.rootSessionId,
+          messageId: result.messageId,
+        })),
+      };
+      return { content: [{ type: 'text' as const, text: output.text }], details: finalResult };
     },
   });
 }

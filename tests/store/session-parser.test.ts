@@ -17,6 +17,42 @@ describe('session-parser', () => {
   });
 
   describe('parseSessionFile', () => {
+    it('parses optional synthetic lineage and source header metadata', () => {
+      const filePath = path.join(tmpDir, 'synthetic-metadata.jsonl');
+      fs.writeFileSync(filePath, JSON.stringify({
+        type: 'session',
+        id: 'synthetic-child',
+        timestamp: '2026-01-01T00:00:00Z',
+        cwd: '/synthetic/project',
+        parentSessionId: 'synthetic-root',
+        source: 'cron',
+      }));
+
+      const result = parseSessionFile(filePath);
+
+      assert.ok(result);
+      assert.strictEqual(result.parentSessionId, 'synthetic-root');
+      assert.strictEqual(result.source, 'cron');
+    });
+
+    it('defaults absent or invalid lineage metadata safely', () => {
+      const filePath = path.join(tmpDir, 'synthetic-defaults.jsonl');
+      fs.writeFileSync(filePath, JSON.stringify({
+        type: 'session',
+        id: 'synthetic-defaults',
+        timestamp: '2026-01-01T00:00:00Z',
+        cwd: '/synthetic/project',
+        parent_session_id: '   ',
+        source: 42,
+      }));
+
+      const result = parseSessionFile(filePath);
+
+      assert.ok(result);
+      assert.strictEqual(result.parentSessionId, null);
+      assert.strictEqual(result.source, 'interactive');
+    });
+
     it('should parse a valid session JSONL file', () => {
       const filePath = path.join(tmpDir, 'test-session.jsonl');
       const lines = [

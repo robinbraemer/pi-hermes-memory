@@ -4,16 +4,63 @@
 
 import { describe, it, beforeEach, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
 import { registerConsolidateCommand, triggerConsolidation } from "../../src/handlers/auto-consolidate.js";
 import { resolveChildPiInvocation } from "../../src/handlers/pi-child-process.js";
+import { MemoryStore } from "../../src/store/memory-store.js";
+import { AtomicLockCoordinator } from "../../src/store/atomic-lock-coordinator.js";
 import { ENTRY_DELIMITER } from "../../src/constants.js";
 
 // ─── Mock infrastructure ───
 
 let execCalls: any[];
+let directCalls: unknown[][];
+
+const directTransportLlmConfig = { reviewTransport: "direct" as const };
+
+function createDirectCtx(): { model: unknown; modelRegistry: unknown; _tag: string } {
+  return { model: {}, modelRegistry: {}, _tag: "consolidation-direct-ctx" };
+}
+
+function makeDirectDeps(
+  result: { ok: boolean; appliedCount: number } | "throw",
+): { runDirectMemoryCompletion: (...args: unknown[]) => Promise<{ ok: boolean; appliedCount: number }> } {
+  return {
+    runDirectMemoryCompletion: async (...args: unknown[]) => {
+      directCalls.push(args);
+      if (result === "throw") throw new Error("injected direct consolidation failure");
+      return result;
+    },
+  };
+}
+let LOCK_DIR = "";
+const OLD_LOCK_DIR = process.env.PI_HERMES_CONSOLIDATION_LOCK_DIR;
+
+function captureExecArgs(args: any[]): any[] {
+  const [command, childArgs, options] = args;
+  const capturedArgs = [...childArgs];
+  const promptReference = capturedArgs.at(-1);
+  if (typeof promptReference === "string" && promptReference.startsWith("@")) {
+    capturedArgs[capturedArgs.length - 1] = readFileSync(promptReference.slice(1), "utf-8");
+  }
+  return [command, capturedArgs, options];
+}
+before(async () => {
+  LOCK_DIR = await fs.mkdtemp(path.join(os.tmpdir(), "pi-consolidation-lock-"));
+  process.env.PI_HERMES_CONSOLIDATION_LOCK_DIR = LOCK_DIR;
+});
+
+after(async () => {
+  if (OLD_LOCK_DIR === undefined) {
+    delete process.env.PI_HERMES_CONSOLIDATION_LOCK_DIR;
+  } else {
+    process.env.PI_HERMES_CONSOLIDATION_LOCK_DIR = OLD_LOCK_DIR;
+  }
+  try { await fs.rm(LOCK_DIR, { recursive: true, force: true }); } catch { /* ignore */ }
+});
 
 function logicalChildArgs(call: any[]): string[] {
   const [cmd, args] = call;
@@ -34,7 +81,7 @@ function createMockPi(execReturn?: { code: number; stdout: string; stderr: strin
   return {
     on: () => {},
     exec: async (...args: any[]) => {
-      execCalls.push(args);
+      execCalls.push(captureExecArgs(args));
       return ret;
     },
     registerTool: () => {},
@@ -46,6 +93,15 @@ const mockStore = {
   getMemoryEntries: () => ["old entry 1", "old entry 2"],
   getUserEntries: () => ["user fact 1"],
   getAllFailureEntries: () => ["failure lesson 1", "failure lesson 2"],
+  getPersistedCharCount(target: "memory" | "user" | "failure") {
+    const entries = target === "user"
+      ? this.getUserEntries()
+      : target === "failure"
+        ? this.getAllFailureEntries()
+        : this.getMemoryEntries();
+    return entries.length ? entries.join(ENTRY_DELIMITER).length : 0;
+  },
+  getStorageIdentity: async (target: string) => path.join("mock-store", target),
   loadFromDisk: async () => {},
 } as any;
 
@@ -80,6 +136,108 @@ describe("triggerConsolidation", () => {
 
     assert.strictEqual(result.consolidated, true);
     assert.strictEqual(result.error, undefined);
+  });
+
+  it("clears a failed release before the next consolidation", async () => {
+    const prototype = AtomicLockCoordinator.prototype as any;
+    const originalDeleteOwnedLock = prototype.deleteOwnedLock;
+    let deleteAttempts = 0;
+    prototype.deleteOwnedLock = function (key: string, token: string): void {
+      deleteAttempts++;
+      if (deleteAttempts <= 3) throw new Error("injected consolidation release failure");
+      return originalDeleteOwnedLock.call(this, key, token);
+    };
+
+    try {
+      const pi = createMockPi();
+      const first = await triggerConsolidation(pi, mockStore, "memory");
+      const second = await triggerConsolidation(pi, mockStore, "memory");
+
+      assert.strictEqual(first.consolidated, true);
+      assert.strictEqual(second.consolidated, true);
+      assert.strictEqual(execCalls.length, 2);
+      assert.ok(deleteAttempts >= 4);
+    } finally {
+      prototype.deleteOwnedLock = originalDeleteOwnedLock;
+    }
+  });
+
+  it("skips a duplicate subprocess while the same target is consolidating", async () => {
+    const releaseExecs: Array<() => void> = [];
+    let markExecStarted!: () => void;
+    const execStarted = new Promise<void>((resolve) => { markExecStarted = resolve; });
+    const pi = {
+      on: () => {},
+      exec: async (...args: any[]) => {
+        execCalls.push(captureExecArgs(args));
+        markExecStarted();
+        await new Promise<void>((resolve) => { releaseExecs.push(resolve); });
+        return { code: 0, stdout: "Done", stderr: "" };
+      },
+      registerTool: () => {},
+      registerCommand: () => {},
+    } as any;
+
+    const first = triggerConsolidation(pi, mockStore, "memory");
+    await execStarted;
+    const second = triggerConsolidation(pi, mockStore, "memory");
+    const raced = await Promise.race([
+      second.then((result) => ({ result })),
+      settle(100).then(() => ({ timeout: true as const })),
+    ]);
+
+    releaseExecs.forEach((release) => release());
+    await Promise.allSettled([first, second]);
+
+    assert.ok("result" in raced, "duplicate consolidation should return without spawning another child");
+    assert.strictEqual(raced.result.consolidated, false);
+    assert.match(raced.result.error!, /already in progress/i);
+    assert.strictEqual(execCalls.length, 1, "only one child Pi process should be spawned");
+  });
+
+  it("allows the same project target to consolidate concurrently in distinct stores", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-consolidation-stores-"));
+    const stores = ["project-a", "project-b"].map((name) => new MemoryStore({
+      memoryDir: path.join(root, name),
+      memoryCharLimit: 5_000,
+      userCharLimit: 5_000,
+    } as any));
+    await Promise.all(stores.map((store) => store.loadFromDisk()));
+
+    let started = 0;
+    let markFirstStarted!: () => void;
+    let markBothStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const bothStarted = new Promise<void>((resolve) => { markBothStarted = resolve; });
+    const releases: Array<() => void> = [];
+    const pi = {
+      exec: async () => {
+        started++;
+        if (started === 1) markFirstStarted();
+        if (started === 2) markBothStarted();
+        await new Promise<void>((resolve) => { releases.push(resolve); });
+        return { code: 0, stdout: "Done", stderr: "" };
+      },
+    } as any;
+
+    try {
+      const first = triggerConsolidation(pi, stores[0], "memory", undefined, 60_000, "project");
+      await firstStarted;
+      const second = triggerConsolidation(pi, stores[1], "memory", undefined, 60_000, "project");
+      const raced = await Promise.race([
+        bothStarted.then(() => "both-started" as const),
+        settle(100).then(() => "timeout" as const),
+      ]);
+
+      releases.forEach((release) => release());
+      await Promise.allSettled([first, second]);
+
+      assert.strictEqual(raced, "both-started");
+      assert.strictEqual(started, 2);
+    } finally {
+      releases.forEach((release) => release());
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("returns { consolidated: false } on failure (non-zero exit code)", async () => {
@@ -148,7 +306,7 @@ describe("triggerConsolidation", () => {
     const pi = {
       on: () => {},
       exec: async (...args: any[]) => {
-        execCalls.push(args);
+        execCalls.push(captureExecArgs(args));
         if (execCalls.length === 1) {
           return { code: 1, stdout: "", stderr: "model not found" };
         }
@@ -189,7 +347,7 @@ describe("triggerConsolidation", () => {
     const pi = {
       on: () => {},
       exec: async (...args: any[]) => {
-        execCalls.push(args);
+        execCalls.push(captureExecArgs(args));
         return { code: 1, stdout: "", stderr: "memory tool returned no changes" };
       },
       registerTool: () => {},
@@ -214,6 +372,7 @@ describe("triggerConsolidation", () => {
     const emptyStore = {
       getMemoryEntries: () => [],
       getUserEntries: () => [],
+      getStorageIdentity: async (target: string) => path.join("empty-store", target),
       loadFromDisk: async () => {},
     } as any;
 
@@ -222,6 +381,288 @@ describe("triggerConsolidation", () => {
 
     const prompt = childPrompt(execCalls[0]);
     assert.ok(prompt.includes("(empty)"), "prompt should show (empty) for empty entries");
+  });
+
+  it("leases enough time for direct completion and subprocess retry", async () => {
+    const prototype = AtomicLockCoordinator.prototype as any;
+    const originalTryAcquire = prototype.tryAcquire;
+    let staleMs = 0;
+    prototype.tryAcquire = function (key: string, options: { staleMs: number }) {
+      staleMs = options.staleMs;
+      return originalTryAcquire.call(this, key, options);
+    };
+
+    try {
+      await triggerConsolidation(
+        createMockPi(),
+        mockStore,
+        "memory",
+        undefined,
+        1_234,
+        "memory",
+        directTransportLlmConfig,
+        createDirectCtx(),
+        null,
+        null,
+        makeDirectDeps({ ok: false, appliedCount: 0 }),
+      );
+    } finally {
+      prototype.tryAcquire = originalTryAcquire;
+    }
+
+    assert.strictEqual(staleMs, 30_000 + (3 * 1_234));
+  });
+
+  describe("direct transport", () => {
+    beforeEach(() => {
+      directCalls = [];
+    });
+
+    it("returns consolidated true via direct transport only when it reduces target size", async () => {
+      const pi = createMockPi();
+      const directCtx = createDirectCtx();
+      let entries = ["old entry 1", "old entry 2"];
+      const store = {
+        ...mockStore,
+        getMemoryEntries: () => entries,
+      } as any;
+      const result = await triggerConsolidation(
+        pi,
+        store,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        directCtx,
+        null,
+        null,
+        {
+          runDirectMemoryCompletion: async (...args: unknown[]) => {
+            directCalls.push(args);
+            entries = ["short"];
+            return { ok: true, appliedCount: 3 };
+          },
+        },
+      );
+
+      assert.strictEqual(result.consolidated, true);
+      assert.strictEqual(result.error, undefined);
+      assert.strictEqual(directCalls.length, 1);
+      assert.deepStrictEqual((directCalls[0][3] as any).allowedTargets, ["memory"]);
+      assert.strictEqual(execCalls.length, 0, "subprocess must not run on successful direct consolidation");
+    });
+
+    it("falls back when persisted target usage grows despite shorter visible entries", async () => {
+      const pi = createMockPi();
+      let entries = ["old entry 1", "old entry 2"];
+      let persistedChars = 100;
+      const store = {
+        ...mockStore,
+        getMemoryEntries: () => entries,
+        getPersistedCharCount: () => persistedChars,
+      } as any;
+
+      const result = await triggerConsolidation(
+        pi,
+        store,
+        "memory",
+        undefined,
+        60_000,
+        "memory",
+        directTransportLlmConfig,
+        createDirectCtx(),
+        null,
+        null,
+        {
+          runDirectMemoryCompletion: async (...args: unknown[]) => {
+            directCalls.push(args);
+            entries = ["short"];
+            persistedChars = 101;
+            return { ok: true, appliedCount: 1 };
+          },
+        },
+      );
+
+      assert.strictEqual(result.consolidated, true);
+      assert.strictEqual(directCalls.length, 1);
+      assert.strictEqual(execCalls.length, 1);
+    });
+
+    it("falls back when direct operations do not reduce target size", async () => {
+      const pi = createMockPi();
+      const result = await triggerConsolidation(
+        pi,
+        mockStore,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        createDirectCtx(),
+        null,
+        null,
+        makeDirectDeps({ ok: true, appliedCount: 3 }),
+      );
+
+      assert.strictEqual(result.consolidated, true);
+      assert.strictEqual(directCalls.length, 1);
+      assert.strictEqual(execCalls.length, 1, "non-shrinking direct operations must fall back");
+    });
+
+    it("builds subprocess fallback from the post-direct snapshot", async () => {
+      const pi = createMockPi();
+      let entries = ["old entry"];
+      const store = {
+        ...mockStore,
+        getMemoryEntries: () => entries,
+      } as any;
+      await triggerConsolidation(
+        pi,
+        store,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        createDirectCtx(),
+        null,
+        null,
+        {
+          runDirectMemoryCompletion: async (...args: unknown[]) => {
+            directCalls.push(args);
+            entries = ["new larger entry after direct mutation"];
+            return { ok: true, appliedCount: 1 };
+          },
+        },
+      );
+
+      assert.strictEqual(execCalls.length, 1);
+      const prompt = childPrompt(execCalls[0]);
+      assert.match(prompt, /new larger entry after direct mutation/);
+      assert.doesNotMatch(prompt, /old entry/);
+    });
+
+    it("holds the consolidation lease while direct transport is running", async () => {
+      const pi = createMockPi();
+      const { promise: directPending, resolve: finishDirect } = Promise.withResolvers<{ ok: boolean; appliedCount: number }>();
+      const { promise: directStarted, resolve: markDirectStarted } = Promise.withResolvers<void>();
+      const deps = {
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          markDirectStarted();
+          return directPending;
+        },
+      };
+
+      const first = triggerConsolidation(
+        pi, mockStore, "memory", undefined, 60000, "memory",
+        directTransportLlmConfig, createDirectCtx(), null, null, deps,
+      );
+      await directStarted;
+      const second = triggerConsolidation(
+        pi, mockStore, "memory", undefined, 60000, "memory",
+        directTransportLlmConfig, createDirectCtx(), null, null, deps,
+      );
+      const secondRace = await Promise.race([
+        second.then((result) => ({ result })),
+        settle(100).then(() => ({ timeout: true as const })),
+      ]);
+      const directCallCount = directCalls.length;
+      finishDirect({ ok: false, appliedCount: 0 });
+      await Promise.all([first, second]);
+      assert.ok("result" in secondRace, "duplicate consolidation should return while direct transport is pending");
+      assert.strictEqual(directCallCount, 1, "duplicate direct completion must not start");
+      assert.strictEqual(secondRace.result.consolidated, false);
+      assert.match(secondRace.result.error!, /already in progress/i);
+    });
+
+    it("falls back to subprocess when direct transport succeeds with appliedCount 0", async () => {
+      const pi = createMockPi();
+      const directCtx = createDirectCtx();
+      const result = await triggerConsolidation(
+        pi,
+        mockStore,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        directCtx,
+        null,
+        null,
+        makeDirectDeps({ ok: true, appliedCount: 0 }),
+      );
+
+      assert.strictEqual(result.consolidated, true);
+      assert.strictEqual(directCalls.length, 1);
+      assert.strictEqual(execCalls.length, 1, "empty direct result must fall back to subprocess");
+    });
+
+    it("falls back to subprocess when direct transport returns ok false", async () => {
+      const pi = createMockPi();
+      const directCtx = createDirectCtx();
+      const result = await triggerConsolidation(
+        pi,
+        mockStore,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        directCtx,
+        null,
+        null,
+        makeDirectDeps({ ok: false, appliedCount: 0 }),
+      );
+
+      assert.strictEqual(result.consolidated, true);
+      assert.strictEqual(directCalls.length, 1);
+      assert.strictEqual(execCalls.length, 1, "failed direct result must fall back to subprocess");
+    });
+
+    it("falls back to subprocess when direct transport throws without propagating", async () => {
+      const pi = createMockPi();
+      const directCtx = createDirectCtx();
+      const result = await triggerConsolidation(
+        pi,
+        mockStore,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        directCtx,
+        null,
+        null,
+        makeDirectDeps("throw"),
+      );
+
+      assert.strictEqual(result.consolidated, true);
+      assert.strictEqual(directCalls.length, 1);
+      assert.strictEqual(execCalls.length, 1, "thrown direct error must fall back to subprocess");
+    });
+
+    it("does not attempt direct transport when directCtx is null", async () => {
+      const pi = createMockPi();
+      const result = await triggerConsolidation(
+        pi,
+        mockStore,
+        "memory",
+        undefined,
+        60000,
+        "memory",
+        directTransportLlmConfig,
+        null,
+        null,
+        null,
+        makeDirectDeps({ ok: true, appliedCount: 3 }),
+      );
+
+      assert.strictEqual(result.consolidated, true);
+      assert.strictEqual(directCalls.length, 0, "direct path must be skipped without directCtx");
+      assert.strictEqual(execCalls.length, 1, "subprocess-only path must still consolidate");
+    });
   });
 });
 
@@ -238,7 +679,7 @@ describe("registerConsolidateCommand", () => {
     const pi = {
       on: () => {},
       exec: async (...args: any[]) => {
-        execCalls.push(args);
+        execCalls.push(captureExecArgs(args));
         return { code: 0, stdout: "Done", stderr: "" };
       },
       registerTool: () => {},
@@ -250,6 +691,8 @@ describe("registerConsolidateCommand", () => {
     const projectStore = {
       getMemoryEntries: () => ["project fact"],
       getUserEntries: () => [],
+      getPersistedCharCount: () => "project fact".length,
+      getStorageIdentity: async (target: string) => path.join("project-store", target),
       loadFromDisk: async () => { projectReloaded = true; },
     } as any;
 
@@ -282,7 +725,7 @@ describe("registerConsolidateCommand", () => {
     const pi = {
       on: () => {},
       exec: async (...args: any[]) => {
-        execCalls.push(args);
+        execCalls.push(captureExecArgs(args));
         return { code: 0, stdout: "Done", stderr: "" };
       },
       registerTool: () => {},
@@ -308,7 +751,7 @@ describe("registerConsolidateCommand", () => {
     const pi = {
       on: () => {},
       exec: async (...args: any[]) => {
-        execCalls.push(args);
+        execCalls.push(captureExecArgs(args));
         return { code: 0, stdout: "Done", stderr: "" };
       },
       registerTool: () => {},
@@ -329,6 +772,74 @@ describe("registerConsolidateCommand", () => {
         },
       });
     });
+  });
+
+  it("passes command ctx to direct consolidation and reflects success in the summary", async () => {
+    directCalls = [];
+    let memoryEntries = ["old memory entry one", "old memory entry two"];
+    let userEntries = ["old user entry one", "old user entry two"];
+    let failureEntries = ["old failure entry one", "old failure entry two"];
+    const commandStore = {
+      ...mockStore,
+      getMemoryEntries: () => memoryEntries,
+      getUserEntries: () => userEntries,
+      getAllFailureEntries: () => failureEntries,
+    } as any;
+    let handler: ((_args: unknown, ctx: unknown) => Promise<void>) | undefined;
+    const notifications: string[] = [];
+    const commandCtx = {
+      model: {},
+      modelRegistry: {},
+      signal: undefined,
+      ui: { notify: (message: string) => { notifications.push(message); } },
+      _tag: "manual-consolidate-ctx",
+    };
+
+    const pi = {
+      on: () => {},
+      exec: async (...args: unknown[]) => {
+        execCalls.push(captureExecArgs(args as Parameters<typeof captureExecArgs>[0]));
+        return { code: 0, stdout: "Done", stderr: "" };
+      },
+      registerTool: () => {},
+      registerCommand: (_name: string, command: { handler: typeof handler }) => {
+        handler = command.handler;
+      },
+    } as unknown as Parameters<typeof registerConsolidateCommand>[0];
+
+    registerConsolidateCommand(
+      pi,
+      commandStore,
+      60000,
+      null,
+      null,
+      directTransportLlmConfig,
+      null,
+      {
+        runDirectMemoryCompletion: async (...args: unknown[]) => {
+          directCalls.push(args);
+          const prompt = (args[3] as { userPrompt: string }).userPrompt;
+          if (prompt.includes("target: 'memory'")) memoryEntries = ["short"];
+          if (prompt.includes("target: 'user'")) userEntries = ["short"];
+          if (prompt.includes("target: 'failure'")) failureEntries = ["short"];
+          return { ok: true, appliedCount: 2 };
+        },
+      },
+    );
+
+    assert.ok(handler, "command handler should be registered");
+    await handler!({}, commandCtx);
+
+    assert.strictEqual(directCalls.length, 3, "memory, user, and failure targets should use direct transport");
+    assert.strictEqual(execCalls.length, 0, "successful direct consolidation should not spawn subprocess");
+    for (const call of directCalls) {
+      assert.strictEqual(call[0], commandCtx, "runDirectMemoryCompletion must receive the command ctx");
+    }
+
+    const finalNotification = notifications[notifications.length - 1] ?? "";
+    assert.ok(finalNotification.includes("memory: ✅ consolidated"), "summary should show memory consolidated");
+    assert.ok(finalNotification.includes("user: ✅ consolidated"), "summary should show user consolidated");
+    assert.ok(finalNotification.includes("failure: ✅ consolidated"), "summary should show failure consolidated");
   });
 });
 

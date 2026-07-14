@@ -42,6 +42,8 @@ describe('session-indexer', () => {
       cwd: '/test',
       startedAt: '2026-05-03T00:00:00Z',
       endedAt: null,
+      parentSessionId: null,
+      source: 'interactive',
       messages: [
         { id: `${id}-msg-1`, role: 'user', content: 'Hello', timestamp: '2026-05-03T00:01:00Z' },
         { id: `${id}-msg-2`, role: 'assistant', content: 'Hi there!', timestamp: '2026-05-03T00:01:30Z', toolCalls: ['read'] },
@@ -51,6 +53,43 @@ describe('session-indexer', () => {
   }
 
   describe('indexSession', () => {
+    it('indexes a child before its parent is available', () => {
+      const result = indexSession(dbManager, createTestSession({
+        id: 'synthetic-newest-child',
+        parentSessionId: 'synthetic-older-parent',
+      }));
+
+      assert.strictEqual(result.messagesIndexed, 2);
+      const row = dbManager.getDb().prepare(
+        'SELECT parent_session_id FROM sessions WHERE id = ?',
+      ).get('synthetic-newest-child') as { parent_session_id: string | null };
+      assert.strictEqual(row.parent_session_id, 'synthetic-older-parent');
+    });
+
+    it('persists and updates synthetic lineage and source metadata', () => {
+      indexSession(dbManager, createTestSession({ id: 'synthetic-root' }));
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-child',
+        parentSessionId: 'synthetic-root',
+        source: 'cron',
+      }));
+
+      const row = dbManager.getDb().prepare(
+        'SELECT parent_session_id, source FROM sessions WHERE id = ?',
+      ).get('synthetic-child') as { parent_session_id: string | null; source: string };
+      assert.deepStrictEqual(row, { parent_session_id: 'synthetic-root', source: 'cron' });
+
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-child',
+        parentSessionId: null,
+        source: 'automation',
+      }));
+      const updated = dbManager.getDb().prepare(
+        'SELECT parent_session_id, source FROM sessions WHERE id = ?',
+      ).get('synthetic-child') as { parent_session_id: string | null; source: string };
+      assert.deepStrictEqual(updated, { parent_session_id: 'synthetic-root', source: 'automation' });
+    });
+
     it('should index a session and its messages', () => {
       const session = createTestSession();
       const result = indexSession(dbManager, session);
@@ -352,6 +391,8 @@ describe('session-indexer', () => {
       assert.ok(parsed);
       assert.strictEqual(parsed.id, 'live-session-1');
       assert.strictEqual(parsed.project, 'live-project');
+      assert.strictEqual(parsed.parentSessionId, null);
+      assert.strictEqual(parsed.source, 'interactive');
       assert.strictEqual(parsed.messages.length, 2);
       assert.deepStrictEqual(parsed.messages[1].toolCalls, ['read']);
     });

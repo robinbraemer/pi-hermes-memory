@@ -282,6 +282,20 @@ Search behavior notes:
 - Multi-word natural-language queries are supported for both `memory_search` and `session_search`.
 - Exact phrases can be requested with quotes, for example `"memory search"`.
 - Advanced FTS queries with operators like `OR` still work when you need them.
+- FTS produces a widened candidate set, then results are ranked deterministically by lexical relevance and last-reference/message recency. Stable source and ID keys break remaining ties.
+- Session hits collapse to one result per session lineage. Known `cron` and `automation` sources are demoted rather than hidden, and project/source diversity prevents one source from filling the first result pass while still filling unused capacity.
+- Session results include a small query-anchored message window and non-overlapping opener/closer bookends. Empty or tool-call-only prose does not displace useful context.
+- Both tools return query-local snippets bounded to 1,200 characters by default (`snippetChars`: 100–4,000) and enforce a hard 50 KiB total response ceiling.
+- Compact refs identify results as `session:<session-id>/message:<message-id>` or `memory:<id>`. Details contain counts and opaque IDs, not duplicated snippets, working directories, or full stored content; `truncatedCount` is non-zero when retrieval shaping or the final safety cap truncates output.
+
+To read one result more deeply without opening an unbounded browse mode, repeat the same query with its returned ref and a larger bounded snippet:
+
+```text
+session_search({ query: "same terms", sessionId: "<session-id>", limit: 1, snippetChars: 4_000 })
+memory_search({ query: "same terms", memoryId: 42, limit: 1, snippetChars: 4_000 })
+```
+
+Retrieval is local-only: ranking and snippet selection read the extension's SQLite store and do not call an LLM, network provider, embedding service, or telemetry endpoint.
 
 Session history is indexed automatically during the active session and on session shutdown. Startup also runs a bounded incremental backfill for missed sessions: it compares stored file metadata and only parses files without matching metadata, capped per startup. To bulk-import existing sessions manually:
 
@@ -289,7 +303,7 @@ Session history is indexed automatically during the active session and on sessio
 /memory-index-sessions
 ```
 
-For users who prefer source anchors over snippets, `sessionSearch.variant` can be set to `anchors`. In that opt-in mode, the same `session_search` tool reads session JSONL files directly and accepts a Markdown request with fields such as `from`, `to`, `cwd`, and `limit`, plus `all`, `any`, and `exclude` lists. It returns plain text with `count`, an optional `message`, and compact `path:startLine-endLine` style anchors with short reasons instead of summaries or previews.
+For users who prefer source anchors over snippets, `sessionSearch.variant` can be set to `anchors`. This opt-in mode is unchanged by hybrid retrieval: the same `session_search` tool reads session JSONL files directly and accepts a Markdown request with fields such as `from`, `to`, `cwd`, and `limit`, plus `all`, `any`, and `exclude` lists. It returns plain text with `count`, an optional `message`, and compact `path:startLine-endLine` style anchors with short reasons instead of summaries or previews.
 
 ### Extended Memory Store
 
@@ -299,6 +313,7 @@ This means:
 - Fresh `memory` tool writes become searchable immediately
 - Older Markdown entries can be backfilled with `/memory-sync-markdown`
 - SQLite search does **not** replace the core Markdown limit
+- Memory recall uses the same deterministic relevance ranking, source diversity, query-local snippet bounds, compact refs, and 50 KiB response ceiling as session recall
 
 This is the **hybrid memory architecture**:
 - **Core memory** (MEMORY.md/USER.md/failures.md): Human-readable, size-limited, searchable by default
@@ -339,18 +354,18 @@ Background review triggers based on **activity level**, not just turn count:
 
 Both counters reset after each review.
 
-### Background Review Transport
+### Direct-Transport LLM Calls (Review, Flush, Correction, Consolidation)
 
-By default, background review uses an in-process `completeSimple()` side-channel: a small JSON-only prompt, no child `pi` process, and memory writes applied directly by the extension. This keeps the main session's system prompt, tools, and LLM prefix cache intact.
+By default, background review, session flush, correction save, and the manual `/memory-consolidate` command use an in-process `completeSimple()` side-channel: a small JSON-only prompt, no child `pi` process, and memory writes applied directly by the extension. This keeps the main session's system prompt, tools, and LLM prefix cache intact, and avoids the subprocess path's argv/`--no-extensions` concerns entirely on the common path.
 
-If direct review fails (no model, no auth, provider error, unparseable response), it automatically falls back to the legacy `pi -p --no-session` subprocess path.
+If direct mode fails (no model, no auth, provider error, unparseable response, or — for consolidation only — a result that didn't actually free any space), it automatically falls back to the legacy `pi -p --no-session` subprocess path. The automatic over-capacity consolidator triggered from `MemoryStore` itself always uses the subprocess path, since it runs without extension-runtime access.
 
 Set `reviewTransport` in config only when you need to override this:
 
 | Value | Behavior |
 |---|---|
 | `direct` (default) | Try in-process `completeSimple()` first; fall back to subprocess on failure |
-| `subprocess` | Always use `pi -p` subprocess (pre-PR #92 behavior) |
+| `subprocess` | Always use `pi -p` subprocess for every LLM-driven memory operation (pre-PR #92 behavior) |
 
 ### Skill Auto-Extraction
 
@@ -471,11 +486,12 @@ Create `~/.pi/agent/hermes-memory-config.json`:
 | `sessionSearch` | `{ "variant": "legacy" }` | Session search implementation: `legacy` keeps the existing SQLite/FTS snippet search; `anchors` uses the opt-in Markdown request surface and returns compact JSONL line-range anchors from `~/.pi/agent/sessions/` |
 | `llmModelOverride` | unset | Optional model override for background review (direct and subprocess), correction save, session flush, and consolidation |
 | `llmThinkingOverride` | unset | Optional thinking override for those LLM calls; valid values are `off`, `minimal`, `low`, `medium`, `high`, and `xhigh`. If `llmModelOverride` is set and this is omitted, review/child calls default to `off` |
+| `childExtensionPaths` | unset | Trusted provider/auth adapter entry paths explicitly allowed in isolated child Pi processes; sibling packages matching the `*-oauth-adapter`/`*-auth-adapter` naming convention (including scoped packages, via their `package.json` `pi.extensions` manifest) are detected automatically — this setting is only needed for adapters that don't match that convention. In-process direct transport (the default for review/flush/correction/consolidation) doesn't need this at all, since it reads whatever provider auth is already registered |
 | `nudgeInterval` | `10` | Turns between auto-reviews |
 | `nudgeToolCalls` | `15` | Tool calls between auto-reviews (OR with turns) |
 | `reviewRecentMessages` | `0` | Recent messages included in background review (`0` = all) |
 | `reviewEnabled` | `true` | Enable/disable background learning loop |
-| `reviewTransport` | `direct` | Background review LLM transport: `direct` uses in-process `completeSimple()` with subprocess fallback; `subprocess` forces legacy `pi -p` only |
+| `reviewTransport` | `direct` | LLM transport for background review, session flush, correction save, and manual consolidation: `direct` uses in-process `completeSimple()` with subprocess fallback; `subprocess` forces legacy `pi -p` only |
 | `memoryOverflowStrategy` | `auto-consolidate` | Behavior when MEMORY.md, USER.md, failures.md, or project-scoped memory reaches its character limit: `auto-consolidate` runs the existing consolidation flow; `reject` returns an error; `fifo-evict` rotates older entries in file order until the new entry fits |
 | `autoConsolidate` | `true` | Legacy alias for `memoryOverflowStrategy` when `memoryOverflowStrategy` is not set (`true` = `auto-consolidate`, `false` = `reject`) |
 | `consolidationTimeoutMs` | `60000` | Maximum time in milliseconds for auto-consolidation to complete |
@@ -527,7 +543,7 @@ The `sessions.db` SQLite database stores session history and extended memory ent
 ## Known Limitations
 
 - **`§` delimiter**: Memory entries are separated by `§` (section sign). If an entry naturally contains `§`, it will be split incorrectly on reload. This is rare in English text but possible. [Hermes uses the same delimiter.]
-- **Background review cost**: Each review cycle costs one full LLM API call via a child `pi -p` process. Correction detection and explicit skill saves can add additional calls when the agent decides they are worth it.
+- **Background review cost**: Each review cycle costs one LLM API call. Direct transport makes that call in-process by default and falls back to a child `pi -p` process on failure. Correction detection and explicit skill saves can add additional calls when the agent decides they are worth it.
 - **Session search requires indexing**: Past sessions must be indexed before they're searchable. Run `/memory-index-sessions` to bulk-import, or let the extension auto-index on session shutdown.
 - **Older Markdown memories may need backfill**: If you saved memories before the SQLite mirror existed or search looks stale, run `/memory-sync-markdown`.
 - **Core memory limits still apply**: SQLite search mirroring does not bypass the 5,000-char core Markdown limit. If consolidation cannot free space, the write fails instead of becoming SQLite-only memory invisibly.

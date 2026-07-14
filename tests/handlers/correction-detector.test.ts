@@ -10,8 +10,12 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseManager } from "../../src/store/db.js";
 import { getMemories } from "../../src/store/sqlite-memory-store.js";
+import { MemoryStore } from "../../src/store/memory-store.js";
+import { registerMemoryTool } from "../../src/tools/memory-tool.js";
 import { isCorrection, setupCorrectionDetector } from "../../src/handlers/correction-detector.js";
 import { resolveChildPiInvocation } from "../../src/handlers/pi-child-process.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { MemoryConfig } from "../../src/types.js";
 
 // ─── Pattern matching tests ───
 
@@ -242,6 +246,42 @@ describe("setupCorrectionDetector handler", () => {
     } as any;
   }
 
+  let directCalls: unknown[][];
+
+  function makeDirectDeps(
+    result: { ok: boolean; appliedCount: number } | "throw",
+  ): { runDirectMemoryCompletion: (...args: unknown[]) => Promise<{ ok: boolean; appliedCount: number }> } {
+    return {
+      runDirectMemoryCompletion: async (...args: unknown[]) => {
+        directCalls.push(args);
+        if (result === "throw") throw new Error("injected direct correction failure");
+        return result;
+      },
+    };
+  }
+
+
+  function correctionBranch(userText = "don't do that") {
+    return [
+      { type: "message", message: { role: "user", content: [{ type: "text", text: userText }] } },
+      { type: "message", message: { role: "assistant", content: [{ type: "text", text: "I used npm" }] } },
+    ];
+  }
+
+  function storeWithFailureTracking() {
+    let failureCount = 0;
+    return {
+      store: {
+        getMemoryEntries: () => ["existing entry"],
+        getUserEntries: () => [],
+        addFailure: async () => {
+          failureCount += 1;
+        },
+        getFailureCount: () => failureCount,
+      },
+    };
+  }
+
   function logicalChildArgs(call: any[]): string[] {
     const [cmd, args] = call;
     const logicalArgs = cmd === "pi" ? args : args.slice(1);
@@ -266,9 +306,11 @@ describe("setupCorrectionDetector handler", () => {
     flushOnCompact: false,
     flushOnShutdown: false,
     flushMinTurns: 6,
-    autoConsolidate: false,
     nudgeToolCalls: 15,
+    consolidationTimeoutMs: 60_000,
   };
+
+  const directTransportConfig: MemoryConfig = { ...config, reviewTransport: "direct" };
 
   function makeCtx(branch: any[] = []) {
     return {
@@ -290,24 +332,18 @@ describe("setupCorrectionDetector handler", () => {
     }
   }
 
-  function fireTurnEnd(branch: any[] = []) {
+  function fireTurnEnd(branch: any[] = []): Promise<unknown> {
     const h = handlers["turn_end"];
     if (!h) throw new Error("No turn_end handler registered");
     const ctx = makeCtx(branch);
-    for (const fn of h) {
-      fn({}, ctx);
-    }
-    return ctx;
-  }
-
-  async function settle(ms = 10) {
-    await new Promise((r) => setTimeout(r, ms));
+    return Promise.all(h.map((fn) => fn({}, ctx)));
   }
 
   beforeEach(() => {
     handlers = {};
     execCalls = [];
     notifyCalls = [];
+    directCalls = [];
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "correction-detector-test-"));
     dbManager = new DatabaseManager(tmpDir);
   });
@@ -327,8 +363,7 @@ describe("setupCorrectionDetector handler", () => {
     ];
 
     fireMessageEnd("user", "don't do that");
-    fireTurnEnd(branch);
-    await settle();
+    await fireTurnEnd(branch);
 
     assert.ok(execCalls.length >= 1, "pi.exec should be called on correction");
   });
@@ -346,8 +381,7 @@ describe("setupCorrectionDetector handler", () => {
     ];
 
     fireMessageEnd("user", "don't do that");
-    fireTurnEnd(branch);
-    await settle();
+    await fireTurnEnd(branch);
 
     const cmdArgs = logicalChildArgs(execCalls[0]);
     assert.deepStrictEqual(
@@ -361,8 +395,7 @@ describe("setupCorrectionDetector handler", () => {
     setupCorrectionDetector(pi, mockStore, null, config);
 
     fireMessageEnd("user", "looks good");
-    fireTurnEnd([]);
-    await settle();
+    await fireTurnEnd([]);
 
     assert.strictEqual(execCalls.length, 0, "pi.exec should NOT be called for normal messages");
   });
@@ -373,26 +406,23 @@ describe("setupCorrectionDetector handler", () => {
 
     // First correction
     fireMessageEnd("user", "don't do that");
-    fireTurnEnd([]);
-    await settle();
+    await fireTurnEnd([]);
 
     const firstCallCount = execCalls.length;
     assert.ok(firstCallCount >= 1, "first correction should trigger");
 
     // Second correction within 3 turns — should be rate-limited
     fireMessageEnd("user", "not like that");
-    fireTurnEnd([]);
-    await settle();
+    await fireTurnEnd([]);
 
     assert.strictEqual(execCalls.length, firstCallCount, "second correction should be rate-limited");
   });
 
   it("syncs direct correction saves into SQLite", async () => {
     const pi = createMockPi();
-    const correctionStore = {
-      ...mockStore,
-      addFailure: async () => ({ success: true, target: 'failure', entry_count: 1, message: 'Failure memory saved: correction' }),
-    } as any;
+    const correctionStore = new MemoryStore({ ...config, memoryDir: tmpDir } as any);
+    await correctionStore.loadFromDisk();
+    registerMemoryTool(pi, correctionStore, null, dbManager);
 
     setupCorrectionDetector(pi, correctionStore, null, config, dbManager);
 
@@ -402,24 +432,23 @@ describe("setupCorrectionDetector handler", () => {
     ];
 
     fireMessageEnd("user", "no, use pnpm instead");
-    fireTurnEnd(branch);
-    await settle();
+    await fireTurnEnd(branch);
 
     const failures = getMemories(dbManager, { target: 'failure' });
     assert.strictEqual(failures.length, 1);
     assert.match(failures[0].content, /use pnpm instead/);
     assert.strictEqual(failures[0].category, 'correction');
+    assert.strictEqual(failures[0].project, null);
   });
 
   it("syncs project correction saves into SQLite with project scope", async () => {
     const pi = createMockPi();
-    const correctionStore = {
-      ...mockStore,
-      addFailure: async () => ({ success: true, target: 'failure', entry_count: 1, message: 'Failure memory saved: correction' }),
-    } as any;
+    const correctionStore = new MemoryStore({ ...config, memoryDir: tmpDir } as any);
+    await correctionStore.loadFromDisk();
     const projectStore = {
       getMemoryEntries: () => [],
     } as any;
+    registerMemoryTool(pi, correctionStore, projectStore, dbManager, 'project-a');
 
     setupCorrectionDetector(pi, correctionStore, projectStore, config, dbManager, 'project-a');
 
@@ -429,26 +458,20 @@ describe("setupCorrectionDetector handler", () => {
     ];
 
     fireMessageEnd("user", "no, use pnpm in this repo");
-    fireTurnEnd(branch);
-    await settle();
+    await fireTurnEnd(branch);
 
     const projectFailures = getMemories(dbManager, { target: 'failure', project: 'project-a' });
     assert.strictEqual(projectFailures.length, 1);
     assert.match(projectFailures[0].content, /use pnpm in this repo/);
-    assert.match(projectFailures[0].content, /Project: project-a/);
+    assert.doesNotMatch(projectFailures[0].content, /Project: project-a/);
     assert.strictEqual(projectFailures[0].category, 'correction');
+    assert.strictEqual(getMemories(dbManager, { target: 'failure', project: null }).length, 0);
   });
 
   it("does not break correction handling when SQLite sync fails", async () => {
     const pi = createMockPi();
-    let addFailureCalls = 0;
-    const correctionStore = {
-      ...mockStore,
-      addFailure: async () => {
-        addFailureCalls++;
-        return { success: true, target: 'failure', entry_count: 1, message: 'Failure memory saved: correction' };
-      },
-    } as any;
+    const correctionStore = new MemoryStore({ ...config, memoryDir: tmpDir } as any);
+    await correctionStore.loadFromDisk();
 
     const failingDbManager = {
       getDb: () => {
@@ -456,6 +479,7 @@ describe("setupCorrectionDetector handler", () => {
       },
     } as unknown as DatabaseManager;
 
+    registerMemoryTool(pi, correctionStore, null, failingDbManager);
     setupCorrectionDetector(pi, correctionStore, null, config, failingDbManager);
 
     const branch = [
@@ -464,11 +488,121 @@ describe("setupCorrectionDetector handler", () => {
     ];
 
     fireMessageEnd("user", "no, use yarn instead");
-    fireTurnEnd(branch);
-    await settle();
+    await fireTurnEnd(branch);
 
     assert.ok(execCalls.length >= 1, 'correction review should still run');
-    assert.strictEqual(addFailureCalls, 1, 'Markdown correction save should still happen');
+    assert.strictEqual(correctionStore.getFailureEntries().length, 1, 'Markdown correction save should still happen');
+  });
+
+  describe("direct memory completion transport", () => {
+    it("skips subprocess and notifies when direct succeeds with applied memories", async () => {
+      const pi = createMockPi();
+      const { store } = storeWithFailureTracking();
+      setupCorrectionDetector(
+        pi,
+        store as unknown as MemoryStore,
+        null,
+        directTransportConfig,
+        null,
+        null,
+        makeDirectDeps({ ok: true, appliedCount: 1 }),
+      );
+
+      fireMessageEnd("user", "don't do that");
+      await fireTurnEnd(correctionBranch());
+
+      assert.strictEqual(directCalls.length, 1);
+      assert.strictEqual(execCalls.length, 0, "subprocess must not run on successful direct correction");
+      assert.deepStrictEqual(
+        notifyCalls.filter((n) => n.msg === "🔧 Correction detected — memory updated"),
+        [{ msg: "🔧 Correction detected — memory updated", level: "info" }],
+      );
+    });
+
+    it("skips subprocess and omits memory-updated notify when direct ok with zero applied", async () => {
+      const pi = createMockPi();
+      const { store } = storeWithFailureTracking();
+      setupCorrectionDetector(
+        pi,
+        store as unknown as MemoryStore,
+        null,
+        directTransportConfig,
+        null,
+        null,
+        makeDirectDeps({ ok: true, appliedCount: 0 }),
+      );
+
+      fireMessageEnd("user", "don't do that");
+      await fireTurnEnd(correctionBranch());
+
+      assert.strictEqual(directCalls.length, 1);
+      assert.strictEqual(execCalls.length, 0, "ok:true with appliedCount 0 still completes via direct transport");
+      assert.strictEqual(
+        notifyCalls.some((n) => n.msg === "🔧 Correction detected — memory updated"),
+        false,
+      );
+    });
+
+    it("falls back to subprocess when direct returns ok false", async () => {
+      const pi = createMockPi();
+      const { store } = storeWithFailureTracking();
+      setupCorrectionDetector(
+        pi,
+        store as unknown as MemoryStore,
+        null,
+        directTransportConfig,
+        null,
+        null,
+        makeDirectDeps({ ok: false, appliedCount: 0 }),
+      );
+
+      fireMessageEnd("user", "don't do that");
+      await fireTurnEnd(correctionBranch());
+
+      assert.strictEqual(directCalls.length, 1);
+      assert.ok(execCalls.length >= 1, "failed direct result must fall back to subprocess");
+    });
+
+    it("falls back to subprocess when direct throws without propagating", async () => {
+      const pi = createMockPi();
+      const { store } = storeWithFailureTracking();
+      setupCorrectionDetector(
+        pi,
+        store as unknown as MemoryStore,
+        null,
+        directTransportConfig,
+        null,
+        null,
+        makeDirectDeps("throw"),
+      );
+
+      fireMessageEnd("user", "don't do that");
+      await fireTurnEnd(correctionBranch());
+
+      assert.strictEqual(directCalls.length, 1);
+      assert.ok(execCalls.length >= 1, "thrown direct error must fall back to subprocess");
+    });
+
+    it("uses subprocess only when reviewTransport is subprocess", async () => {
+      const pi = createMockPi();
+      const { store } = storeWithFailureTracking();
+      const subprocessConfig: MemoryConfig = { ...config, reviewTransport: "subprocess" };
+      setupCorrectionDetector(
+        pi,
+        store as unknown as MemoryStore,
+        null,
+        subprocessConfig,
+        null,
+        null,
+        makeDirectDeps({ ok: true, appliedCount: 1 }),
+      );
+
+      fireMessageEnd("user", "don't do that");
+      await fireTurnEnd(correctionBranch());
+
+      assert.strictEqual(directCalls.length, 0, "direct transport must be skipped for subprocess config");
+      assert.ok(execCalls.length >= 1, "subprocess must run when direct transport is disabled");
+    });
   });
 
   it("does not register handlers when correctionDetection is false", () => {
