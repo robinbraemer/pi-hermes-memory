@@ -794,22 +794,27 @@ export function searchMemoriesDetailed(
     }
   };
 
-  type RankedMemory = MemorySearchResult & { key: RelevanceKey; diversityKey: string };
+  type RankedMemory = MemorySearchResult & {
+    key: RelevanceKey;
+    sourceIdentity: string;
+    diversityIdentity: string;
+  };
   const candidates = new Map<number, RankedMemory>();
   const addAttempt = (matchQuery: string, matchMode: SearchMatchMode): void => {
     for (const entry of runSearch(matchQuery)) {
       if (candidates.has(entry.id)) continue;
       const sourceKey = `project:${entry.project ?? 'global'}|target:${entry.target}|category:${entry.category ?? 'none'}`;
-      const diversityParts: string[] = [];
-      if (project === undefined) diversityParts.push(`project:${entry.project ?? 'global'}`);
-      if (target === undefined) diversityParts.push(`target:${entry.target}`);
-      if (category === undefined) diversityParts.push(`category:${entry.category ?? 'none'}`);
+      const sourceIdentity = JSON.stringify([entry.project, entry.target, entry.category]);
+      const diversityParts: Array<[string, string | null]> = [];
+      if (project === undefined) diversityParts.push(['project', entry.project]);
+      if (target === undefined) diversityParts.push(['target', entry.target]);
+      if (category === undefined) diversityParts.push(['category', entry.category]);
       const key = buildRelevanceKey(
         entry.content,
         query,
         matchMode,
         entry.lastReferenced,
-        sourceKey,
+        sourceIdentity,
         String(entry.id).padStart(20, '0'),
       );
       candidates.set(entry.id, {
@@ -819,7 +824,8 @@ export function searchMemoriesDetailed(
         totalTerms: key.totalTerms,
         sourceKey,
         key,
-        diversityKey: diversityParts.join('|'),
+        sourceIdentity,
+        diversityIdentity: JSON.stringify(diversityParts),
       });
     }
   };
@@ -839,10 +845,10 @@ export function searchMemoriesDetailed(
     const remainder: RankedMemory[] = [];
     const sourceCounts = new Map<string, number>();
     for (const candidate of ranked) {
-      const count = sourceCounts.get(candidate.diversityKey) ?? 0;
+      const count = sourceCounts.get(candidate.diversityIdentity) ?? 0;
       if (count < 2 && selected.length < limit) {
         selected.push(candidate);
-        sourceCounts.set(candidate.diversityKey, count + 1);
+        sourceCounts.set(candidate.diversityIdentity, count + 1);
       } else {
         remainder.push(candidate);
       }
@@ -850,11 +856,16 @@ export function searchMemoriesDetailed(
     if (selected.length < limit) selected.push(...remainder.slice(0, limit - selected.length));
   }
 
-  const results = selected.map(({ key: _key, diversityKey: _diversityKey, ...entry }) => entry);
+  const results = selected.map(({
+    key: _key,
+    sourceIdentity: _sourceIdentity,
+    diversityIdentity: _diversityIdentity,
+    ...entry
+  }) => entry);
   return {
     results,
     candidateCount: ranked.length,
-    sourceCount: new Set(ranked.map((entry) => entry.sourceKey)).size,
+    sourceCount: new Set(ranked.map((entry) => entry.sourceIdentity)).size,
     omittedCount: Math.max(0, ranked.length - results.length),
   };
 }

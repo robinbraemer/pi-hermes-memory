@@ -262,6 +262,68 @@ describe('DatabaseManager', () => {
         'SELECT parent_session_id, source FROM sessions WHERE id = ?',
       ).get('synthetic-legacy') as { parent_session_id: string | null; source: string };
       assert.deepStrictEqual(row, { parent_session_id: null, source: 'interactive' });
+      const foreignKeys = migratedDb.prepare('PRAGMA foreign_key_list(sessions)').all() as { from: string }[];
+      assert.ok(!foreignKeys.some((foreignKey) => foreignKey.from === 'parent_session_id'));
+      assert.doesNotThrow(() => {
+        migratedDb.prepare(`
+          INSERT INTO sessions (id, project, cwd, started_at, parent_session_id)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          'synthetic-newest-child',
+          'synthetic-project',
+          '/synthetic/project',
+          '2026-02-01T00:00:00Z',
+          'synthetic-missing-parent',
+        );
+      });
+      migratedManager.close();
+    });
+
+    it('removes the insertion-order lineage constraint from existing databases', () => {
+      const dbPath = path.join(tmpDir, 'sessions.db');
+      const constrainedDb = new Database(dbPath);
+      constrainedDb.exec(`
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE sessions (
+          id TEXT PRIMARY KEY,
+          project TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          parent_session_id TEXT REFERENCES sessions(id),
+          source TEXT NOT NULL DEFAULT 'interactive',
+          message_count INTEGER DEFAULT 0
+        );
+        INSERT INTO sessions (id, project, cwd, started_at)
+        VALUES ('synthetic-parent', 'synthetic-project', '/synthetic/project', '2026-01-01T00:00:00Z');
+        INSERT INTO sessions (id, project, cwd, started_at, parent_session_id)
+        VALUES ('synthetic-child', 'synthetic-project', '/synthetic/project', '2026-02-01T00:00:00Z', 'synthetic-parent');
+      `);
+      constrainedDb.close();
+
+      const migratedManager = new DatabaseManager(tmpDir);
+      const migratedDb = migratedManager.getDb();
+      const foreignKeys = migratedDb.prepare('PRAGMA foreign_key_list(sessions)').all() as { from: string }[];
+      assert.ok(!foreignKeys.some((foreignKey) => foreignKey.from === 'parent_session_id'));
+      assert.deepStrictEqual(
+        migratedDb.prepare('SELECT id, parent_session_id FROM sessions ORDER BY id').all(),
+        [
+          { id: 'synthetic-child', parent_session_id: 'synthetic-parent' },
+          { id: 'synthetic-parent', parent_session_id: null },
+        ],
+      );
+      assert.doesNotThrow(() => {
+        migratedDb.prepare(`
+          INSERT INTO sessions (id, project, cwd, started_at, parent_session_id)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          'synthetic-orphan',
+          'synthetic-project',
+          '/synthetic/project',
+          '2026-03-01T00:00:00Z',
+          'synthetic-unavailable-parent',
+        );
+      });
       migratedManager.close();
     });
 

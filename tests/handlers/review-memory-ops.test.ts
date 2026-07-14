@@ -158,6 +158,51 @@ describe("applyReviewOperations", () => {
     assert.deepStrictEqual(store.getUserEntries(), []);
   });
 
+  it("rolls back every intended operation when an atomic batch is partially rejected", async () => {
+    const store = new MemoryStore({
+      memoryDir: tmpDir,
+      memoryCharLimit: 160,
+      userCharLimit: 5000,
+      memoryOverflowStrategy: "reject",
+      autoConsolidate: false,
+    } as any);
+    await store.loadFromDisk();
+    await store.add("memory", "synthetic original entry one occupies capacity");
+    await store.add("memory", "synthetic original entry two occupies capacity");
+    const before = store.getRawEntriesForSync("memory");
+
+    const result = await (applyReviewOperations as any)(store, null, [
+      { action: "add", target: "memory", content: "synthetic replacement entry that cannot fit before removals" },
+      { action: "remove", target: "memory", old_text: "synthetic original entry one" },
+    ], null, null, ["memory"], { atomic: true });
+
+    assert.deepStrictEqual(result, { appliedCount: 0, skippedCount: 2 });
+    assert.deepStrictEqual(store.getRawEntriesForSync("memory"), before);
+  });
+
+  it("reports all-rejected direct operations as a fallback result", async () => {
+    const reviewModule = await import("../../src/handlers/review-memory-ops.js") as Record<string, unknown>;
+    assert.strictEqual(typeof reviewModule.applyDirectReviewOperations, "function");
+    const store = new MemoryStore({
+      memoryDir: tmpDir,
+      memoryCharLimit: 5000,
+      userCharLimit: 5000,
+      autoConsolidate: false,
+    } as any);
+    await store.loadFromDisk();
+
+    const result = await (reviewModule.applyDirectReviewOperations as Function)(store, null, [
+      { action: "add", target: "user", content: "synthetic disallowed preference" },
+    ], null, null, { allowedTargets: ["memory"] });
+
+    assert.deepStrictEqual(result, {
+      ok: false,
+      appliedCount: 0,
+      skippedCount: 1,
+      fallbackReason: "operations_rejected",
+    });
+  });
+
   it("uses the in-lock mutation observer as the sole SQLite reconciliation path", async () => {
     const store = new MemoryStore({
       memoryDir: tmpDir,

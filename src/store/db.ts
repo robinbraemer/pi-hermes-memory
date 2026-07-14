@@ -321,6 +321,7 @@ export class DatabaseManager {
     // Extra safety: always ensure legacy columns exist, then migrate legacy
     // CHECK(target IN ('memory','user')) constraints to include 'failure'.
     this.ensureLegacySchemaColumns(db);
+    this.migrateSessionsParentConstraint(db);
     this.migrateLegacyMemoriesTargetConstraint(db);
     this.rebuildMemoryFts(db);
   }
@@ -887,7 +888,7 @@ export class DatabaseManager {
       db.exec('ALTER TABLE sessions ADD COLUMN project TEXT');
     }
     if (!names.has('parent_session_id')) {
-      db.exec('ALTER TABLE sessions ADD COLUMN parent_session_id TEXT REFERENCES sessions(id)');
+      db.exec('ALTER TABLE sessions ADD COLUMN parent_session_id TEXT');
     }
     if (!names.has('source')) {
       db.exec("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'interactive'");
@@ -916,6 +917,51 @@ export class DatabaseManager {
         : 'unknown';
       update.run(project, row.id);
     }
+  }
+
+  private migrateSessionsParentConstraint(db: DatabaseLike): void {
+    const foreignKeys = db.prepare('PRAGMA foreign_key_list(sessions)').all() as Array<Record<string, unknown>>;
+    if (!foreignKeys.some((foreignKey) => foreignKey.from === 'parent_session_id')) return;
+
+    db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      db.exec('BEGIN IMMEDIATE');
+      db.exec(`
+        CREATE TABLE sessions_without_parent_fk (
+          id TEXT PRIMARY KEY,
+          project TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          ended_at TEXT,
+          parent_session_id TEXT,
+          source TEXT NOT NULL DEFAULT 'interactive',
+          message_count INTEGER DEFAULT 0
+        );
+      `);
+      db.exec(`
+        INSERT INTO sessions_without_parent_fk (
+          id, project, cwd, started_at, ended_at, parent_session_id, source, message_count
+        )
+        SELECT id, project, cwd, started_at, ended_at, parent_session_id, source, message_count
+        FROM sessions;
+      `);
+      db.exec('DROP TABLE sessions');
+      db.exec('ALTER TABLE sessions_without_parent_fk RENAME TO sessions');
+      db.exec('COMMIT');
+    } catch (err) {
+      try { db.exec('ROLLBACK'); } catch {}
+      throw err;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON');
+    }
+
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+      CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
+      CREATE INDEX IF NOT EXISTS idx_sessions_parent_session_id ON sessions(parent_session_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+    `);
+    this.assertForeignKeysOk(db);
   }
 
   private migrateLegacyMemoriesTargetConstraint(db: DatabaseLike): void {

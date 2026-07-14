@@ -26,8 +26,13 @@ export interface ApplyReviewOperationsResult {
 export interface DirectReviewResult {
   ok: boolean;
   appliedCount: number;
-  fallbackReason?: "no_model" | "no_auth" | "aborted" | "parse_error" | "provider_error" | "empty";
+  skippedCount?: number;
+  fallbackReason?: "no_model" | "no_auth" | "aborted" | "parse_error" | "provider_error" | "empty" | "operations_rejected";
   error?: string;
+}
+
+export interface ApplyReviewOperationsOptions {
+  atomic?: boolean;
 }
 
 export interface RunDirectMemoryCompletionOptions {
@@ -37,6 +42,7 @@ export interface RunDirectMemoryCompletionOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   allowedTargets?: readonly ReviewMemoryOperation["target"][];
+  atomic?: boolean;
 }
 
 /** Shared transport gate: review/flush/consolidation/correction all default to
@@ -211,10 +217,35 @@ export async function applyReviewOperations(
   _dbManager: DatabaseManager | null = null,
   _projectName?: string | null,
   allowedTargets?: readonly ReviewMemoryOperation["target"][],
+  options: ApplyReviewOperationsOptions = {},
 ): Promise<ApplyReviewOperationsResult> {
   let appliedCount = 0;
   let skippedCount = 0;
   const allowedTargetSet = allowedTargets ? new Set(allowedTargets) : null;
+  const snapshots: Array<{
+    store: MemoryStore;
+    target: "memory" | "user" | "failure";
+    entries: string[];
+  }> = [];
+
+  if (options.atomic) {
+    const captured = new Map<MemoryStore, Set<string>>();
+    for (const op of operations) {
+      if (allowedTargetSet && !allowedTargetSet.has(op.target)) continue;
+      const activeStore = op.target === "project" ? projectStore : store;
+      if (!activeStore) continue;
+      const target = op.target === "project" ? "memory" : op.target;
+      const storeTargets = captured.get(activeStore) ?? new Set<string>();
+      if (storeTargets.has(target)) continue;
+      storeTargets.add(target);
+      captured.set(activeStore, storeTargets);
+      snapshots.push({
+        store: activeStore,
+        target,
+        entries: activeStore.getRawEntriesForSync(target),
+      });
+    }
+  }
 
   for (const op of operations) {
     if (allowedTargetSet && !allowedTargetSet.has(op.target)) {
@@ -291,7 +322,45 @@ export async function applyReviewOperations(
 
   }
 
+  if (options.atomic && skippedCount > 0) {
+    for (const snapshot of snapshots.reverse()) {
+      const restored = await snapshot.store.restoreRawEntries(snapshot.target, snapshot.entries);
+      if (!restored.success) {
+        throw new Error(restored.error ?? "Could not roll back rejected memory operations.");
+      }
+    }
+    return { appliedCount: 0, skippedCount: operations.length };
+  }
+
   return { appliedCount, skippedCount };
+}
+
+export async function applyDirectReviewOperations(
+  store: MemoryStore,
+  projectStore: MemoryStore | null,
+  operations: ReviewMemoryOperation[],
+  dbManager: DatabaseManager | null = null,
+  projectName?: string | null,
+  options: Pick<RunDirectMemoryCompletionOptions, "allowedTargets" | "atomic"> = {},
+): Promise<DirectReviewResult> {
+  const { appliedCount, skippedCount } = await applyReviewOperations(
+    store,
+    projectStore,
+    operations,
+    dbManager,
+    projectName,
+    options.allowedTargets,
+    { atomic: options.atomic },
+  );
+  if (operations.length > 0 && appliedCount === 0 && skippedCount > 0) {
+    return {
+      ok: false,
+      appliedCount: 0,
+      skippedCount,
+      fallbackReason: "operations_rejected",
+    };
+  }
+  return { ok: true, appliedCount, skippedCount };
 }
 
 function responseText(content: unknown): string {
@@ -366,15 +435,14 @@ export async function runDirectMemoryCompletion(
       return { ok: true, appliedCount: 0, fallbackReason: "empty" };
     }
 
-    const { appliedCount } = await applyReviewOperations(
+    return await applyDirectReviewOperations(
       store,
       projectStore,
       operations,
       dbManager,
       projectName,
-      options.allowedTargets,
+      options,
     );
-    return { ok: true, appliedCount };
   } catch (err) {
     if (controller.signal.aborted) {
       return { ok: false, appliedCount: 0, fallbackReason: "aborted" };

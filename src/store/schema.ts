@@ -24,7 +24,7 @@ export const SCHEMA_SQL = `
     cwd TEXT NOT NULL,
     started_at TEXT NOT NULL,
     ended_at TEXT,
-    parent_session_id TEXT REFERENCES sessions(id),
+    parent_session_id TEXT,
     source TEXT NOT NULL DEFAULT 'interactive',
     message_count INTEGER DEFAULT 0
   );

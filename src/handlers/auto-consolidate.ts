@@ -147,12 +147,17 @@ export async function triggerConsolidation(
             timeoutMs,
             signal,
             allowedTargets: [toolTarget],
+            atomic: true,
           },
           dbManager,
           projectName,
         );
         const updatedPersistedChars = store.getPersistedCharCount(target);
-        if (directResult.ok && updatedPersistedChars < currentPersistedChars) {
+        if (
+          directResult.ok
+          && (directResult.skippedCount ?? 0) === 0
+          && updatedPersistedChars < currentPersistedChars
+        ) {
           return { consolidated: true };
         }
       } catch {

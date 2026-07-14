@@ -125,7 +125,7 @@ function resolveRoot(
   if (cached) return cached;
 
   const visited: string[] = [];
-  const seen = new Set<string>();
+  const visitedIndex = new Map<string, number>();
   let current = sessionId;
 
   while (true) {
@@ -134,13 +134,14 @@ function resolveRoot(
       for (const id of visited) cache.set(id, known);
       return known;
     }
-    if (seen.has(current)) {
-      const root = [...seen].sort()[0] ?? sessionId;
+    const cycleStart = visitedIndex.get(current);
+    if (cycleStart !== undefined) {
+      const root = visited.slice(cycleStart).sort()[0] ?? current;
       for (const id of visited) cache.set(id, root);
       return root;
     }
 
-    seen.add(current);
+    visitedIndex.set(current, visited.length);
     visited.push(current);
     const row = db.prepare(
       'SELECT parent_session_id, project FROM sessions WHERE id = ?',

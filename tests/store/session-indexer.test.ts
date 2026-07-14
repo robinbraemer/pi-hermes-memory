@@ -53,6 +53,19 @@ describe('session-indexer', () => {
   }
 
   describe('indexSession', () => {
+    it('indexes a child before its parent is available', () => {
+      const result = indexSession(dbManager, createTestSession({
+        id: 'synthetic-newest-child',
+        parentSessionId: 'synthetic-older-parent',
+      }));
+
+      assert.strictEqual(result.messagesIndexed, 2);
+      const row = dbManager.getDb().prepare(
+        'SELECT parent_session_id FROM sessions WHERE id = ?',
+      ).get('synthetic-newest-child') as { parent_session_id: string | null };
+      assert.strictEqual(row.parent_session_id, 'synthetic-older-parent');
+    });
+
     it('persists and updates synthetic lineage and source metadata', () => {
       indexSession(dbManager, createTestSession({ id: 'synthetic-root' }));
       indexSession(dbManager, createTestSession({

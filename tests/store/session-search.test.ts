@@ -134,6 +134,30 @@ describe('session-search', () => {
       assert.strictEqual(first[0].rootSessionId, 'synthetic-cycle-a');
     });
 
+    it('canonicalizes a lineage tail from cycle members only', () => {
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-cycle-z',
+        messages: [{ id: 'synthetic-cycle-z-message', role: 'user', content: 'synthetic tailed cycle needle', timestamp: '2026-01-01T00:00:00Z' }],
+      }));
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-cycle-y',
+        parentSessionId: 'synthetic-cycle-z',
+        messages: [{ id: 'synthetic-cycle-y-message', role: 'assistant', content: 'synthetic tailed cycle needle', timestamp: '2026-02-01T00:00:00Z' }],
+      }));
+      indexSession(dbManager, createTestSession({ id: 'synthetic-cycle-z', parentSessionId: 'synthetic-cycle-y' }));
+      indexSession(dbManager, createTestSession({
+        id: 'synthetic-cycle-a-tail',
+        parentSessionId: 'synthetic-cycle-y',
+        messages: [{ id: 'synthetic-cycle-a-tail-message', role: 'assistant', content: 'synthetic tailed cycle needle', timestamp: '2026-03-01T00:00:00Z' }],
+      }));
+
+      const results = searchSessions(dbManager, 'synthetic tailed cycle needle');
+
+      assert.strictEqual(results.length, 1);
+      assert.strictEqual(results[0].sessionId, 'synthetic-cycle-a-tail');
+      assert.strictEqual(results[0].rootSessionId, 'synthetic-cycle-y');
+    });
+
     it('ranks exact term coverage ahead of a newer fallback hit', () => {
       indexSession(dbManager, createTestSession({
         id: 'synthetic-exact',

@@ -7,6 +7,7 @@ import { DatabaseManager } from '../../src/store/db.js';
 import {
   addMemory,
   searchMemories,
+  searchMemoriesDetailed,
   getMemories,
   removeMemory,
   touchMemory,
@@ -382,6 +383,31 @@ describe('sqlite-memory-store', () => {
       assert.ok(results.some((entry) => entry.id === sourceB.id));
       assert.strictEqual(results.filter((entry) => sourceA.some((candidate) => candidate.id === entry.id)).length, 2);
       assert.ok(results.every((entry) => entry.sourceKey.startsWith('project:')));
+    });
+
+    it('keeps null and literal global projects as distinct internal sources', () => {
+      for (let index = 0; index < 2; index++) {
+        syncMemoryEntry(dbManager, {
+          content: `synthetic-source-identity needle null-${index}`,
+          target: 'memory',
+          project: null,
+          category: 'convention',
+          lastReferenced: `2026-03-0${index + 2}`,
+        });
+      }
+      const literalGlobal = syncMemoryEntry(dbManager, {
+        content: 'synthetic-source-identity needle literal-global',
+        target: 'memory',
+        project: 'global',
+        category: 'convention',
+        lastReferenced: '2026-01-01',
+      }).entry;
+
+      const response = searchMemoriesDetailed(dbManager, 'synthetic-source-identity needle', { limit: 3 });
+
+      assert.strictEqual(response.sourceCount, 2);
+      assert.ok(response.results.some((entry) => entry.id === literalGlobal.id));
+      assert.ok(response.results.every((entry) => entry.sourceKey.startsWith('project:')));
     });
 
     it('preserves explicit filters while filling from the requested source', () => {
