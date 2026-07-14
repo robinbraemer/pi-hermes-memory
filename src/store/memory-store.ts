@@ -41,6 +41,21 @@ const CONFLICT_MAX_BYTES = 64 * 1024 * 1024;
 
 class ExternalMemoryWriteConflict extends Error {}
 
+export interface MemoryTargetTransaction {
+  add(content: string): Promise<MemoryResult>;
+  addFailure(content: string, options: {
+    category: MemoryCategory;
+    failureReason?: string;
+  }): Promise<MemoryResult>;
+  replace(oldText: string, newContent: string): Promise<MemoryResult>;
+  remove(oldText: string): Promise<MemoryResult>;
+}
+
+export interface MemoryTargetTransactionDecision<T> {
+  result: T;
+  commit: boolean;
+}
+
 export class MemoryStore {
   private memoryEntries: string[] = [];
   private userEntries: string[] = [];
@@ -181,6 +196,7 @@ export class MemoryStore {
     signal?: AbortSignal,
     addedMessage = "Entry added.",
     project?: string,
+    persist = true,
   ): Promise<MemoryResult> {
     content = content.trim();
     if (!content) return { success: false, error: "Content cannot be empty." };
@@ -212,7 +228,7 @@ export class MemoryStore {
       const strategy = this.memoryOverflowStrategy();
 
       if (strategy === "fifo-evict") {
-        return this.fifoEvictAndAdd(target, entries, encoded, content.length, limit);
+        return this.fifoEvictAndAdd(target, entries, encoded, content.length, limit, persist);
       }
 
       return this.memoryFullError(target, content.length);
@@ -220,7 +236,7 @@ export class MemoryStore {
 
     entries.push(encoded);
     this.setEntries(target, entries);
-    await this.saveToDisk(target);
+    if (persist) await this.saveToDisk(target);
 
     return this.successResponse(target, addedMessage);
   }
@@ -264,6 +280,7 @@ export class MemoryStore {
     encoded: string,
     contentLength: number,
     limit: number,
+    persist = true,
   ): Promise<MemoryResult> {
     if (encoded.length > limit) {
       return this.memoryFullError(target, contentLength);
@@ -279,7 +296,7 @@ export class MemoryStore {
 
     remaining.push(encoded);
     this.setEntries(target, remaining);
-    await this.saveToDisk(target);
+    if (persist) await this.saveToDisk(target);
 
     return {
       ...this.successResponse(
@@ -304,7 +321,12 @@ export class MemoryStore {
     return this.runTargetMutation(target, () => this.replaceUnlocked(target, oldText, newContent));
   }
 
-  private async replaceUnlocked(target: "memory" | "user" | "failure", oldText: string, newContent: string): Promise<MemoryResult> {
+  private async replaceUnlocked(
+    target: "memory" | "user" | "failure",
+    oldText: string,
+    newContent: string,
+    persist = true,
+  ): Promise<MemoryResult> {
     oldText = normalizeMemoryLookupText(oldText);
     newContent = newContent.trim();
     if (!oldText) return { success: false, error: "old_text cannot be empty." };
@@ -343,7 +365,7 @@ export class MemoryStore {
     }
 
     this.setEntries(target, testEntries);
-    await this.saveToDisk(target);
+    if (persist) await this.saveToDisk(target);
 
     return this.successResponse(target, "Entry replaced.");
   }
@@ -352,7 +374,11 @@ export class MemoryStore {
     return this.runTargetMutation(target, () => this.removeUnlocked(target, oldText));
   }
 
-  private async removeUnlocked(target: "memory" | "user" | "failure", oldText: string): Promise<MemoryResult> {
+  private async removeUnlocked(
+    target: "memory" | "user" | "failure",
+    oldText: string,
+    persist = true,
+  ): Promise<MemoryResult> {
     oldText = normalizeMemoryLookupText(oldText);
     if (!oldText) return { success: false, error: "old_text cannot be empty." };
 
@@ -371,7 +397,7 @@ export class MemoryStore {
 
     const matchedEntries = new Set(matches);
     this.setEntries(target, entries.filter((entry) => !matchedEntries.has(entry)));
-    await this.saveToDisk(target);
+    if (persist) await this.saveToDisk(target);
 
     return this.successResponse(target, "Entry removed.");
   }
@@ -440,6 +466,65 @@ export class MemoryStore {
       this.setEntries(target, [...entries]);
       await this.saveToDisk(target);
       return this.successResponse(target, "Memory operations rolled back.");
+    });
+  }
+
+  async runAtomicTargetMutation<T>(
+    target: "memory" | "user" | "failure",
+    mutation: (transaction: MemoryTargetTransaction) => Promise<MemoryTargetTransactionDecision<T>>,
+  ): Promise<T> {
+    const storagePath = await this.resolveStoragePath(target);
+    return withMarkdownMutationLock(storagePath, async () => {
+      await this.syncTargetFromDiskIfChanged(target);
+      const snapshot = [...this.entriesFor(target)];
+      let published = false;
+      try {
+        const decision = await mutation({
+          add: (content) => this._add(target, content, undefined, "Entry added.", undefined, false),
+          addFailure: (content, options) => {
+            if (target !== "failure") {
+              return Promise.resolve({ success: false, error: "Failure entries require the failure target." });
+            }
+            return this._add(
+              target,
+              this.buildFailureMemoryText(content, options),
+              undefined,
+              "Failure memory saved: " + options.category,
+              undefined,
+              false,
+            );
+          },
+          replace: (oldText, newContent) => this.replaceUnlocked(target, oldText, newContent, false),
+          remove: (oldText) => this.removeUnlocked(target, oldText, false),
+        });
+
+        if (!decision.commit) {
+          this.setEntries(target, snapshot);
+          return decision.result;
+        }
+
+        await this.saveToDisk(target);
+        published = true;
+        await this.notifyMutationObserver(target, storagePath);
+        return decision.result;
+      } catch (error) {
+        if (published) {
+          this.setEntries(target, snapshot);
+          try {
+            await this.saveToDisk(target);
+          } catch (rollbackError) {
+            await this.syncTargetFromDisk(storagePath, target);
+            throw new AggregateError(
+              [error, rollbackError],
+              `Atomic memory rollback failed after: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+          try { await this.notifyMutationObserver(target, storagePath); } catch {}
+        } else {
+          await this.syncTargetFromDisk(storagePath, target);
+        }
+        throw error;
+      }
     });
   }
 
@@ -603,6 +688,24 @@ export class MemoryStore {
     this.fileFingerprints[filePath] = state.fingerprint;
   }
 
+  private async syncTargetFromDisk(
+    filePath: string,
+    target: "memory" | "user" | "failure",
+  ): Promise<void> {
+    const state = await this.readFileState(filePath);
+    this.setEntries(target, [...new Set(state.entries)]);
+    this.fileFingerprints[filePath] = state.fingerprint;
+  }
+
+  private async notifyMutationObserver(
+    target: "memory" | "user" | "failure",
+    filePath: string,
+  ): Promise<string | null | undefined> {
+    if (!this.mutationObserver) return null;
+    await this.syncTargetFromDisk(filePath, target);
+    return this.mutationObserver(target, [...this.entriesFor(target)]);
+  }
+
   private async runTargetMutation(
     target: "memory" | "user" | "failure",
     mutation: () => Promise<MemoryResult>,
@@ -613,11 +716,7 @@ export class MemoryStore {
         try {
           const result = await mutation();
           if (result.success && this.mutationObserver) {
-            const filePath = storagePath;
-            const state = await this.readFileState(filePath);
-            this.setEntries(target, [...new Set(state.entries)]);
-            this.fileFingerprints[filePath] = state.fingerprint;
-            const warning = await this.mutationObserver(target, [...state.entries]);
+            const warning = await this.notifyMutationObserver(target, storagePath);
             if (warning) {
               const warnings = [...(result.warnings ?? []), warning];
               return {
@@ -630,11 +729,8 @@ export class MemoryStore {
           }
           return result;
         } catch (error) {
-          const filePath = storagePath;
-          delete this.fileFingerprints[filePath];
-          const state = await this.readFileState(filePath);
-          this.setEntries(target, [...new Set(state.entries)]);
-          this.fileFingerprints[filePath] = state.fingerprint;
+          delete this.fileFingerprints[storagePath];
+          await this.syncTargetFromDisk(storagePath, target);
           if (!(error instanceof ExternalMemoryWriteConflict)) throw error;
           if (attempt >= MAX_EXTERNAL_WRITE_RETRIES) {
             return {

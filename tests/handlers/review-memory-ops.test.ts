@@ -180,6 +180,60 @@ describe("applyReviewOperations", () => {
     assert.deepStrictEqual(store.getRawEntriesForSync("memory"), before);
   });
 
+  it("preserves newer disk entries when a stale store rolls back an atomic batch", async () => {
+    const config = {
+      memoryDir: tmpDir,
+      memoryCharLimit: 120,
+      userCharLimit: 5000,
+      memoryOverflowStrategy: "reject" as const,
+      autoConsolidate: false,
+    } as any;
+    const staleStore = new MemoryStore(config);
+    const writerStore = new MemoryStore(config);
+    await staleStore.loadFromDisk();
+    await writerStore.loadFromDisk();
+    const written = await writerStore.add("memory", "synthetic latest disk entry occupies capacity");
+    assert.strictEqual(written.success, true);
+
+    const result = await applyReviewOperations(staleStore, null, [
+      { action: "add", target: "memory", content: "synthetic replacement cannot fit before removal" },
+      { action: "remove", target: "memory", old_text: "synthetic latest disk entry" },
+    ], null, null, ["memory"], { atomic: true });
+
+    const readerStore = new MemoryStore(config);
+    await readerStore.loadFromDisk();
+    assert.deepStrictEqual(result, { appliedCount: 0, skippedCount: 2 });
+    assert.deepStrictEqual(readerStore.getMemoryEntries(), ["synthetic latest disk entry occupies capacity"]);
+  });
+
+  it("restores an atomic batch when commit observation throws", async () => {
+    const config = {
+      memoryDir: tmpDir,
+      memoryCharLimit: 5000,
+      userCharLimit: 5000,
+      memoryOverflowStrategy: "reject" as const,
+      autoConsolidate: false,
+    } as any;
+    const store = new MemoryStore(config);
+    await store.loadFromDisk();
+    await store.add("memory", "synthetic original survives observer failure");
+    store.setMutationObserver(async () => {
+      throw new Error("synthetic observer failure");
+    });
+
+    await assert.rejects(
+      applyReviewOperations(store, null, [
+        { action: "remove", target: "memory", old_text: "synthetic original" },
+        { action: "add", target: "memory", content: "synthetic replacement must roll back" },
+      ], null, null, ["memory"], { atomic: true }),
+      /synthetic observer failure/,
+    );
+
+    const readerStore = new MemoryStore(config);
+    await readerStore.loadFromDisk();
+    assert.deepStrictEqual(readerStore.getMemoryEntries(), ["synthetic original survives observer failure"]);
+  });
+
   it("reports all-rejected direct operations as a fallback result", async () => {
     const reviewModule = await import("../../src/handlers/review-memory-ops.js") as Record<string, unknown>;
     assert.strictEqual(typeof reviewModule.applyDirectReviewOperations, "function");

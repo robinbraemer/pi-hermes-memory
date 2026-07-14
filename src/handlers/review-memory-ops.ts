@@ -5,9 +5,9 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { completeSimple, type Message, type SimpleStreamOptions } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { MemoryStore } from "../store/memory-store.js";
+import { MemoryStore, type MemoryTargetTransaction } from "../store/memory-store.js";
 import type { DatabaseManager } from "../store/db.js";
-import type { MemoryCategory, MemoryConfig, MemoryResult, ThinkingLevel } from "../types.js";
+import type { MemoryCategory, MemoryConfig, ThinkingLevel } from "../types.js";
 
 export interface ReviewMemoryOperation {
   action: "add" | "replace" | "remove";
@@ -210,6 +210,91 @@ export function parseReviewOperations(text: string): ReviewMemoryOperation[] | n
   return parsed;
 }
 
+type ReviewOperationExecutor = Pick<MemoryTargetTransaction, "add" | "addFailure" | "replace" | "remove">;
+
+async function applyReviewOperation(
+  operation: ReviewMemoryOperation,
+  executor: ReviewOperationExecutor,
+): Promise<boolean> {
+  switch (operation.action) {
+    case "add": {
+      if (!operation.content?.trim()) return false;
+      const result = operation.target === "failure"
+        ? await executor.addFailure(operation.content, {
+            category: operation.category ?? "failure",
+            failureReason: operation.failure_reason,
+          })
+        : await executor.add(operation.content);
+      return result.success;
+    }
+    case "replace": {
+      if (!operation.old_text || !operation.content?.trim()) return false;
+      return (await executor.replace(operation.old_text, operation.content)).success;
+    }
+    case "remove": {
+      if (!operation.old_text) return false;
+      return (await executor.remove(operation.old_text)).success;
+    }
+  }
+}
+
+function operationScope(
+  store: MemoryStore,
+  projectStore: MemoryStore | null,
+  operation: ReviewMemoryOperation,
+): { store: MemoryStore; target: "memory" | "user" | "failure" } | null {
+  if (operation.target === "project") {
+    return projectStore ? { store: projectStore, target: "memory" } : null;
+  }
+  return { store, target: operation.target };
+}
+
+async function applyAtomicReviewOperations(
+  store: MemoryStore,
+  projectStore: MemoryStore | null,
+  operations: ReviewMemoryOperation[],
+  allowedTargetSet: Set<ReviewMemoryOperation["target"]> | null,
+): Promise<ApplyReviewOperationsResult> {
+  let scope: { store: MemoryStore; target: "memory" | "user" | "failure" } | null = null;
+  let preSkippedCount = 0;
+  const executable: ReviewMemoryOperation[] = [];
+
+  for (const operation of operations) {
+    if (allowedTargetSet && !allowedTargetSet.has(operation.target)) {
+      preSkippedCount++;
+      continue;
+    }
+    const candidate = operationScope(store, projectStore, operation);
+    if (!candidate) {
+      preSkippedCount++;
+      continue;
+    }
+    if (scope && (scope.store !== candidate.store || scope.target !== candidate.target)) {
+      return { appliedCount: 0, skippedCount: operations.length };
+    }
+    scope = candidate;
+    executable.push(operation);
+  }
+
+  if (!scope) return { appliedCount: 0, skippedCount: operations.length };
+
+  return scope.store.runAtomicTargetMutation(scope.target, async (transaction) => {
+    let appliedCount = 0;
+    let skippedCount = preSkippedCount;
+    for (const operation of executable) {
+      if (await applyReviewOperation(operation, transaction)) appliedCount++;
+      else skippedCount++;
+    }
+    const commit = skippedCount === 0;
+    return {
+      result: commit
+        ? { appliedCount, skippedCount }
+        : { appliedCount: 0, skippedCount: operations.length },
+      commit,
+    };
+  });
+}
+
 export async function applyReviewOperations(
   store: MemoryStore,
   projectStore: MemoryStore | null,
@@ -222,29 +307,8 @@ export async function applyReviewOperations(
   let appliedCount = 0;
   let skippedCount = 0;
   const allowedTargetSet = allowedTargets ? new Set(allowedTargets) : null;
-  const snapshots: Array<{
-    store: MemoryStore;
-    target: "memory" | "user" | "failure";
-    entries: string[];
-  }> = [];
-
   if (options.atomic) {
-    const captured = new Map<MemoryStore, Set<string>>();
-    for (const op of operations) {
-      if (allowedTargetSet && !allowedTargetSet.has(op.target)) continue;
-      const activeStore = op.target === "project" ? projectStore : store;
-      if (!activeStore) continue;
-      const target = op.target === "project" ? "memory" : op.target;
-      const storeTargets = captured.get(activeStore) ?? new Set<string>();
-      if (storeTargets.has(target)) continue;
-      storeTargets.add(target);
-      captured.set(activeStore, storeTargets);
-      snapshots.push({
-        store: activeStore,
-        target,
-        entries: activeStore.getRawEntriesForSync(target),
-      });
-    }
+    return applyAtomicReviewOperations(store, projectStore, operations, allowedTargetSet);
   }
 
   for (const op of operations) {
@@ -261,75 +325,14 @@ export async function applyReviewOperations(
     const memoryTarget = rawTarget === "project" ? "memory" : rawTarget === "failure" ? "failure" : rawTarget;
     const activeStore = rawTarget === "project" ? projectStore! : store;
 
-    let result: MemoryResult;
-    switch (op.action) {
-      case "add": {
-        if (!op.content?.trim()) {
-          skippedCount++;
-          continue;
-        }
-        if (rawTarget === "failure") {
-          const category = op.category ?? "failure";
-          result = await activeStore.addFailure(op.content, {
-            category,
-            failureReason: op.failure_reason,
-          });
-          if (result.success) {
-            appliedCount++;
-          } else {
-            skippedCount++;
-          }
-        } else {
-          result = await activeStore.add(memoryTarget, op.content);
-          if (result.success) {
-            appliedCount++;
-          } else {
-            skippedCount++;
-          }
-        }
-        break;
-      }
-      case "replace": {
-        if (!op.old_text || !op.content?.trim()) {
-          skippedCount++;
-          continue;
-        }
-        result = await activeStore.replace(memoryTarget, op.old_text, op.content);
-        if (result.success) {
-          appliedCount++;
-        } else {
-          skippedCount++;
-        }
-        break;
-      }
-      case "remove": {
-        if (!op.old_text) {
-          skippedCount++;
-          continue;
-        }
-        result = await activeStore.remove(memoryTarget, op.old_text);
-        if (result.success) {
-          appliedCount++;
-        } else {
-          skippedCount++;
-        }
-        break;
-      }
-      default:
-        skippedCount++;
-        continue;
-    }
-
-  }
-
-  if (options.atomic && skippedCount > 0) {
-    for (const snapshot of snapshots.reverse()) {
-      const restored = await snapshot.store.restoreRawEntries(snapshot.target, snapshot.entries);
-      if (!restored.success) {
-        throw new Error(restored.error ?? "Could not roll back rejected memory operations.");
-      }
-    }
-    return { appliedCount: 0, skippedCount: operations.length };
+    const executor: ReviewOperationExecutor = {
+      add: (content) => activeStore.add(memoryTarget, content),
+      addFailure: (content, failureOptions) => activeStore.addFailure(content, failureOptions),
+      replace: (oldText, newContent) => activeStore.replace(memoryTarget, oldText, newContent),
+      remove: (oldText) => activeStore.remove(memoryTarget, oldText),
+    };
+    if (await applyReviewOperation(op, executor)) appliedCount++;
+    else skippedCount++;
   }
 
   return { appliedCount, skippedCount };
